@@ -52,6 +52,7 @@ impl Publisher {
         Modes {
             key: self.cfg.key_mode,
             cert: self.cfg.cert_mode,
+            key_gid: self.cfg.key_gid,
         }
     }
 

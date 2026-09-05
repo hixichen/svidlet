@@ -69,7 +69,20 @@ async fn run_stream(
     node_name: &str,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let channel = connect(manager, endpoint).await?;
-    let mut client = PolicyServiceClient::new(channel);
+
+    // Present the bearer token, if one is configured. Read per connection
+    // rather than cached, so a rotated token is picked up on the next
+    // reconnect without a restart.
+    let token = bearer_token(manager)?;
+    let mut client =
+        PolicyServiceClient::with_interceptor(channel, move |mut request: Request<()>| {
+            if let Some(token) = &token {
+                request
+                    .metadata_mut()
+                    .insert("authorization", token.clone());
+            }
+            Ok(request)
+        });
 
     let (tx, rx) = mpsc::unbounded_channel::<WatchRequest>();
 
@@ -82,7 +95,21 @@ async fn run_stream(
         tx,
     ));
 
-    let result = pump(manager, &mut client, rx).await;
+    let result = async {
+        let mut updates = client
+            .watch(Request::new(UnboundedReceiverStream::new(rx)))
+            .await?
+            .into_inner();
+
+        manager.set_connected(true);
+
+        while let Some(update) = updates.message().await? {
+            apply(manager, update);
+        }
+        Ok::<(), Box<dyn std::error::Error + Send + Sync>>(())
+    }
+    .await;
+
     sync.abort();
     result
 }
@@ -110,6 +137,36 @@ async fn connect(
     }
 
     Ok(builder.connect().await?)
+}
+
+/// The `Authorization` header for the policy backend, if a token file is set.
+///
+/// A backend that authenticates its callers wants this; one that does not will
+/// ignore it. Either way, a configured credential that the code never sends is
+/// worse than no setting at all, because it reads as protection that is not
+/// there.
+fn bearer_token(
+    manager: &Arc<PolicyManager>,
+) -> Result<
+    Option<tonic::metadata::MetadataValue<tonic::metadata::Ascii>>,
+    Box<dyn std::error::Error + Send + Sync>,
+> {
+    let Some(path) = &manager.settings().stream.token_path else {
+        return Ok(None);
+    };
+    let raw = std::fs::read_to_string(path)
+        .map_err(|e| format!("cannot read the policy token from {}: {e}", path.display()))?;
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err(format!("the policy token at {} is empty", path.display()).into());
+    }
+    let value = format!("Bearer {trimmed}").parse().map_err(|e| {
+        format!(
+            "the policy token at {} is not a valid header: {e}",
+            path.display()
+        )
+    })?;
+    Ok(Some(value))
 }
 
 /// Send Subscribe and Unsubscribe messages until the wanted set matches what
@@ -159,24 +216,6 @@ async fn sync_subscriptions(
 
         changed.await;
     }
-}
-
-async fn pump(
-    manager: &Arc<PolicyManager>,
-    client: &mut PolicyServiceClient<Channel>,
-    rx: mpsc::UnboundedReceiver<WatchRequest>,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let mut updates = client
-        .watch(Request::new(UnboundedReceiverStream::new(rx)))
-        .await?
-        .into_inner();
-
-    manager.set_connected(true);
-
-    while let Some(update) = updates.message().await? {
-        apply(manager, update);
-    }
-    Ok(())
 }
 
 /// Translate one protobuf update and hand it to the manager.

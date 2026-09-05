@@ -50,6 +50,9 @@ pub struct Identity {
 pub struct Modes {
     pub key: u32,
     pub cert: u32,
+    /// Group that owns `tls.key`. `None` leaves it owned by the process's own
+    /// group, which for a root plugin means only root can read it at 0640.
+    pub key_gid: Option<u32>,
 }
 
 /// Create the target directory and back it with a private tmpfs.
@@ -75,7 +78,12 @@ pub fn publish_identity(target: &Path, identity: &Identity, modes: Modes) -> io:
     fs::create_dir(&dir)?;
     fs::set_permissions(&dir, fs::Permissions::from_mode(0o755))?;
 
-    write_file(&dir.join(KEY_FILE), identity.key_pem.as_bytes(), modes.key)?;
+    let key_path = dir.join(KEY_FILE);
+    write_file(&key_path, identity.key_pem.as_bytes(), modes.key)?;
+    if let Some(gid) = modes.key_gid {
+        // 0640 is only useful if somebody other than root is in the group.
+        chgrp(&key_path, gid)?;
+    }
     write_file(
         &dir.join(CERT_FILE),
         identity.cert_chain_pem.as_bytes(),
@@ -149,11 +157,36 @@ pub fn published_revision(target: &Path) -> Option<String> {
 /// Used by the trust-bundle refresh, which rewrites `ca.crt` without minting a
 /// new key.
 pub fn read_identity(target: &Path) -> io::Result<Identity> {
-    let base = target.join(DATA_LINK);
+    // Resolve `..data` once and read all three files from that one generation.
+    // Reading them through the symlink would re-resolve it each time, so a
+    // renewal landing between the reads would hand back a key from one
+    // generation and a certificate from the next — a pair that fails every
+    // handshake, and one this process would then publish as if it were good.
+    //
+    // The generation can still be collected underneath us, which is what the
+    // retry is for: a fresh resolve gets the newer one.
+    let mut last = None;
+    for _ in 0..4 {
+        let generation = match fs::read_link(target.join(DATA_LINK)) {
+            Ok(relative) => target.join(relative),
+            // No chain published yet, or an older layout.
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Err(e),
+            Err(e) => return Err(e),
+        };
+        match read_generation(&generation) {
+            Ok(identity) => return Ok(identity),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => last = Some(e),
+            Err(e) => return Err(e),
+        }
+    }
+    Err(last.unwrap_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no published identity")))
+}
+
+fn read_generation(dir: &Path) -> io::Result<Identity> {
     Ok(Identity {
-        key_pem: fs::read_to_string(base.join(KEY_FILE))?,
-        cert_chain_pem: fs::read_to_string(base.join(CERT_FILE))?,
-        ca_pem: fs::read_to_string(base.join(CA_FILE))?,
+        key_pem: fs::read_to_string(dir.join(KEY_FILE))?,
+        cert_chain_pem: fs::read_to_string(dir.join(CERT_FILE))?,
+        ca_pem: fs::read_to_string(dir.join(CA_FILE))?,
     })
 }
 
@@ -208,10 +241,43 @@ fn link(target: &Path, name: &str, points_to: &str) -> io::Result<()> {
 
 fn write_file(path: &Path, contents: &[u8], mode: u32) -> io::Result<()> {
     use std::io::Write as _;
-    let mut f = fs::File::create(path)?;
+    use std::os::unix::fs::OpenOptionsExt as _;
+
+    // Born with its final mode. `File::create` would use 0666 & ~umask — 0644
+    // typically — leaving the private key world-readable for the length of the
+    // write and fsync, which is exactly the window a 0640 key mode exists to
+    // close.
+    let mut f = fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(mode)
+        .open(path)?;
     f.write_all(contents)?;
     f.sync_all()?;
+    // Still set it explicitly: `mode` only applies when the file is created,
+    // and a version directory is fresh but a retry may not be.
     fs::set_permissions(path, fs::Permissions::from_mode(mode))
+}
+
+/// Give a file to a group, so a non-root workload can read a 0640 key.
+#[cfg(target_os = "linux")]
+#[allow(unsafe_code)]
+fn chgrp(path: &Path, gid: u32) -> io::Result<()> {
+    let path_c = cstring(path.as_os_str().as_encoded_bytes())?;
+    // SAFETY: path_c is a NUL-terminated string that outlives the call; -1 for
+    // the uid leaves the owner unchanged.
+    let rc = unsafe { libc::chown(path_c.as_ptr(), u32::MAX, gid) };
+    if rc != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// Non-Linux builds are for development only, where the group does not matter.
+#[cfg(not(target_os = "linux"))]
+fn chgrp(_path: &Path, _gid: u32) -> io::Result<()> {
+    Ok(())
 }
 
 fn fsync_dir(path: &Path) -> io::Result<()> {
@@ -238,11 +304,19 @@ fn version_of(name: &str, prefix: &str) -> Option<u64> {
     name.strip_prefix(prefix)?.parse().ok()
 }
 
+/// Collect superseded generations, keeping the current one and the one before
+/// it.
+///
+/// Keeping the previous generation matters for readers: an application that
+/// opens `tls.crt` and then `tls.key` re-resolves the symlink twice, and
+/// deleting the old generation the instant the swap lands turns that race into
+/// an ENOENT rather than a readable — if briefly mismatched — pair. One
+/// generation of grace makes the common reader work.
 fn remove_stale_versions(target: &Path, prefix: &str, keep: u64) -> io::Result<()> {
     for entry in fs::read_dir(target)?.flatten() {
         let name = entry.file_name().to_string_lossy().into_owned();
         if let Some(n) = version_of(&name, prefix) {
-            if n != keep {
+            if n != keep && n + 1 != keep {
                 let _ = fs::remove_dir_all(entry.path());
             }
         }
@@ -338,6 +412,7 @@ mod tests {
     const MODES: Modes = Modes {
         key: 0o640,
         cert: 0o644,
+        key_gid: None,
     };
 
     fn identity(tag: &str) -> Identity {
@@ -385,14 +460,21 @@ mod tests {
         assert_eq!(fs::read_to_string(dir.join(CERT_FILE)).unwrap(), "CERT-2\n");
         assert_eq!(fs::read_to_string(dir.join(KEY_FILE)).unwrap(), "KEY-2\n");
 
-        // The superseded version is collected, so a long-lived volume does not
-        // accumulate one directory per renewal.
-        let versions = fs::read_dir(&dir)
-            .unwrap()
-            .flatten()
-            .filter(|e| e.file_name().to_string_lossy().starts_with(VERSION_PREFIX))
-            .count();
-        assert_eq!(versions, 1);
+        // Current plus one generation of grace, so a reader that straddles the
+        // swap finds files rather than ENOENT. Older ones are collected, so a
+        // long-lived volume does not accumulate a directory per renewal.
+        let versions = |dir: &Path| {
+            fs::read_dir(dir)
+                .unwrap()
+                .flatten()
+                .filter(|e| e.file_name().to_string_lossy().starts_with(VERSION_PREFIX))
+                .count()
+        };
+        assert_eq!(versions(&dir), 2);
+        for tag in ["3", "4", "5"] {
+            publish_identity(&dir, &identity(tag), MODES).unwrap();
+        }
+        assert_eq!(versions(&dir), 2, "retention does not grow without bound");
 
         fs::remove_dir_all(&dir).unwrap();
     }
@@ -502,8 +584,10 @@ mod tests {
                 .filter(|e| e.file_name().to_string_lossy().starts_with(prefix))
                 .count()
         };
-        assert_eq!(count(VERSION_PREFIX), 1);
-        assert_eq!(count(POLICY_VERSION_PREFIX), 1);
+        // Each chain keeps its own current plus one generation of grace, and
+        // neither counts the other's directories.
+        assert_eq!(count(VERSION_PREFIX), 2);
+        assert_eq!(count(POLICY_VERSION_PREFIX), 2);
 
         fs::remove_dir_all(&dir).unwrap();
     }

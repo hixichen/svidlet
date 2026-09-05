@@ -25,6 +25,10 @@ data:
   SVIDLET_CLUSTER: cluster-a
   SVIDLET_CERT_TTL: 24h
   SVIDLET_LOG_LEVEL: info
+  # Group that owns tls.key, which is mode 0640. Must match the workload's
+  # runAsGroup or a non-root workload cannot read its own key. See
+  # docs/HOWTO.md; do not "fix" a permission error by widening SVIDLET_KEY_MODE.
+  SVIDLET_KEY_GID: "1000"
 
   # Shape of every SPIFFE ID this node issues. The cluster lives in the path,
   # not the trust domain, so cross-cluster mTLS needs no federation.

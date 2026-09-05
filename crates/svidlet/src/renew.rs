@@ -32,12 +32,17 @@ pub async fn renew_due(publisher: Arc<Publisher>) -> usize {
     let count = due.len();
 
     // The PKI client blocks, so the whole batch runs off the reactor.
-    let _ = tokio::task::spawn_blocking(move || {
+    if let Err(e) = tokio::task::spawn_blocking(move || {
         for entry in due {
             renew_one(&publisher, &entry);
         }
     })
-    .await;
+    .await
+    {
+        // Renewal is the one loop whose silent death expires every certificate
+        // on the node. It must never fail quietly.
+        error!("renewal batch panicked", error = e);
+    }
     count
 }
 

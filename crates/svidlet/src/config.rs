@@ -73,9 +73,16 @@ pub struct Config {
 
     /// tmpfs `size=` option for each published volume.
     pub tmpfs_size: String,
-    /// Mode for `tls.key`. Pods that read it as non-root need a matching
-    /// `fsGroup` (the CSIDriver sets `fsGroupPolicy: File`).
+    /// Mode for `tls.key`.
     pub key_mode: u32,
+    /// Group that owns `tls.key`, so a non-root workload can read it at 0640.
+    ///
+    /// Set this to the workload's `runAsGroup`. It is independent of the
+    /// kubelet's `fsGroup` handling, which depends on the CSIDriver's
+    /// `fsGroupPolicy` and on driver capabilities svidlet does not advertise —
+    /// so relying on `fsGroup` alone would be relying on behaviour this project
+    /// has not verified on a real cluster.
+    pub key_gid: Option<u32>,
     pub cert_mode: u32,
 
     /// `host:port` for the Prometheus endpoint; empty disables it.
@@ -380,6 +387,12 @@ impl Config {
                 .duration("SVIDLET_CA_REFRESH_INTERVAL", Duration::from_secs(3600))?,
             tmpfs_size: env.opt("SVIDLET_TMPFS_SIZE").unwrap_or_else(|| "1m".into()),
             key_mode: env.mode("SVIDLET_KEY_MODE", 0o640)?,
+            key_gid: match env.opt("SVIDLET_KEY_GID") {
+                None => None,
+                Some(v) => Some(v.parse::<u32>().map_err(|_| {
+                    ConfigError(format!("SVIDLET_KEY_GID must be a group id, got {v:?}"))
+                })?),
+            },
             cert_mode: env.mode("SVIDLET_CERT_MODE", 0o644)?,
             metrics_addr: env
                 .opt("SVIDLET_METRICS_ADDR")
@@ -638,6 +651,7 @@ mod tests {
         assert_eq!(cfg.ca_refresh_interval, Duration::from_secs(3600));
         assert_eq!(cfg.tmpfs_size, "1m");
         assert_eq!((cfg.key_mode, cfg.cert_mode), (0o640, 0o644));
+        assert_eq!(cfg.key_gid, None);
         assert_eq!(cfg.metrics_addr, "0.0.0.0:9464");
         assert_eq!(cfg.log_level, Level::Info);
         // The PKI role defaults to the cluster's own role.
@@ -925,6 +939,14 @@ mod tests {
     fn file_modes_are_octal_and_bounded() {
         let cfg = with(&[("SVIDLET_KEY_MODE", "0600"), ("SVIDLET_CERT_MODE", "0o644")]).unwrap();
         assert_eq!((cfg.key_mode, cfg.cert_mode), (0o600, 0o644));
+
+        // The key's group is svidlet's own, not the kubelet's fsGroup.
+        assert_eq!(
+            with(&[("SVIDLET_KEY_GID", "1000")]).unwrap().key_gid,
+            Some(1000)
+        );
+        let err = with(&[("SVIDLET_KEY_GID", "staff")]).unwrap_err();
+        assert!(err.0.contains("group id"), "{err}");
 
         for bad in ["999", "rw-r-----", "1777", ""] {
             if bad.is_empty() {

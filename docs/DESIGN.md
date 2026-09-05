@@ -94,7 +94,7 @@ The asymmetry is the point. The policy path is where the untrusted input is — 
 - svidlet publishes `tls.crt`; the daemon reads it to learn what identity a volume holds. A certificate it did not issue is not one it can forge.
 - the daemon publishes `policy/` and `policy.revision`; svidlet, when `SVIDLET_POLICY_REQUIRED` is set, waits for that revision file before letting a pod start.
 
-Inside one volume there are two independent atomic swap chains, so neither writer can disturb the other's files even by accident:
+Inside one volume there are two independent atomic swap chains, so neither writer's *code* can disturb the other's files even by accident:
 
 ```
 ..data        -> ..svidlet.N/   tls.crt, tls.key, ca.crt     (svidlet)
@@ -102,6 +102,8 @@ Inside one volume there are two independent atomic swap chains, so neither write
 ```
 
 This also removes a subtlety that used to need careful coding: a certificate renewal previously had to read the policy back and rewrite it so as not to clear it. Now it structurally cannot touch it.
+
+**One honest limit on "structurally".** The separation is enforced by the code each process runs, not by the filesystem. `SVIDLET_POLICY_GID` makes the tmpfs root group-writable so the daemon can create `..policy.N`, and that same directory permission would let a *compromised* daemon unlink `..data` or `tls.crt`. It could not forge a certificate — it holds no signing credential — and it could not read `tls.key`, which is `0640` and owned by a different group. So the claim that a compromised policy path cannot issue an identity holds; the claim that it cannot touch the identity files does not. Pre-creating a per-volume `policy/` subdirectory owned by the policy group, with the volume root left root-only, would make it structural, and is the obvious next step.
 
 The daemon writes into a tmpfs it did not create, so the mount is made group-writable by `SVIDLET_POLICY_GID` and the daemon runs with that group. Where no policy is distributed, leave the GID unset and drop the container: the mount stays root-only and the deployment is exactly what it was.
 
@@ -184,7 +186,7 @@ Applied to each knob:
 | Policy backend unreachable | block pod start | start without policy | **Start.** `SVIDLET_POLICY_REQUIRED=true` inverts this for operators who would rather a pod not start than start unpoliced — the choice is theirs, but the default keeps a second network dependency out of pod start-up. |
 | Bad policy bundle | apply it and hope | refuse it, keep the last good one | **Refuse.** A bundle that fails signature, digest or validation never reaches a pod, and the node keeps what it has. |
 | SPIFFE ID shape | pin an exact pattern | allow whatever the template builds | **No pattern by default.** `SVIDLET_SPIFFE_ID_PATTERN` is there for operators who want a second, independent gate; requiring one out of the box would be a cliff for a first deployment. |
-| `tls.key` permissions | root-only | world-readable | **0640 plus `fsGroup`.** Readable by the workload's group and nobody else; costs one line of `securityContext` in the pod spec. |
+| `tls.key` permissions | root-only | world-readable | **0640 plus `SVIDLET_KEY_GID`.** Readable by the workload's group and nobody else. The group is set by svidlet directly rather than relying on the kubelet's `fsGroup` handling, which depends on driver capabilities svidlet does not advertise and has not been verified on a real cluster. |
 | Liveness probe | tied to the PKI backend | process-only | **Process-only.** Tying liveness to Vault would restart every node in the fleet during a Vault outage, at the exact moment restarts are least helpful. |
 
 Each of these can be moved. What should not move is the principle: the failure of a dependency should cost you *new* work, never *running* work.
@@ -200,18 +202,19 @@ Each of these can be moved. What should not move is the principle: the failure o
 
 ## Open Questions
 
-1. **Certificate lifetime.** 24 h proposed; 48–72 h reduces Vault load and widens the outage window at the cost of a longer exposure window for a leaked key.
-2. **AppRole secret ID rotation** cadence. Rotation without restart is implemented — the secret ID is re-read on every login, and a 403 from Vault triggers exactly one re-login — but the cadence itself is a deployment decision. See the trust discussion above for why this credential is the part to replace first.
-3. **Peer verification.** mTLS is only useful if services check the peer's SPIFFE ID, not just the CA. A small client library per language (or guidance for `spiffe` crates and go-spiffe) should accompany the plugin.
-4. **Alternative authentication tiers.** Cloud IAM auth (per-node identity on cloud nodes) and Vault JWT auth against an aggregated JWKS endpoint are cleaner than AppRole where available; both can be added as additive login backends.
+1. **Rollout manifest freshness.** The signed `rollout.toml` carries no sequence number, timestamp or expiry, so a party that can serve old signed responses — a compromised registry, or the stale pull-through cache POLICY.md recommends for large fleets — can pin nodes to an old bundle, and can *undo a freeze* by replaying a pre-freeze manifest. `bundle_age_seconds` does not detect either, because a replayed manifest is a successful poll. A monotonic `sequence` or a `valid_until` in the manifest, checked on the node, closes it; it is a one-field change now and a schema migration later. Not yet implemented.
+2. **Certificate lifetime.** 24 h proposed; 48–72 h reduces Vault load and widens the outage window at the cost of a longer exposure window for a leaked key.
+3. **AppRole secret ID rotation** cadence. Rotation without restart is implemented — the secret ID is re-read on every login, and a 403 from Vault triggers exactly one re-login — but the cadence itself is a deployment decision. See the trust discussion above for why this credential is the part to replace first.
+4. **Peer verification.** mTLS is only useful if services check the peer's SPIFFE ID, not just the CA. A small client library per language (or guidance for `spiffe` crates and go-spiffe) should accompany the plugin.
+5. **Alternative authentication tiers.** Cloud IAM auth (per-node identity on cloud nodes) and Vault JWT auth against an aggregated JWKS endpoint are cleaner than AppRole where available; both can be added as additive login backends.
 
 ## Details (Appendix)
 
 ### A. Issuance flow
 
 1. Pod scheduled → kubelet calls `NodePublishVolume` with pod namespace, SA, name, UID.
-2. Plugin: generate key → CSR with URI SAN `spiffe://<td>/cluster/<c>/ns/<ns>/sa/<sa>` → `POST pki/sign/spiffe-<c>` with `metadata.node=<nodeName>`.
-3. Vault: policy check (cluster path) → role check (URI SAN prefix) → sign.
+2. Plugin: generate key → CSR with URI SAN `spiffe://<td>/cluster/<c>/ns/<ns>/sa/<sa>` → `POST pki/sign/spiffe-<c>`.
+3. Vault: policy check (cluster path) → role check (URI SAN prefix) → sign. The node name travels as an `X-Svidlet-Node` request header, which reaches the audit log only if the operator lists it in `audit_non_hmac_request_headers`.
 4. Plugin: write `tls.key`, `tls.crt`, `ca.crt` to tmpfs at the target path; record renewal time.
 5. Renew at 50–70 % of lifetime with jitter; atomic write; application reloads on inotify.
 

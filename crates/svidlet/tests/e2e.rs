@@ -185,6 +185,7 @@ fn config_with(
         ca_refresh_interval: std::time::Duration::from_secs(3600),
         tmpfs_size: "1m".into(),
         key_mode: 0o640,
+        key_gid: None,
         cert_mode: 0o644,
         metrics_addr: String::new(),
         log_level: svidlet::log::Level::Warn,

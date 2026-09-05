@@ -31,9 +31,9 @@ spec:
       securityContext:
         runAsNonRoot: true
         runAsUser: 1000
-        # tls.key is mode 0640; fsGroup plus the CSIDriver's
-        # `fsGroupPolicy: File` is what makes it readable by this user without
-        # making it readable by everyone.
+        # tls.key is mode 0640 and owned by SVIDLET_KEY_GID, so runAsGroup
+        # above is what makes it readable by this workload and nobody else.
+        # fsGroup is kept for any other volume this pod might mount.
         fsGroup: 1000
         seccompProfile:
           type: RuntimeDefault

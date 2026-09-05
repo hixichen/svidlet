@@ -716,3 +716,100 @@ fn a_source_without_a_trusted_key_refuses_to_start() {
     assert!(matches!(err, Error::Config(_)));
     assert!(err.to_string().contains("public key"));
 }
+
+// ------------------------------------------------------------- regressions
+
+#[test]
+fn a_failed_bundle_fetch_does_not_wedge_the_node_on_a_304() {
+    // Regression. The ETag used to be recorded as soon as the manifest
+    // verified, before the bundle it names was fetched. If the blob fetch then
+    // failed, the next poll sent that ETag, the registry answered 304, and the
+    // node concluded there was nothing to do — for ever, with
+    // bundle_age_seconds staying green because a 304 is a successful poll.
+    let stub = Stub::start();
+    let ci = Ci::new();
+    let dir = scratch("etag-wedge");
+
+    // A manifest naming a bundle the registry does not actually serve.
+    let missing = digest_of(&bundle("never-published", "x"));
+    stub.publish_rollout(ci.sign(manifest(&ring("all", "", &missing)).as_bytes()));
+
+    let source = source(&stub, &ci, dir.clone(), "prod-eu", "node-1");
+    assert!(source.poll().is_err(), "the blob is missing");
+    assert_eq!(source.current().digest, "");
+
+    // Now the bundle appears. The node must notice, which means it must not
+    // have cached an ETag for a manifest it never finished applying.
+    let real = stub.publish_blob(bundle("v1", "allow := true"));
+    stub.publish_rollout(ci.sign(manifest(&ring("all", "", &real)).as_bytes()));
+
+    let applied = source
+        .poll()
+        .expect("the poll succeeds")
+        .expect("and applies the bundle");
+    assert_eq!(applied.revision, real);
+    assert_eq!(
+        std::fs::read_to_string(dir.join("current/rules/authz.rego")).unwrap(),
+        "allow := true"
+    );
+
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn an_unchanged_manifest_is_still_answered_from_the_etag_once_applied() {
+    // The other half: once a bundle really is on disk, the ETag must be used,
+    // or every node re-downloads the manifest on every poll.
+    let stub = Stub::start();
+    let ci = Ci::new();
+    let dir = scratch("etag-works");
+
+    let digest = stub.publish_blob(bundle("v1", "x"));
+    stub.publish_rollout(ci.sign(manifest(&ring("all", "", &digest)).as_bytes()));
+
+    let source = source(&stub, &ci, dir.clone(), "prod-eu", "node-1");
+    assert!(source.poll().unwrap().is_some());
+
+    for _ in 0..3 {
+        assert!(source.poll().unwrap().is_none());
+    }
+    assert_eq!(stub.not_modified.load(Ordering::SeqCst), 3);
+
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn a_node_with_no_bundle_applied_never_short_circuits_on_an_etag() {
+    // The conservative half of the ETag rule. Until a bundle is actually on
+    // disk, every poll re-reads the manifest, because a 304 would assert
+    // "nothing changed" about a bundle this node has never had. It costs one
+    // small download per interval and it always makes progress.
+    let stub = Stub::start();
+    let ci = Ci::new();
+    let dir = scratch("etag-no-bundle");
+
+    let digest = stub.publish_blob(bundle("v1", "x"));
+    let frozen = format!("schema = 1\nfreeze = true\n{}", ring("all", "", &digest));
+    stub.publish_rollout(ci.sign(frozen.as_bytes()));
+
+    let source = source(&stub, &ci, dir.clone(), "prod-eu", "node-1");
+    for _ in 0..3 {
+        assert!(
+            source.poll().unwrap().is_none(),
+            "frozen: nothing is applied"
+        );
+    }
+    assert_eq!(
+        stub.not_modified.load(Ordering::SeqCst),
+        0,
+        "a node holding no bundle must not accept a 304"
+    );
+
+    // Once the freeze lifts and a bundle lands, the ETag starts being used.
+    stub.publish_rollout(ci.sign(manifest(&ring("all", "", &digest)).as_bytes()));
+    assert!(source.poll().unwrap().is_some());
+    assert!(source.poll().unwrap().is_none());
+    assert_eq!(stub.not_modified.load(Ordering::SeqCst), 1);
+
+    std::fs::remove_dir_all(&dir).unwrap();
+}

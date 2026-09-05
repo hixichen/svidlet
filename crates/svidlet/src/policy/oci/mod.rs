@@ -273,9 +273,16 @@ impl BundleSource {
         let toml = verify::open(&envelope, &self.key)?;
         let rollout = Rollout::parse(&toml)?;
         let _ = self.store.save_manifest(&toml);
-        self.record_success(new_etag);
+        // The manifest verified, so the poll succeeded — but the ETag is only
+        // recorded once the bundle it names is on disk. Recording it here would
+        // make a failed blob fetch permanent: the next poll would 304 and never
+        // retry.
+        self.record_success(None);
 
+        // Nothing further to do, and the manifest is confirmed current: it is
+        // now safe to remember its ETag.
         if rollout.freeze {
+            self.remember_etag(new_etag);
             // The kill switch. Deliberately blocks rollbacks too: a human
             // looking at a live incident should not be racing an automated
             // promotion, in either direction.
@@ -290,11 +297,13 @@ impl BundleSource {
                 node = self.node,
                 bucket = self.bucket(),
             );
+            self.remember_etag(new_etag);
             return Ok(None);
         };
 
         let current = self.current();
         if current.digest == ring.bundle && self.store.has(&ring.bundle) {
+            self.remember_etag(new_etag);
             if current.ring != ring.name {
                 info!(
                     "ring changed but the bundle did not",
@@ -344,6 +353,9 @@ impl BundleSource {
             .collect();
         self.store.prune(&keep);
 
+        // Applied. Only now is a 304 on this ETag a truthful "nothing to do".
+        self.remember_etag(new_etag);
+
         info!(
             "bundle applied",
             ring = ring.name,
@@ -354,15 +366,30 @@ impl BundleSource {
         Ok(Some(bundle))
     }
 
+    /// The ETag to send, if sending one is safe.
+    ///
+    /// Only safe while the bundle that ETag went with is actually unpacked on
+    /// this node. Otherwise a 304 says "nothing changed" about a bundle we
+    /// never applied, and the node stalls on no policy at all until the
+    /// upstream manifest happens to move — with `bundle_age_seconds` staying
+    /// green throughout, because a 304 is a successful poll. Sending no ETag
+    /// costs one manifest download and always makes progress.
     fn current_etag(&self) -> Option<String> {
         let state = self.state.lock().expect("bundle state poisoned");
-        // An ETag is only usable while the bundle it went with is still on
-        // disk; otherwise a 304 would leave the node with nothing to publish.
-        if state.digest.is_empty() || self.store.has(&state.digest) {
-            Some(state.manifest_etag.clone()).filter(|e| !e.is_empty())
-        } else {
-            None
+        if state.digest.is_empty() || !self.store.has(&state.digest) {
+            return None;
         }
+        Some(state.manifest_etag.clone()).filter(|e| !e.is_empty())
+    }
+
+    /// Remember the manifest ETag, now that the bundle it names is in place.
+    fn remember_etag(&self, etag: Option<String>) {
+        let Some(etag) = etag else { return };
+        let mut state = self.state.lock().expect("bundle state poisoned");
+        state.manifest_etag = etag;
+        let snapshot = state.clone();
+        drop(state);
+        let _ = self.store.save_state(&snapshot);
     }
 
     fn record_success(&self, etag: Option<String>) {

@@ -25,6 +25,7 @@ use svidlet::volume::{self, Identity, Modes};
 const MODES: Modes = Modes {
     key: 0o640,
     cert: 0o644,
+    key_gid: None,
 };
 
 fn scratch(name: &str) -> PathBuf {

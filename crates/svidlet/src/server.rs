@@ -317,6 +317,7 @@ mod tests {
             ca_refresh_interval: Duration::from_secs(3600),
             tmpfs_size: "1m".into(),
             key_mode: 0o640,
+            key_gid: None,
             cert_mode: 0o644,
             metrics_addr: String::new(),
             log_level: crate::log::Level::Warn,

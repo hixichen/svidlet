@@ -344,6 +344,11 @@ kubectl apply -f deploy/csidriver.yaml
 kubectl apply -f deploy/daemonset.yaml     # then set the ConfigMap and Secret
 ```
 
+[docs/HOWTO.md](docs/HOWTO.md) covers what a workload does with the result: reading the
+files across a renewal, checking a peer's SPIFFE ID (the step that makes mTLS mean
+anything), exchanging the certificate for AWS or GCP credentials, and what "revoke"
+means in a system with no CRL.
+
 Then give a workload an identity by declaring the volume and mounting it into
 only the containers that should hold it — see [deploy/example-workload.yaml](deploy/example-workload.yaml):
 
@@ -355,8 +360,10 @@ volumes:
       readOnly: true
 ```
 
-`tls.key` is written mode `0640`, so a non-root workload needs `fsGroup` set; the
-CSIDriver's `fsGroupPolicy: File` makes the kubelet apply it.
+`tls.key` is written mode `0640`. For a non-root workload to read it, set
+`SVIDLET_KEY_GID` to the workload's `runAsGroup` — svidlet then owns the key with that
+group directly, rather than depending on the kubelet's `fsGroup` handling, which has not
+been verified on a real cluster. See [HOWTO.md](docs/HOWTO.md).
 
 ## Credentials
 
@@ -438,6 +445,7 @@ between clusters only by a ConfigMap.
 | `SVIDLET_STARTUP_SPREAD` | `300s` | Window over which already-due renewals are spread after a restart |
 | `SVIDLET_CA_REFRESH_INTERVAL` | `1h` | Trust-bundle refresh interval |
 | `SVIDLET_KEY_MODE` / `SVIDLET_CERT_MODE` | `0640` / `0644` | File modes |
+| `SVIDLET_KEY_GID` | — | Group owning `tls.key`; set to the workload's `runAsGroup` |
 | `SVIDLET_TMPFS_SIZE` | `1m` | tmpfs `size=` per volume |
 | `SVIDLET_METRICS_ADDR` | `0.0.0.0:9464` | Prometheus endpoint; empty disables |
 | `SVIDLET_DRIVER_NAME` | `csi.svidlet.io` | CSI driver name |
@@ -613,6 +621,7 @@ hack/build-bundle.sh      What CI does: package, sign and push a bundle and roll
 hack/coverage.sh          Coverage report with an 80% floor
 docs/DESIGN.md            Design document
 docs/POLICY.md            Policy bundle distribution: rings, signing, rollout
+docs/HOWTO.md             Using a certificate: verify a peer, reach AWS/GCP, revoke
 ```
 
 `svidlet-issue` knows nothing about CSI or Kubernetes. It is the piece that survives the

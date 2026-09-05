@@ -12,6 +12,9 @@ use ureq::Agent;
 
 use super::Error;
 
+/// An OCI manifest is a few kilobytes. This is generous.
+const MAX_MANIFEST_BYTES: usize = 1024 * 1024;
+
 /// A parsed `registry/repository:tag` reference.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Reference {
@@ -188,10 +191,22 @@ impl Registry {
             .get("etag")
             .and_then(|v| v.to_str().ok())
             .map(str::to_string);
-        let body = response
+        // Capped like a blob read: an OCI manifest is a few kilobytes, and a
+        // compromised registry or a misbehaving pull-through cache must not be
+        // able to stream gigabytes into a process on a 16 MB budget.
+        use std::io::Read as _;
+        let mut body = String::new();
+        response
             .body_mut()
-            .read_to_string()
+            .as_reader()
+            .take(MAX_MANIFEST_BYTES as u64 + 1)
+            .read_to_string(&mut body)
             .map_err(|e| Error::Fetch(format!("GET {url}: {e}")))?;
+        if body.len() > MAX_MANIFEST_BYTES {
+            return Err(Error::Rejected(format!(
+                "{url} returned more than the {MAX_MANIFEST_BYTES} byte manifest limit"
+            )));
+        }
         let manifest: Manifest = serde_json::from_str(&body)
             .map_err(|e| Error::Malformed(format!("{url} is not an OCI manifest: {e}")))?;
 
