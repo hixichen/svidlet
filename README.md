@@ -9,9 +9,47 @@
 > no control plane and no API-server dependency — for pod identity across multiple
 > Kubernetes clusters. Read it in that spirit.
 
-Svidlet gives pods short-lived X.509 certificates carrying a SPIFFE ID
-(`spiffe://<trust-domain>/cluster/<cluster>/ns/<namespace>/sa/<serviceaccount>`)
-so services can authenticate each other with mutual TLS at the application layer.
+## TL;DR
+
+Every pod that should have an identity gets a short-lived X.509 certificate carrying a
+SPIFFE ID, so services can authenticate each other with mutual TLS at the application
+layer instead of trusting network position.
+
+One static binary per node, running as a CSI node plugin. When a pod starts, the kubelet
+tells Svidlet which namespace and ServiceAccount it belongs to; Svidlet generates a P-256
+key on the node, has a PKI backend sign a certificate for
+`spiffe://<trust-domain>/cluster/<cluster>/ns/<namespace>/sa/<serviceaccount>`, and
+mounts it into only the containers that should hold it. It renews in the background and
+can also ship the authorization policy that goes with the identity.
+
+No control plane, no API-server access, no sidecars, no CRDs, no datastore. 2.2 MB
+resident idle, 5.9 MB with 2000 certificates on the node.
+
+## Goal
+
+Pod identity across multiple Kubernetes clusters, with the smallest thing that can
+honestly do it:
+
+- **Lightweight.** One process per node instead of three, or an agent plus a server and
+  its datastore. The budget is **16 MB resident or under**, which is what makes it
+  deployable on edge and resource-constrained nodes where the existing agents do not fit.
+  Measured: 2.2 MB idle, 5.9 MB with 2000 certificates.
+- **Easy to deploy.** A DaemonSet, a ConfigMap and a Secret. One PKI credential per
+  cluster, set up once; adding a workload never touches the PKI backend.
+- **Easy to maintain.** Nothing to run but the DaemonSet. No control plane to upgrade, no
+  database to back up, no API-server objects churning through etcd on every issuance. The
+  plugin keeps no state of its own — after a restart it recovers from the certificates
+  already on disk.
+- **Multi-cluster by construction.** The cluster name lives in the SPIFFE path, not the
+  trust domain, so one trust domain spans every cluster and cross-cluster mTLS needs no
+  federation or bundle exchange. Vault enforces the per-cluster prefix, so a compromised
+  node can only mint identities in its own cluster.
+
+Explicitly **not** goals: replacing SPIRE, JWT SVIDs, evaluating or enforcing policy
+(Svidlet delivers bytes), certificate revocation (short lifetimes replace it), or
+federation with external trust domains.
+
+## How it fits together
 
 It is a single small Rust process per node, running as a CSI node plugin:
 
@@ -443,9 +481,10 @@ the kubelet:
 | 500 | 4.2 MB | ~1.7 KB |
 | 2000 | 5.9 MB | ~1.9 KB |
 
-That is inside the design's 5–8 MB target with room to spare: the design's planning
-ceiling is 20–50 containers per node, where this sits at ~2.3 MB. The binary is ~2.5 MB,
-statically linked against musl, with no API-server client and no sidecars.
+The budget is **16 MB resident or under**. At the design's planning ceiling of 20–50
+containers per node this sits at roughly 2.3 MB, and even at 2000 certificates — far more
+than a node will hold — it is a third of the budget. The binary is ~2.5 MB, statically
+linked against musl, with no API-server client and no sidecars.
 
 Two caveats. These numbers are from macOS, where the volumes are plain directories rather
 than tmpfs and RSS is accounted differently — treat them as an order of magnitude and
@@ -457,7 +496,9 @@ The dependency tree is a compromise worth naming: the design says "no Tokio-heav
 dependency tree", but CSI is gRPC, and `tonic` brings `tokio`, `hyper` and `h2`. The
 reactor is single-threaded with at most four blocking threads, and the metrics endpoint,
 the logger and the TOML-adjacent plumbing are hand-rolled rather than pulled in. The
-measurements above say that compromise cost less than feared.
+measurements above say that compromise cost far less than feared — it is the difference
+between comfortably inside a 16 MB budget and comfortably inside a tighter one, not
+between fitting and not fitting.
 
 Unsafe code is denied crate-wide. `svidlet-issue` is `#![forbid(unsafe_code)]`; the
 plugin has exactly two `unsafe` blocks, both `libc` FFI for `mount`/`umount2`, each

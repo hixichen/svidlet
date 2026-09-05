@@ -1,6 +1,6 @@
 //! A ~100-line logfmt logger.
 //!
-//! A DaemonSet with a 5–8 MB budget does not need a subscriber framework: this
+//! A DaemonSet with a 16 MB budget does not need a subscriber framework: this
 //! writes one line per event to stderr, which is where a container runtime
 //! collects it.
 

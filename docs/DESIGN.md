@@ -10,7 +10,7 @@ Every pod that should have an identity gets a short-lived X.509 certificate carr
 
 Svidlet is a small Rust DaemonSet that acts as a CSI (Container Storage Interface) node plugin. When a pod starts, the kubelet tells the plugin which namespace and ServiceAccount the pod belongs to; the plugin generates a private key on the node, asks a PKI backend (HashiCorp Vault PKI first; other backends later) to sign a certificate with the identity `spiffe://<trust-domain>/cluster/<cluster>/ns/<namespace>/sa/<serviceaccount>`, and mounts the result into only the containers that should hold it. The plugin authenticates to Vault with one AppRole per cluster.
 
-Why this shape: it fits very small DaemonSet memory budgets (target 5–8 MB), keeps certificate issuance off the Kubernetes API server, works on Kubernetes 1.31+, respects restricted Pod Security Standards, and scales to tens of thousands of nodes with one PKI credential per cluster.
+Why this shape: it fits a small DaemonSet memory budget (target: 16 MB resident or under), keeps certificate issuance off the Kubernetes API server, works on Kubernetes 1.31+, respects restricted Pod Security Standards, and scales to tens of thousands of nodes with one PKI credential per cluster.
 
 ## Problem
 
@@ -46,7 +46,7 @@ Why this shape: it fits very small DaemonSet memory budgets (target 5–8 MB), k
 - Renews at a random point between 50 % and 70 % of the certificate lifetime, writing files atomically so applications can reload on file change.
 - On restart, rebuilds its renewal list from the kubelet's CSI volume records under `/var/lib/kubelet/pods`; never re-issues on restart.
 - Refreshes `ca.crt` from Vault's CA chain periodically.
-- Target footprint: 5–8 MB resident memory, one static binary (musl), no Kubernetes API server access, no Tokio-heavy dependency tree.
+- Target footprint: 16 MB resident memory or under, one static binary (musl), no Kubernetes API server access, no Tokio-heavy dependency tree.
 
 **2. PKI backend — Vault PKI (one-time configuration per cluster)**
 

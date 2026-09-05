@@ -168,9 +168,12 @@ spec:
           resources:
             requests:
               cpu: 10m
+              # Measured: 2.2 MB idle, 5.9 MB with 2000 certificates on the node.
               memory: 24Mi
             limits:
-              memory: 96Mi
+              # The design budgets 16 MB resident; this leaves headroom for a
+              # large bundle being unpacked without letting a leak go unnoticed.
+              memory: 64Mi
       volumes:
         - name: kubelet-dir
           hostPath:
