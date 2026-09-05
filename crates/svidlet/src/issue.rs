@@ -13,9 +13,8 @@ use svidlet_issue::{
 
 use crate::config::Config;
 use crate::metrics::Metrics;
-use crate::policy::PolicyManager;
 use crate::store::Store;
-use crate::volume::{self, Material, Modes};
+use crate::volume::{self, Identity, Modes};
 use crate::{debug, info};
 
 pub struct Publisher {
@@ -25,7 +24,6 @@ pub struct Publisher {
     pub policy: Arc<IdPolicy>,
     pub store: Arc<Store>,
     pub metrics: Arc<Metrics>,
-    pub policy_manager: Arc<PolicyManager>,
     /// Trust bundle fetched from the backend's CA endpoint. Preferred over the
     /// chain returned alongside a signature, because it also carries a new root
     /// during a CA rotation, before any leaf has been signed by it.
@@ -39,7 +37,6 @@ impl Publisher {
         issuer: Arc<dyn Issuer>,
         store: Arc<Store>,
         metrics: Arc<Metrics>,
-        policy_manager: Arc<PolicyManager>,
     ) -> Self {
         Publisher {
             cfg,
@@ -47,7 +44,6 @@ impl Publisher {
             policy,
             store,
             metrics,
-            policy_manager,
             ca: Mutex::new(String::new()),
         }
     }
@@ -56,7 +52,6 @@ impl Publisher {
         Modes {
             key: self.cfg.key_mode,
             cert: self.cfg.cert_mode,
-            policy_dir: self.cfg.policy.directory.clone(),
         }
     }
 
@@ -89,66 +84,16 @@ impl Publisher {
             cached
         };
 
-        // Whatever policy is currently held. `None` means none has arrived, and
-        // the writer then leaves any policy already on disk alone — a renewal
-        // during a policy-backend outage must not clear it.
-        let policy = self.current_policy(spiffe_id, target);
-
-        volume::publish(
+        volume::publish_identity(
             target,
-            &Material {
+            &Identity {
                 key_pem: generated.key_pem,
                 cert_chain_pem: bundle.cert_chain_pem.clone(),
                 ca_pem,
-                policy,
             },
             self.modes(),
         )?;
         Ok(bundle)
-    }
-
-    /// The policy bundle to write for an identity: what the backend last sent,
-    /// or what is already published if nothing has arrived yet.
-    fn current_policy(
-        &self,
-        spiffe_id: &SpiffeId,
-        target: &Path,
-    ) -> Option<crate::policy::PolicyBundle> {
-        if !self.policy_manager.enabled() {
-            return None;
-        }
-        self.policy_manager.bundle(spiffe_id.as_str()).or_else(|| {
-            volume::read_published(target, &self.cfg.policy.directory)
-                .ok()
-                .and_then(|m| m.policy)
-        })
-    }
-
-    /// Rewrite one volume's policy directory, leaving its certificate alone.
-    ///
-    /// Returns false when the volume has gone away, which is the normal race
-    /// between a pod being deleted and an update arriving for it.
-    pub fn apply_policy(&self, spiffe_id: &SpiffeId, target: &Path) -> Result<bool> {
-        let Some(bundle) = self.policy_manager.bundle(spiffe_id.as_str()) else {
-            return Ok(false);
-        };
-        let current = match volume::read_published(target, &self.cfg.policy.directory) {
-            Ok(m) => m,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
-            Err(e) => return Err(Error::Io(e)),
-        };
-        if current.policy.as_ref() == Some(&bundle) {
-            return Ok(false);
-        }
-        volume::publish(
-            target,
-            &Material {
-                policy: Some(bundle),
-                ..current
-            },
-            self.modes(),
-        )?;
-        Ok(true)
     }
 
     /// Fetch the trust bundle and, if it changed, rewrite `ca.crt` in every
@@ -171,26 +116,25 @@ impl Publisher {
 
         let mut updated = 0;
         for entry in self.store.all() {
-            let current =
-                match volume::read_published(&entry.target_path, &self.cfg.policy.directory) {
-                    Ok(m) => m,
-                    Err(e) => {
-                        debug!(
-                            "skipping ca.crt refresh for unreadable volume",
-                            path = entry.target_path.display(),
-                            error = e
-                        );
-                        continue;
-                    }
-                };
+            let current = match volume::read_identity(&entry.target_path) {
+                Ok(m) => m,
+                Err(e) => {
+                    debug!(
+                        "skipping ca.crt refresh for unreadable volume",
+                        path = entry.target_path.display(),
+                        error = e
+                    );
+                    continue;
+                }
+            };
             if current.ca_pem == fetched {
                 continue;
             }
-            let material = Material {
+            let refreshed = Identity {
                 ca_pem: fetched.clone(),
                 ..current
             };
-            match volume::publish(&entry.target_path, &material, self.modes()) {
+            match volume::publish_identity(&entry.target_path, &refreshed, self.modes()) {
                 Ok(()) => updated += 1,
                 Err(e) => {
                     debug!(

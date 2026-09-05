@@ -24,6 +24,21 @@ use crate::metrics::Metrics;
 use crate::store::{jittered_renew_at, Entry, PodRef};
 use crate::{debug, error, info, volume, warn};
 
+/// Wait for `svidlet-policy` to publish a revision file into this volume.
+async fn wait_for_policy(target: &std::path::Path, timeout: std::time::Duration) -> bool {
+    let deadline = tokio::time::Instant::now() + timeout;
+    let revision = target.join(crate::config::REVISION_FILE);
+    loop {
+        if revision.exists() {
+            return true;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
+}
+
 /// Map an issuance failure onto the gRPC status the kubelet should see.
 ///
 /// The distinction matters in `kubectl describe pod`: `InvalidArgument` says
@@ -161,43 +176,15 @@ impl Node for NodeService {
             )));
         }
 
-        // Start following this identity's policy before issuing, so the bundle
-        // is on its way while the certificate is being signed.
-        publisher.policy_manager.subscribe(spiffe_id.as_str());
-        if publisher.policy_manager.enabled() && publisher.cfg.policy.required {
-            let timeout = publisher.cfg.policy.initial_timeout;
-            if publisher
-                .policy_manager
-                .wait_for(spiffe_id.as_str(), timeout)
-                .await
-                .is_none()
-            {
-                // The operator asked for policy to be present before a pod
-                // starts. Failing here means the pod stays pending, which is
-                // what they chose over starting it unpoliced.
-                publisher.policy_manager.unsubscribe(spiffe_id.as_str());
-                error!(
-                    "no policy arrived; refusing to publish",
-                    spiffe_id = spiffe_id,
-                    pod = pod.name,
-                    namespace = pod.namespace,
-                    waited_secs = timeout.as_secs_f64(),
-                );
-                return Err(Status::unavailable(format!(
-                    "no policy for {spiffe_id} after {:?}; SVIDLET_POLICY_REQUIRED is set",
-                    timeout
-                )));
-            }
-        }
-
         let tmpfs_size = publisher.cfg.tmpfs_size.clone();
+        let policy_gid = publisher.cfg.policy_gid;
         let target_for_task = target.clone();
         let id_for_task = spiffe_id.clone();
 
         // Key generation and the call to the PKI backend both block.
         let started = std::time::Instant::now();
         let outcome = tokio::task::spawn_blocking(move || {
-            volume::ensure_tmpfs(&target_for_task, &tmpfs_size)
+            volume::ensure_tmpfs(&target_for_task, &tmpfs_size, policy_gid)
                 .map_err(svidlet_issue::Error::Io)?;
             publisher.issue(&id_for_task, &target_for_task)
         })
@@ -215,9 +202,6 @@ impl Node for NodeService {
                 // Leave nothing half-published behind: the kubelet will retry,
                 // and a stale tmpfs would make the retry look like a republish.
                 let _ = volume::unpublish(&target);
-                self.publisher
-                    .policy_manager
-                    .unsubscribe(spiffe_id.as_str());
                 if e.is_caller_error() {
                     // A pod asked for something it may not have. Loud enough to
                     // find, but not an operational alert.
@@ -243,6 +227,28 @@ impl Node for NodeService {
                 return Err(status_for(e));
             }
         };
+
+        // The only thing svidlet knows about policy: whether a revision file
+        // has appeared beside the certificate it just wrote. The policy daemon
+        // discovers this volume by reading that certificate, so the certificate
+        // has to exist first. No IPC, no shared credential, one direction.
+        if self.publisher.cfg.policy.required {
+            let timeout = self.publisher.cfg.policy.initial_timeout;
+            if !wait_for_policy(&target, timeout).await {
+                let _ = volume::unpublish(&target);
+                error!(
+                    "no policy arrived; refusing to publish",
+                    spiffe_id = spiffe_id,
+                    pod = pod.name,
+                    namespace = pod.namespace,
+                    waited_secs = timeout.as_secs_f64(),
+                );
+                return Err(Status::unavailable(format!(
+                    "no policy for {spiffe_id} after {timeout:?}; SVIDLET_POLICY_REQUIRED is set \
+                     and svidlet-policy has not published a bundle for it"
+                )));
+            }
+        }
 
         let renew_at = jittered_renew_at(
             bundle.not_before,
@@ -285,13 +291,6 @@ impl Node for NodeService {
         let target = PathBuf::from(&req.target_path);
 
         let removed = self.publisher.store.remove(&target);
-        if let Some(entry) = &removed {
-            // Stop following policy for an identity this node no longer hosts,
-            // so the backend is not pushing updates nobody will write.
-            self.publisher
-                .policy_manager
-                .unsubscribe(entry.spiffe_id.as_str());
-        }
         let target_for_task = target.clone();
         tokio::task::spawn_blocking(move || volume::unpublish(&target_for_task))
             .await

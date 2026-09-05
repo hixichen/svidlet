@@ -30,10 +30,11 @@ resident idle, 5.9 MB with 2000 certificates on the node.
 Pod identity across multiple Kubernetes clusters, with the smallest thing that can
 honestly do it:
 
-- **Lightweight.** One process per node instead of three, or an agent plus a server and
-  its datastore. The budget is **16 MB resident or under**, which is what makes it
-  deployable on edge and resource-constrained nodes where the existing agents do not fit.
-  Measured: 2.2 MB idle, 5.9 MB with 2000 certificates.
+- **Lightweight.** One process per node for identity, plus an optional second for policy
+  — against three Go processes, or an agent with a server and its datastore. The budget
+  is **16 MB resident or under**, which is what makes it deployable on edge and
+  resource-constrained nodes where the existing agents do not fit. Measured: 3.3 MB idle,
+  7.2 MB with 2000 certificates, both processes together.
 - **Easy to deploy.** A DaemonSet, a ConfigMap and a Secret. One PKI credential per
   cluster, set up once; adding a workload never touches the PKI backend.
 - **Easy to maintain.** Nothing to run but the DaemonSet. No control plane to upgrade, no
@@ -48,6 +49,12 @@ honestly do it:
 Explicitly **not** goals: replacing SPIRE, JWT SVIDs, evaluating or enforcing policy
 (Svidlet delivers bytes), certificate revocation (short lifetimes replace it), or
 federation with external trust domains.
+
+**Known gap:** Svidlet issues identity to whatever the cluster admitted. Verifying that a
+workload is what it claims to be — signed images, a reviewed pod spec — needs a
+validating admission controller, which is essential and is
+[future work](docs/DESIGN.md#admission-control-the-missing-half-of-the-chain), not
+something this does today.
 
 ## How it fits together
 
@@ -89,10 +96,15 @@ recovery, trust-bundle refresh, policy bundle streaming, and Prometheus metrics.
 Policy is distributed either way: streamed per identity over gRPC, or pulled as signed
 OCI bundles with a staged ring rollout.
 
-219 tests, ~88% line coverage, plus six integration tests that run against a real
-Vault (`./hack/local-vault.sh`).
+Policy distribution runs in a second process so that a compromise of the policy path
+cannot mint identities — see [Policy](#policy).
 
-Not started: cloud IAM authentication, PKI backends other than Vault, and
+225 tests, plus six integration tests that run against a real Vault
+(`./hack/local-vault.sh`).
+
+Not started: a validating admission controller for workload provenance (the
+[missing half](docs/DESIGN.md#admission-control-the-missing-half-of-the-chain) of the
+trust chain), cloud IAM authentication, PKI backends other than Vault, and
 `PodCertificateRequest` signer mode for Kubernetes 1.35+.
 
 It has not been run on a production cluster. Treat it as working code that still
@@ -139,6 +151,15 @@ is already root on the node, so this adds no trust. Compromising one node means 
 able to mint any identity **in that cluster**; cross-cluster impersonation is blocked
 by Vault policy, not by the plugin.
 
+**Svidlet issues identity to whatever was admitted.** It does not decide what should be
+admitted — anyone who can create a pod in namespace N with ServiceAccount S gets S's
+identity. The real boundary is your RBAC on pod creation plus your admission control. A
+validating admission controller that checks workload provenance is the missing half of
+this chain, and it is
+[planned rather than done](docs/DESIGN.md#admission-control-the-missing-half-of-the-chain);
+composing with Sigstore policy-controller or Kyverno is the likely shape, since a webhook
+of svidlet's own would put it on the critical path of every pod create in the cluster.
+
 **The AppRole credential is the weakest part of the design.** It is a shared bearer
 secret in a Kubernetes Secret: whoever can read that Secret can mint any identity in
 the cluster, from anywhere, until it is rotated. It proves possession of a secret, not
@@ -175,8 +196,23 @@ else's identity.
 
 ## Policy
 
-Two sources, behind one seam, writing to the same `policy/` directory. Most
-deployments want one or the other.
+Policy distribution runs in **`svidlet-policy`, a separate process**. That is deliberate:
+otherwise identity issuance and authorization configuration would share a trust root and
+an address space, and a bug anywhere in the policy path — OCI manifests, tar archives,
+TOML, a gRPC stream from somebody else's backend — would sit in the process holding the
+credential that mints identities. Split, the same bug yields a non-root process with a
+read-only registry token and no way to issue anything.
+
+The two share no state and no IPC. The interface is the volume, one direction: svidlet
+writes `tls.crt`, the daemon reads it to learn the identity, and the daemon writes
+`policy/` beside it. Each owns its own atomic swap chain, so a certificate renewal
+structurally cannot disturb policy and vice versa.
+
+This does not make svidlet's own compromise less bad — it is root on the node, and root
+can rewrite anything. What it closes is the direction carrying the larger attack surface.
+[docs/DESIGN.md](docs/DESIGN.md#two-processes-one-volume) states both halves.
+
+Within the daemon there are two sources, and most deployments want one or the other.
 
 | | gRPC stream | OCI bundle |
 |---|---|---|
@@ -187,7 +223,9 @@ deployments want one or the other.
 | Provenance | transport trust only | signed artifact, content-addressed |
 
 A per-identity bundle from the stream takes precedence over the fleet bundle for that
-identity. `SVIDLET_POLICY_ENABLED=false` switches off both.
+identity. `SVIDLET_POLICY_ENABLED=false` switches off both. If you distribute no policy
+at all, drop the `svidlet-policy` container from the DaemonSet and leave
+`SVIDLET_POLICY_GID` unset: the volume stays root-only and nothing changes for svidlet.
 
 ### Pulled: signed OCI bundles with a ring rollout
 
@@ -270,7 +308,7 @@ SVIDLET_POLICY_ENABLED=false cargo run -p svidlet     # no policy backend needed
 ## Try it
 
 ```sh
-cargo test                  # 219 tests, no cluster and no Vault needed
+cargo test                  # 225 tests, no cluster and no Vault needed
 ./hack/coverage.sh          # coverage report; fails under 80%
 ./hack/bench-memory.sh      # resident memory under load
 
@@ -410,6 +448,31 @@ Durations accept `30s`, `10m`, `24h`, `3d`, or a bare number of seconds. Every v
 validated at start-up: a bad template, regex, duration, file mode or log level stops
 the process with a message naming the variable, rather than being silently ignored.
 
+## Failure behaviour
+
+Once a pod is running, every remaining decision is a trade between a tighter posture and
+a system people can operate. All of them resolve the same way:
+
+> **Fail stale — not open, and not closed.**
+
+Anything already issued keeps working; anything new is delayed. A Vault outage, an
+unreachable registry, a policy backend that has gone away — none of them touch running
+traffic, and all of them show up as a climbing
+`svidlet_earliest_certificate_expiry_seconds` or `svidlet_bundle_age_seconds`. Those two
+gauges are what to alert on.
+
+Concretely: a certificate that cannot be renewed is kept, not dropped (renewal starts at
+half the lifetime, so there is a lot of runway). Liveness is not tied to the PKI backend,
+because restarting every node during a Vault outage helps nobody. A policy bundle that
+fails its signature or validation never reaches a pod, and the node keeps the last good
+one. A policy backend that is down does not block pod start unless you set
+`SVIDLET_POLICY_REQUIRED=true`.
+
+Each of these is a knob and can be moved; the table in
+[docs/DESIGN.md](docs/DESIGN.md#after-admission-balancing-security-and-usability) gives
+the secure and usable ends of each. What should not move is the principle: a dependency
+failing should cost you *new* work, never *running* work.
+
 ## Errors
 
 Every failure carries a stable error code, used both in logs (`code=…`) and as a
@@ -474,17 +537,28 @@ Measured with `./hack/bench-memory.sh`, which runs the real release binary again
 real Vault and drives it over the real CSI protocol with `svidlet-bench` standing in for
 the kubelet:
 
-| Certificates on the node | Resident | Marginal cost per certificate |
-|---|---|---|
-| 0 (idle) | 2.2 MB | — |
-| 100 | 3.4 MB | ~1.2 KB |
-| 500 | 4.2 MB | ~1.7 KB |
-| 2000 | 5.9 MB | ~1.9 KB |
+| Certificates on the node | `svidlet` | `svidlet-policy` | Both |
+|---|---|---|---|
+| 0 (idle) | 2.0 MB | 1.3 MB | 3.3 MB |
+| 100 | 3.1 MB | 1.3 MB | 4.4 MB |
+| 500 | 3.8 MB | 1.4 MB | 5.3 MB |
+| 2000 | 5.8 MB | 1.4 MB | 7.2 MB |
 
-The budget is **16 MB resident or under**. At the design's planning ceiling of 20–50
-containers per node this sits at roughly 2.3 MB, and even at 2000 certificates — far more
-than a node will hold — it is a third of the budget. The binary is ~2.5 MB, statically
-linked against musl, with no API-server client and no sidecars.
+The two processes are the point, not an accident — see
+[Policy](#policy) and
+[docs/DESIGN.md](docs/DESIGN.md#two-processes-one-volume). Separating them costs
+1.3 MB. Drop the second container if you distribute no policy and the figure is the
+first column alone.
+
+The budget is **16 MB resident or under**, for both processes together. At the design's
+planning ceiling of 20–50 containers per node the pair sits at roughly 3.5 MB, and even
+at 2000 certificates — far more than a node will hold — it is under half the budget. The
+image is ~5 MB for both binaries, statically linked against musl, with no API-server
+client and no sidecars.
+
+The `svidlet-policy` figures are idle: the benchmark drives certificates, not policy, so
+the daemon was scanning and finding nothing. A node genuinely distributing policy will
+sit higher by roughly the size of one unpacked bundle.
 
 Two caveats. These numbers are from macOS, where the volumes are plain directories rather
 than tmpfs and RSS is accounted differently — treat them as an order of magnitude and
@@ -513,14 +587,17 @@ crates/
     src/csi/              Identity, Node and kubelet-registration gRPC services
     src/issue.rs          Key → CSR → backend → files, shared by publish and renewal
     src/renew.rs          Renewal, trust-bundle refresh, policy apply and reaper loops
-    src/policy/           Policy: the manager, the gRPC stream client
+    src/policy/           Policy (all of it runs in svidlet-policy, not svidlet)
+    src/policy/daemon.rs  The daemon: find volumes by their certificates, write policy
     src/policy/oci/       Signed OCI bundles: registry, rollout rings, verify, tar, store
+    src/bin/svidlet-policy.rs  The second binary
     src/recover.rs        Rebuilding the renewal list from the kubelet's records
     src/volume.rs         tmpfs mounts and atomic publication of tls.crt/tls.key/ca.crt
     src/store.rs          Published volumes, renewal deadlines, backoff
     tests/e2e.rs          Publish → renew → recover → unpublish, against a real CA
     tests/rollout.rs      Bundle rollout against a stub registry: promote, roll back,
                           freeze, bad signature, offline, restart
+    tests/policy_daemon.rs    The daemon against volumes svidlet published
     src/bin/svidlet-bench.rs  A load generator that stands in for the kubelet
   svidlet-issue/          Issuance library
     src/template.rs       SPIFFE ID templates and the operator's ID pattern

@@ -148,67 +148,6 @@ pub async fn refresh_ca_once(publisher: Arc<Publisher>) {
     .await;
 }
 
-/// Rewrite volumes whose policy the backend has changed.
-///
-/// Runs on its own loop rather than inside the stream task, so a slow disk
-/// never stalls the stream and a burst of upstream changes coalesces into one
-/// rewrite per volume.
-pub async fn policy_apply_loop(publisher: Arc<Publisher>) {
-    loop {
-        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-        apply_dirty_policy(publisher.clone()).await;
-    }
-}
-
-/// One pass of the policy apply loop. Returns how many volumes were rewritten.
-pub async fn apply_dirty_policy(publisher: Arc<Publisher>) -> usize {
-    let dirty = publisher.policy_manager.take_dirty();
-    if dirty.is_empty() {
-        return 0;
-    }
-
-    tokio::task::spawn_blocking(move || {
-        let mut written = 0;
-        for spiffe_id in dirty {
-            for entry in publisher.store.all() {
-                if entry.spiffe_id.as_str() != spiffe_id {
-                    continue;
-                }
-                match publisher.apply_policy(&entry.spiffe_id, &entry.target_path) {
-                    Ok(true) => {
-                        written += 1;
-                        publisher
-                            .policy_manager
-                            .metrics
-                            .bundles_applied
-                            .fetch_add(1, Ordering::Relaxed);
-                        info!(
-                            "policy published",
-                            spiffe_id = entry.spiffe_id,
-                            target = entry.target_path.display(),
-                        );
-                    }
-                    Ok(false) => debug!(
-                        "policy already current",
-                        spiffe_id = entry.spiffe_id,
-                        target = entry.target_path.display(),
-                    ),
-                    Err(e) => warn!(
-                        "could not publish policy",
-                        spiffe_id = entry.spiffe_id,
-                        target = entry.target_path.display(),
-                        code = e.code(),
-                        error = e,
-                    ),
-                }
-            }
-        }
-        written
-    })
-    .await
-    .unwrap_or(0)
-}
-
 /// Remove entries whose target path no longer exists.
 ///
 /// `NodeUnpublishVolume` is the normal way a volume leaves the store; this
@@ -233,9 +172,6 @@ pub fn reap_orphans(publisher: &Publisher) -> usize {
                 spiffe_id = entry.spiffe_id,
             );
             publisher.store.remove(&entry.target_path);
-            publisher
-                .policy_manager
-                .unsubscribe(entry.spiffe_id.as_str());
             let _ = volume::unpublish(&entry.target_path);
             reaped += 1;
         }

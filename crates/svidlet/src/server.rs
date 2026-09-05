@@ -22,8 +22,6 @@ use crate::csi::proto::registration::registration_server::RegistrationServer;
 use crate::csi::registration::RegistrationService;
 use crate::issue::Publisher;
 use crate::metrics::Metrics;
-use crate::policy::oci::BundleSource;
-use crate::policy::PolicyManager;
 use crate::store::Store;
 use crate::{debug, info, metrics, recover, renew, volume, warn};
 
@@ -58,65 +56,18 @@ pub async fn run(cfg: Config) -> Result<(), Box<dyn std::error::Error>> {
         auth = issuer.auth_name()
     );
 
-    let policy_manager = PolicyManager::new(cfg.policy.clone());
-    if policy_manager.enabled() {
+    if cfg.policy.required {
         info!(
-            "policy distribution enabled",
-            endpoint = cfg.policy.endpoint.as_deref().unwrap_or_default(),
-            required = cfg.policy.required,
-            directory = cfg.policy.directory,
+            "policy is required before a pod starts",
+            wait_secs = cfg.policy.initial_timeout.as_secs_f64(),
         );
-    } else if cfg.policy.endpoint.is_some() || cfg.policy.bundle.is_some() {
-        // Worth saying out loud: an endpoint is configured and being ignored,
-        // which otherwise looks like a broken policy backend.
-        info!(
-            "policy distribution switched off by SVIDLET_POLICY_ENABLED",
-            endpoint = cfg.policy.endpoint.as_deref().unwrap_or_default(),
-        );
-    } else {
-        info!("policy distribution disabled: no policy source configured");
     }
-
-    // The pull-based source, if one is configured. A failure here is fatal on
-    // purpose: it means a bad reference or a key that is not a key, and a node
-    // that silently ran without policy would be worse than one that will not
-    // start.
-    let bundle_source = if policy_manager.bundle_enabled() {
-        let settings = cfg
-            .policy
-            .bundle
-            .clone()
-            .expect("bundle_enabled implies settings");
-        let source = Arc::new(BundleSource::new(
-            settings,
-            cfg.cluster.clone(),
-            cfg.node_name.clone(),
-        )?);
-        let current = source.current();
+    if cfg.policy_gid.is_some() {
         info!(
-            "policy bundle rollout enabled",
-            rollout = cfg
-                .policy
-                .bundle
-                .as_ref()
-                .and_then(|b| b.rollout_ref.as_deref())
-                .unwrap_or_default(),
-            bucket = source.bucket(),
-            ring = if current.ring.is_empty() {
-                "<none yet>"
-            } else {
-                &current.ring
-            },
-            digest = if current.digest.is_empty() {
-                "<none yet>"
-            } else {
-                &current.digest
-            },
+            "published volumes are writable by the policy group",
+            gid = cfg.policy_gid.unwrap_or_default(),
         );
-        Some(source)
-    } else {
-        None
-    };
+    }
 
     let publisher = Arc::new(Publisher::new(
         cfg.clone(),
@@ -124,7 +75,6 @@ pub async fn run(cfg: Config) -> Result<(), Box<dyn std::error::Error>> {
         issuer.clone(),
         store.clone(),
         metrics.clone(),
-        policy_manager.clone(),
     ));
 
     // Prime the trust bundle before serving, but do not make it fatal: the
@@ -157,21 +107,6 @@ pub async fn run(cfg: Config) -> Result<(), Box<dyn std::error::Error>> {
         .recovered
         .fetch_add(adopted as u64, std::sync::atomic::Ordering::Relaxed);
 
-    if policy_manager.stream_enabled() {
-        tokio::spawn(crate::policy::grpc::watch_loop(
-            policy_manager.clone(),
-            cfg.node_name.clone(),
-        ));
-    }
-    if let Some(source) = &bundle_source {
-        tokio::spawn(crate::policy::oci::poll_loop(
-            source.clone(),
-            policy_manager.clone(),
-        ));
-    }
-    if policy_manager.enabled() {
-        tokio::spawn(renew::policy_apply_loop(publisher.clone()));
-    }
     tokio::spawn(renew::renewal_loop(publisher.clone()));
     tokio::spawn(renew::ca_refresh_loop(publisher.clone()));
     tokio::spawn(renew::reaper_loop(publisher.clone()));
@@ -181,8 +116,6 @@ pub async fn run(cfg: Config) -> Result<(), Box<dyn std::error::Error>> {
             cfg.metrics_addr.clone(),
             metrics.clone(),
             store.clone(),
-            policy_manager.clone(),
-            bundle_source.clone(),
         ));
     }
 
@@ -347,7 +280,7 @@ async fn shutdown() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{PolicySettings, VaultSettings};
+    use crate::config::{PolicyGate, VaultSettings};
     use std::path::PathBuf;
     use std::time::Duration;
 
@@ -372,17 +305,11 @@ mod tests {
                 pki_role: "spiffe-a".into(),
                 auth,
             },
-            policy: PolicySettings {
-                enabled: true,
-                bundle: None,
-                endpoint: None,
-                ca_cert_path: None,
-                token_path: None,
+            policy: PolicyGate {
                 required: false,
                 initial_timeout: Duration::from_secs(10),
-                directory: "policy".into(),
-                reconnect_backoff: Duration::from_secs(1),
             },
+            policy_gid: None,
             cert_ttl: Duration::from_secs(3600),
             renew_fraction: (0.5, 0.7),
             renew_check_interval: Duration::from_secs(30),

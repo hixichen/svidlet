@@ -55,6 +55,12 @@ data:
   # Not a secret: the role ID names the AppRole, the secret ID authenticates.
   SVIDLET_ROLE_ID: replace-me
 
+  # ---- read by the svidlet-policy container only ----
+  #
+  # Policy distribution runs as a separate process with separate credentials:
+  # it never sees SVIDLET_ROLE_ID or the AppRole secret, and it does not run as
+  # root. See docs/DESIGN.md, "Two processes, one volume".
+  #
   # Authorization policy, streamed from a backend fronting a git repository.
   # Leave the endpoint unset to disable: no stream is opened and no policy
   # directory is written.
@@ -65,9 +71,13 @@ data:
   # of this ConfigMap alone. Use it for local runs, and to take the policy
   # backend out of the picture when narrowing down a problem.
   SVIDLET_POLICY_ENABLED: "true"
-  # Off means a policy-backend outage still lets certificates be issued. On means
-  # a pod that would run unpoliced does not start.
+  # Read by svidlet, not by svidlet-policy: whether a pod may start before the
+  # policy daemon has written a bundle into its volume. Off means a
+  # policy-backend outage still lets certificates be issued.
   # SVIDLET_POLICY_REQUIRED: "false"
+  # The group that may write the policy chain into a published volume. Must
+  # match the svidlet-policy container's runAsGroup, or it cannot write.
+  SVIDLET_POLICY_GID: "1000"
   # SVIDLET_POLICY_INITIAL_TIMEOUT: 10s
 
   # Or pull policy as signed, content-addressed OCI bundles with a staged ring
@@ -154,8 +164,6 @@ spec:
             # The node-local bundle cache: versions/, current, state.json.
             # A hostPath so a restart resumes the bundle it already had rather
             # than waiting for the registry.
-            - name: bundle-cache
-              mountPath: /var/lib/svidlet/policy
           livenessProbe:
             httpGet:
               path: /healthz
@@ -171,8 +179,58 @@ spec:
               # Measured: 2.2 MB idle, 5.9 MB with 2000 certificates on the node.
               memory: 24Mi
             limits:
-              # The design budgets 16 MB resident; this leaves headroom for a
-              # large bundle being unpacked without letting a leak go unnoticed.
+              memory: 48Mi
+        # Policy distribution, deliberately a separate process. It holds no
+        # Vault credential, needs no capabilities, and cannot mint an identity;
+        # the most it could do if compromised is write policy files. Drop this
+        # container entirely if you do not distribute policy.
+        - name: svidlet-policy
+          image: ghcr.io/hixichen/svidlet:0.0.1
+          command: ["/svidlet-policy"]
+          imagePullPolicy: IfNotPresent
+          envFrom:
+            - configMapRef:
+                name: svidlet
+          env:
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+          ports:
+            - name: policy-metrics
+              containerPort: 9465
+          securityContext:
+            # Everything svidlet needs and this does not: no privilege, no
+            # capabilities, not root.
+            privileged: false
+            runAsNonRoot: true
+            runAsUser: 1000
+            runAsGroup: 1000
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            # HostToContainer, not Bidirectional: this process reads the
+            # tmpfs mounts svidlet made and writes files into them. It never
+            # mounts anything itself.
+            - name: kubelet-dir
+              mountPath: /var/lib/kubelet
+              mountPropagation: HostToContainer
+            - name: bundle-cache
+              mountPath: /var/lib/svidlet/policy
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: policy-metrics
+            initialDelaySeconds: 5
+            periodSeconds: 20
+          resources:
+            requests:
+              cpu: 10m
+              memory: 16Mi
+            limits:
+              # Bundles are unpacked in this process, so it gets the headroom.
               memory: 64Mi
       volumes:
         - name: kubelet-dir
@@ -203,3 +261,6 @@ spec:
     - name: metrics
       port: 9464
       targetPort: metrics
+    - name: policy-metrics
+      port: 9465
+      targetPort: policy-metrics

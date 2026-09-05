@@ -18,6 +18,7 @@
 //!   the same versioned-directory swap as `tls.crt`, so a workload reloading on
 //!   a change never reads a half-written policy set.
 
+pub mod daemon;
 pub mod grpc;
 pub mod oci;
 
@@ -32,7 +33,7 @@ use std::time::Duration;
 
 use tokio::sync::Notify;
 
-use crate::config::PolicySettings;
+use crate::config::PolicyConfig;
 use crate::{debug, info, warn};
 
 /// One file inside a policy bundle.
@@ -137,7 +138,7 @@ pub struct PolicyMetrics {
 /// Deliberately transport-agnostic. The gRPC client in [`grpc`] is the only
 /// thing that knows about streams; tests drive this directly.
 pub struct PolicyManager {
-    settings: PolicySettings,
+    settings: PolicyConfig,
     state: Mutex<State>,
     /// Fires when the wanted set changes, so the stream task re-syncs.
     wanted_changed: Notify,
@@ -149,7 +150,7 @@ pub struct PolicyManager {
 }
 
 impl PolicyManager {
-    pub fn new(settings: PolicySettings) -> Arc<PolicyManager> {
+    pub fn new(settings: PolicyConfig) -> Arc<PolicyManager> {
         Arc::new(PolicyManager {
             settings,
             state: Mutex::new(State::default()),
@@ -167,21 +168,20 @@ impl PolicyManager {
     /// in this module short-circuits on it, so a disabled manager subscribes to
     /// nothing, writes no policy directory, and never makes publishing wait.
     pub fn enabled(&self) -> bool {
-        self.settings.enabled
-            && (self.settings.endpoint.is_some() || self.settings.bundle.is_some())
+        self.settings.enabled()
     }
 
     /// Whether the gRPC stream source should run.
     pub fn stream_enabled(&self) -> bool {
-        self.settings.enabled && self.settings.endpoint.is_some()
+        self.settings.stream_enabled()
     }
 
     /// Whether the OCI rollout source should run.
     pub fn bundle_enabled(&self) -> bool {
-        self.settings.enabled && self.settings.bundle.is_some()
+        self.settings.bundle_enabled()
     }
 
-    pub fn settings(&self) -> &PolicySettings {
+    pub fn settings(&self) -> &PolicyConfig {
         &self.settings
     }
 
@@ -409,22 +409,44 @@ impl PolicyManager {
     }
 }
 
+/// Fixtures shared by the unit tests and the integration suites.
+pub mod testkit {
+    use crate::config::{PolicyConfig, PolicySettings};
+    use std::time::Duration;
+
+    /// A daemon configuration with only the policy stream turned on.
+    pub fn test_config(endpoint: Option<&str>) -> PolicyConfig {
+        PolicyConfig {
+            node_name: "node-1".into(),
+            cluster: "a".into(),
+            trust_domain: "example.org".into(),
+            driver_name: "csi.svidlet.io".into(),
+            kubelet_root: "/var/lib/kubelet".into(),
+            spiffe_id_template: svidlet_issue::IdTemplate::DEFAULT.into(),
+            spiffe_id_pattern: None,
+            stream: PolicySettings {
+                enabled: true,
+                endpoint: endpoint.map(str::to_string),
+                ca_cert_path: None,
+                token_path: None,
+                reconnect_backoff: Duration::from_millis(10),
+            },
+            bundle: None,
+            scan_interval: Duration::from_millis(50),
+            file_mode: 0o644,
+            metrics_addr: String::new(),
+            log_level: crate::log::Level::Warn,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use super::testkit::test_config;
     use super::*;
 
-    fn settings(enabled: bool) -> PolicySettings {
-        PolicySettings {
-            enabled: true,
-            bundle: None,
-            endpoint: enabled.then(|| "http://policy.invalid:9000".to_string()),
-            ca_cert_path: None,
-            token_path: None,
-            required: false,
-            initial_timeout: Duration::from_millis(50),
-            directory: "policy".into(),
-            reconnect_backoff: Duration::from_millis(10),
-        }
+    fn settings(enabled: bool) -> PolicyConfig {
+        test_config(enabled.then_some("http://policy.invalid:9000"))
     }
 
     fn doc(name: &str, content: &str) -> PolicyDocument {
@@ -485,7 +507,7 @@ mod tests {
     fn the_flag_switches_off_a_configured_endpoint() {
         // An endpoint is present, but the operator turned the feature off.
         let mut off = settings(true);
-        off.enabled = false;
+        off.stream.enabled = false;
         let m = PolicyManager::new(off);
 
         assert!(!m.enabled());

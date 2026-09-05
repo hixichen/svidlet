@@ -58,7 +58,7 @@ The backend is behind an `Issuer` trait in the `svidlet-issue` crate; Vault PKI 
 - One AppRole per cluster, with a policy granting only `update` on that cluster's `pki/sign/…` path and `read` on the CA chain. The role ID ships in the DaemonSet config; the secret ID is delivered as a Kubernetes Secret and rotated on a fixed cadence.
 - The plugin logs in once and keeps a periodic, renewable token; it does not log in per certificate.
 
-**3. Policy distribution (optional)**
+**3. `svidlet-policy` — policy distribution (optional, separate process)**
 
 A certificate says who a workload *is*. It says nothing about who it may talk to, and that half has to come from somewhere. When a policy endpoint is configured, the plugin holds one long-lived bidirectional gRPC stream per node to a policy backend — a service fronting a git repository, typically — subscribes to the identities that node hosts, and publishes each returned bundle into that workload's volume beside its certificate. Upstream changes are pushed, not polled, and reach the volume without restarting the pod.
 
@@ -68,7 +68,44 @@ Policy can also be distributed the other way round — pulled as a signed, conte
 
 `SVIDLET_POLICY_ENABLED=false` disables the whole subsystem independently of whether an endpoint is configured, so a deployment can be run without a policy backend without editing its manifest. It is deliberately a separate switch rather than "unset the endpoint": during local development and when narrowing down a production problem, the useful operation is turning the feature off while leaving the configuration alone.
 
+It runs as a **second process**, not a second thread. See *Two processes, one volume* below for why.
+
 **No mutating webhook.** Workloads declare the `csi` ephemeral volume themselves and mount it only into the containers that should hold the identity. A webhook would add an admission-path dependency and a certificate to manage for the sake of saving six lines of YAML.
+
+### Two processes, one volume
+
+Putting policy distribution inside svidlet saves an agent. It also means identity issuance and authorization configuration share a trust root and an address space — and if svidlet is compromised, the attacker can both mint identities and rewrite policy. Signing and a Vault Transit key policy address the *CI* side of that; on the node the coupling is structural, and no amount of signing fixes it.
+
+So they are two processes:
+
+| | `svidlet` | `svidlet-policy` |
+|---|---|---|
+| Job | CSI plugin, key generation, issuance, renewal | fetch policy, write it into volumes |
+| Credentials | Vault AppRole (mints any identity in the cluster) | a registry token at most; the bundle key is **public** |
+| Privilege | root, `CAP_SYS_ADMIN` (must mount tmpfs) | non-root, no capabilities |
+| Parses | CSRs and certificates it asked for | OCI manifests, tar, TOML, signature envelopes, a gRPC stream |
+
+The asymmetry is the point. The policy path is where the untrusted input is — archives and manifests produced by other systems — and therefore where a parsing or logic bug is most likely. Before the split, such a bug ran in the process holding the credential that mints identities. After it, the same bug yields a non-root process with a read-only registry token and no way to issue anything.
+
+**What the split does not buy.** svidlet is still root on the node, and root can rewrite any file, including the policy directory. Compromising svidlet still gives an attacker everything. That direction cannot be closed while the CSI plugin has to mount filesystems, and claiming otherwise would be dishonest. What is closed is the direction that carries the larger attack surface.
+
+**The interface between them is the volume, and it runs one way.** There is no IPC, no shared memory, no socket:
+
+- svidlet publishes `tls.crt`; the daemon reads it to learn what identity a volume holds. A certificate it did not issue is not one it can forge.
+- the daemon publishes `policy/` and `policy.revision`; svidlet, when `SVIDLET_POLICY_REQUIRED` is set, waits for that revision file before letting a pod start.
+
+Inside one volume there are two independent atomic swap chains, so neither writer can disturb the other's files even by accident:
+
+```
+..data        -> ..svidlet.N/   tls.crt, tls.key, ca.crt     (svidlet)
+..policy-data -> ..policy.N/    policy/, policy.revision     (svidlet-policy)
+```
+
+This also removes a subtlety that used to need careful coding: a certificate renewal previously had to read the policy back and rewrite it so as not to clear it. Now it structurally cannot touch it.
+
+The daemon writes into a tmpfs it did not create, so the mount is made group-writable by `SVIDLET_POLICY_GID` and the daemon runs with that group. Where no policy is distributed, leave the GID unset and drop the container: the mount stays root-only and the deployment is exactly what it was.
+
+**Cost.** A second process, and **1.3 MB** more resident per node — measured, not estimated. The pair is 3.3 MB idle and 7.2 MB with 2000 certificates on the node, against a 16 MB budget. The separation is cheap because the daemon shares the binary and does nothing until a volume appears.
 
 ### Seams
 
@@ -78,6 +115,7 @@ Three things are behind traits, because they are the three that change for diffe
 |---|---|---|---|
 | PKI engine | `Issuer` | Vault PKI | step-ca, cert-manager `CertificateRequest`, cloud CAs, `PodCertificateRequest` |
 | Node authentication | `TokenSource` | Vault AppRole, Vault Kubernetes auth, static token | Cloud IAM |
+| Policy source | `svidlet-policy` | gRPC stream, signed OCI bundles | — |
 | Identity layout | `IdPolicy` | A template plus an optional operator regex | — |
 
 The identity layout is a template rather than a constant:
@@ -110,9 +148,50 @@ The template both renders an ID and takes one apart again, which is what lets re
 
 It is kept as the default anyway, because it is the one method that works everywhere, including bare metal, and because it is simple enough to reason about in one sentence: one secret per cluster, rotated on a cadence, blast radius bounded by the Vault role. Where the environment allows it, use something stronger — Vault Kubernetes auth (`SVIDLET_VAULT_AUTH=kubernetes`) proves the plugin's own ServiceAccount to Vault with no shared secret to leak, and cloud IAM does the same with a per-node identity. Both are additive `TokenSource` implementations, not migrations.
 
+### Admission control: the missing half of the chain
+
+Svidlet's assertion is narrow and worth restating exactly: *the kubelet told me this pod runs as ServiceAccount S in namespace N*. A pod cannot forge that. But it says nothing about whether that pod **should exist**. Anyone who can create a pod in namespace N with ServiceAccount S gets S's identity, and svidlet will hand it over without hesitation, because from its position that request is indistinguishable from a legitimate one.
+
+So the real boundary is not in svidlet at all. It is Kubernetes RBAC on pod creation, plus whatever admission control the cluster runs. Svidlet issues identity to *whatever was admitted*; it does not decide what should be admitted.
+
+**A validating admission controller that verifies workload provenance is the missing half, and it is essential.** Verifying that a pod's images are signed by a trusted builder, and that its spec matches a reviewed manifest, is what turns the identity from "something is running in namespace N as S" into "the workload CI built and review approved is running as S". Without it, the strength of every certificate svidlet issues is bounded by who can call `kubectl run` — which is usually a much larger set of people than anyone intends.
+
+It is deliberately **future work rather than part of this design**, for three reasons:
+
+1. **It is on the critical path for every pod create in the cluster**, not just pods that want an identity. A webhook that fails wrong stops all deployments, cluster-wide. Svidlet's entire shape is about staying out of critical paths — issuance is one HTTPS call, restart adopts rather than re-issues, a backend outage fails stale. Adding a component whose failure mode is "nothing can be deployed" is a different kind of thing, and it deserves to be designed as one rather than bolted on.
+2. **It is already well served.** Sigstore's policy-controller, Kyverno and Gatekeeper all do image signature verification and pod spec policy properly, with the operational maturity that takes. Svidlet should compose with one of them, not reimplement it badly.
+3. **It changes the deployment story.** Today it is a DaemonSet, a ConfigMap and a Secret. A webhook adds a serving certificate to issue and rotate, a failure policy to get right, and a new way for the cluster to break — exactly the maintenance cost this project exists to avoid.
+
+Note the distinction from the mutating webhook in *Out of Scope*: that one injects a volume into pod specs, and is genuinely unnecessary because workloads can declare the volume themselves. This one verifies that a workload is what it claims to be, and is not unnecessary at all — only out of scope for now, and worth stating plainly rather than leaving as an implied gap.
+
+Until it exists, the honest statement of what a SPIFFE ID from svidlet means is: *this workload was admitted to namespace N with ServiceAccount S by a cluster whose RBAC and admission rules you must evaluate separately*.
+
+### After admission: balancing security and usability
+
+Once a pod is admitted and running, every remaining decision is a trade between a tighter security posture and a system people can actually operate. The design resolves them with one principle:
+
+> **Fail stale — not open, and not closed.**
+
+Anything already issued keeps working; anything new is delayed. An outage degrades new deployments and never breaks running traffic. Failing open would hand out identities that should not exist; failing closed would take down healthy nodes because a backend was briefly unreachable. Staleness is the only failure mode that is visible, bounded, and harmless in the short term — and it is measurable, which is why `svidlet_earliest_certificate_expiry_seconds` and `svidlet_bundle_age_seconds` are the two gauges to alert on.
+
+Applied to each knob:
+
+| Decision | Secure end | Usable end | Default, and why |
+|---|---|---|---|
+| Certificate lifetime | hours: a leaked key expires fast | days: less issuance load, wider outage window | **24 h.** Renewal starts at 12 h, so a half-day Vault outage is invisible to running pods. |
+| Vault unreachable | refuse to serve | keep serving | **Keep serving.** The certificate on disk is still valid and still trustworthy; refusing would convert a Vault incident into a fleet incident. |
+| Renewal failure | drop the certificate | keep it, retry with backoff | **Keep it.** Renewal begins at half the lifetime, so there is a lot of runway before anything is at risk. |
+| Policy backend unreachable | block pod start | start without policy | **Start.** `SVIDLET_POLICY_REQUIRED=true` inverts this for operators who would rather a pod not start than start unpoliced — the choice is theirs, but the default keeps a second network dependency out of pod start-up. |
+| Bad policy bundle | apply it and hope | refuse it, keep the last good one | **Refuse.** A bundle that fails signature, digest or validation never reaches a pod, and the node keeps what it has. |
+| SPIFFE ID shape | pin an exact pattern | allow whatever the template builds | **No pattern by default.** `SVIDLET_SPIFFE_ID_PATTERN` is there for operators who want a second, independent gate; requiring one out of the box would be a cliff for a first deployment. |
+| `tls.key` permissions | root-only | world-readable | **0640 plus `fsGroup`.** Readable by the workload's group and nobody else; costs one line of `securityContext` in the pod spec. |
+| Liveness probe | tied to the PKI backend | process-only | **Process-only.** Tying liveness to Vault would restart every node in the fleet during a Vault outage, at the exact moment restarts are least helpful. |
+
+Each of these can be moved. What should not move is the principle: the failure of a dependency should cost you *new* work, never *running* work.
+
 ## Out of Scope
 
-- A mutating webhook for volume injection.
+- A mutating webhook for volume injection. (A *validating* admission controller for workload provenance is a different thing, and is future work rather than out of scope — see above.)
 - JWT SVIDs.
 - SPIFFE federation with external trust domains.
 - Issuing identities to untrusted tenant containers.
@@ -192,3 +271,4 @@ PKI role `spiffe-cluster-a`: `allowed_uri_sans = ["spiffe://<td>/cluster/a/ns/*/
 2. Renewal with jitter, restart recovery, CA refresh, Prometheus metrics.
 3. Policy bundle distribution over a gRPC stream, e2e tests on kind with a dev Vault, example peer-verification snippets.
 4. Optional login backends: cloud IAM. Additional PKI backends behind the `Issuer` trait. `PodCertificateRequest` signer mode.
+5. Composition with a validating admission controller, so an identity means "the workload CI built" and not merely "a pod in namespace N". Most likely integration with Sigstore policy-controller or Kyverno rather than a webhook of svidlet's own — see *Admission control: the missing half of the chain*.

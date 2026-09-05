@@ -130,7 +130,13 @@ pub fn adopt(cfg: &Config, policy: &IdPolicy, store: &Store, metrics: &Metrics) 
             }
         };
 
-        if let Err(reason) = adoptable(cfg, policy, &facts) {
+        if let Err(reason) = identity_belongs_here(
+            policy,
+            facts.spiffe_id.as_str(),
+            &cfg.trust_domain,
+            &cfg.cluster,
+            &cfg.node_name,
+        ) {
             warn!(
                 "not adopting a published certificate; it will be re-issued",
                 spiffe_id = facts.spiffe_id,
@@ -190,42 +196,47 @@ pub fn adopt(cfg: &Config, policy: &IdPolicy, store: &Store, metrics: &Metrics) 
 
 /// Whether a certificate found on disk is one this node would have issued.
 ///
-/// Adopting anything else would put an identity on the renewal list that the
-/// configured template and pattern do not allow — so a template change takes
-/// effect on the next restart instead of being silently carried forward.
-fn adoptable(
-    cfg: &Config,
+/// Shared by restart recovery and by `svidlet-policy`, which has the same
+/// question to answer for a different reason: recovery must not adopt a
+/// certificate it cannot renew, and the policy daemon must not hand a bundle to
+/// an identity that belongs to another fleet.
+///
+/// A template that does not substitute a field cannot constrain it — a fleet
+/// whose IDs carry no cluster segment has nothing to check the cluster against.
+pub fn identity_belongs_here(
     policy: &IdPolicy,
-    facts: &CertFacts,
+    spiffe_id: &str,
+    trust_domain: &str,
+    cluster: &str,
+    node_name: &str,
 ) -> std::result::Result<(), String> {
-    let id = facts.spiffe_id.as_str();
-    let Some(attrs) = policy.attributes_of(id) else {
+    let Some(attrs) = policy.attributes_of(spiffe_id) else {
         return Err(format!(
             "does not match the configured SPIFFE ID template {:?}",
-            cfg.spiffe_id_template
+            policy.template().as_str()
         ));
     };
-    if let Err(e) = policy.check(id) {
+    if let Err(e) = policy.check(spiffe_id) {
         return Err(e.to_string());
     }
 
     let fields = policy.template().required_fields();
-    if fields.contains(&Field::TrustDomain) && attrs.trust_domain != cfg.trust_domain {
+    if fields.contains(&Field::TrustDomain) && attrs.trust_domain != trust_domain {
         return Err(format!(
-            "belongs to trust domain {:?}, not {:?}",
-            attrs.trust_domain, cfg.trust_domain
+            "belongs to trust domain {:?}, not {trust_domain:?}",
+            attrs.trust_domain
         ));
     }
-    if fields.contains(&Field::Cluster) && attrs.cluster != cfg.cluster {
+    if fields.contains(&Field::Cluster) && attrs.cluster != cluster {
         return Err(format!(
-            "belongs to cluster {:?}, not {:?}",
-            attrs.cluster, cfg.cluster
+            "belongs to cluster {:?}, not {cluster:?}",
+            attrs.cluster
         ));
     }
-    if fields.contains(&Field::NodeName) && attrs.node_name != cfg.node_name {
+    if fields.contains(&Field::NodeName) && attrs.node_name != node_name {
         return Err(format!(
-            "was issued for node {:?}, not {:?}",
-            attrs.node_name, cfg.node_name
+            "was issued for node {:?}, not {node_name:?}",
+            attrs.node_name
         ));
     }
     Ok(())

@@ -20,6 +20,7 @@ COUNTS="${COUNTS:-0 100 500 2000}"
 # the default temp directory on macOS is long enough to blow past it.
 WORK="$(mktemp -d /tmp/svidlet-bench.XXXXXX)"
 SVIDLET_PID=""
+POLICY_PID=""
 
 cleanup() {
   if [ -n "${KEEP_LOG}" ] && [ -f "${WORK}/svidlet.log" ]; then
@@ -27,6 +28,7 @@ cleanup() {
     cat "${WORK}/svidlet.log" >&2
   fi
   [ -n "${SVIDLET_PID}" ] && kill "${SVIDLET_PID}" 2>/dev/null || true
+  [ -n "${POLICY_PID}" ] && kill "${POLICY_PID}" 2>/dev/null || true
   ./hack/local-vault.sh stop >/dev/null 2>&1 || true
   rm -rf "${WORK}"
 }
@@ -76,8 +78,26 @@ done
 }
 sleep 1
 
-printf '\n%-12s %-12s %-12s %s\n' "CERTIFICATES" "RSS (MB)" "PER CERT" "PUBLISH RATE"
-printf -- '---------------------------------------------------------------\n'
+echo "==> starting svidlet-policy (no Vault credential, no root)"
+env \
+  NODE_NAME=bench-node \
+  SVIDLET_CLUSTER="${SVIDLET_CLUSTER}" \
+  SVIDLET_TRUST_DOMAIN="${SVIDLET_TRUST_DOMAIN}" \
+  SVIDLET_KUBELET_ROOT="${WORK}/kubelet" \
+  SVIDLET_POLICY_METRICS_ADDR=127.0.0.1:19465 \
+  SVIDLET_POLICY_SCAN_INTERVAL=2s \
+  SVIDLET_LOG_LEVEL=warn \
+  ./target/release/svidlet-policy > "${WORK}/policy.log" 2>&1 &
+POLICY_PID=$!
+sleep 2
+kill -0 "${POLICY_PID}" 2>/dev/null || {
+  echo "svidlet-policy did not start:" >&2
+  cat "${WORK}/policy.log" >&2
+  exit 1
+}
+
+printf '\n%-12s %-12s %-12s %-12s %s\n' "CERTIFICATES" "svidlet" "policy" "BOTH (MB)" "PUBLISH RATE"
+printf -- '--------------------------------------------------------------------------\n'
 
 baseline=""
 published=0
@@ -105,17 +125,16 @@ for target in ${COUNTS}; do
   fi
   [ -z "${baseline}" ] && baseline="${rss}"
 
-  if [ "${target}" -gt 0 ]; then
-    per_cert=$(python3 -c "print(f'{(${rss}-${baseline})*1024/${target}:.0f} B')")
-  else
-    per_cert="—"
-  fi
-  printf '%-12s %-12s %-12s %s\n' "${target}" "$(mb "${rss}")" "${per_cert}" "${rate}"
+  policy_rss=$(rss_kb "${POLICY_PID}" || echo 0)
+  total=$(( rss + policy_rss ))
+  printf '%-12s %-12s %-12s %-12s %s\n' \
+    "${target}" "$(mb "${rss}")" "$(mb "${policy_rss}")" "$(mb "${total}")" "${rate}"
 done
 
 echo
-echo "active certificates according to the process itself:"
+echo "according to the processes themselves:"
 curl -s localhost:19464/metrics | grep -E '^svidlet_(certificates_active|certificates_issued_total)' | sed 's/^/  /'
+curl -s localhost:19465/metrics | grep -E '^svidlet_policy_(volumes|scans_total) ' | sed 's/^/  /'
 
 echo
 case "$(uname -s)" in

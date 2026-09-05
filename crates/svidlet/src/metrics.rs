@@ -19,8 +19,6 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
 use crate::log::unix_now;
-use crate::policy::oci::BundleSource;
-use crate::policy::PolicyManager;
 use crate::store::Store;
 use crate::{debug, error, info};
 
@@ -147,12 +145,7 @@ impl Metrics {
         self.latency_renew.observe(elapsed);
     }
 
-    pub fn render(
-        &self,
-        store: &Store,
-        policy: &PolicyManager,
-        bundle: Option<&BundleSource>,
-    ) -> String {
+    pub fn render(&self, store: &Store) -> String {
         let mut out = String::with_capacity(4096);
 
         let (backend, auth) = self
@@ -279,162 +272,7 @@ impl Metrics {
             store.due(now).len() as f64,
         );
 
-        // Policy series are exported even when the feature is off, so a
-        // dashboard does not break when it is switched on.
-        let p = &policy.metrics;
-        for (name, help, value) in [
-            (
-                "svidlet_policy_updates_received_total",
-                "Policy updates received from the backend, including ones that changed nothing.",
-                p.updates_received.load(Ordering::Relaxed),
-            ),
-            (
-                "svidlet_policy_bundles_applied_total",
-                "Policy bundles written into a pod's volume.",
-                p.bundles_applied.load(Ordering::Relaxed),
-            ),
-            (
-                "svidlet_policy_updates_rejected_total",
-                "Policy updates refused as malformed. Non-zero means the backend is sending \
-                 something svidlet will not publish.",
-                p.rejected_updates.load(Ordering::Relaxed),
-            ),
-            (
-                "svidlet_policy_stream_reconnects_total",
-                "Times the policy stream dropped and was re-established.",
-                p.stream_reconnects.load(Ordering::Relaxed),
-            ),
-            (
-                "svidlet_policy_wait_timeouts_total",
-                "Volumes published without waiting further for policy that had not arrived.",
-                p.wait_timeouts.load(Ordering::Relaxed),
-            ),
-        ] {
-            simple(&mut out, name, help, "counter", "", value as f64);
-        }
-
-        simple(
-            &mut out,
-            "svidlet_policy_stream_connected",
-            "1 when the policy stream is up. Alert on this being 0 for longer than a \
-             deploy takes: policy already on disk keeps working, but changes stop arriving.",
-            "gauge",
-            "",
-            if policy.enabled() {
-                p.connected.load(Ordering::Relaxed) as u8 as f64
-            } else {
-                f64::NAN
-            },
-        );
-        simple(
-            &mut out,
-            "svidlet_policy_subscriptions",
-            "Identities this node is following policy for.",
-            "gauge",
-            "",
-            policy.subscription_count() as f64,
-        );
-
-        self.render_bundle(&mut out, bundle);
         out
-    }
-
-    /// The pull-based rollout's own series. Exported even when the source is
-    /// off, so a dashboard does not break when it is switched on.
-    fn render_bundle(&self, out: &mut String, bundle: Option<&BundleSource>) {
-        use crate::policy::oci as svidlet_bundle;
-        use std::fmt::Write as _;
-        use svidlet_bundle::Error as BundleError;
-
-        let current = bundle.map(|b| b.current()).unwrap_or_default();
-        let name = "svidlet_bundle_version";
-        let _ = writeln!(
-            out,
-            "# HELP {name} Always 1. The digest and ring this node is running are its labels."
-        );
-        let _ = writeln!(out, "# TYPE {name} gauge");
-        let _ = writeln!(
-            out,
-            "{name}{{digest=\"{}\",ring=\"{}\"}} 1",
-            if current.digest.is_empty() {
-                "none"
-            } else {
-                &current.digest
-            },
-            if current.ring.is_empty() {
-                "none"
-            } else {
-                &current.ring
-            },
-        );
-
-        simple(
-            out,
-            "svidlet_bundle_age_seconds",
-            "Seconds since this node last verified a rollout manifest. \
-             Alert on this: a node that cannot reach the registry keeps serving the bundle \
-             it has, so age is the only signal that policy has stopped moving.",
-            "gauge",
-            "",
-            bundle
-                .and_then(|b| b.age_seconds())
-                .map(|s| s as f64)
-                .unwrap_or(f64::NAN),
-        );
-
-        let metrics = bundle.map(|b| &b.metrics);
-        let name = "svidlet_bundle_rejected_total";
-        let _ = writeln!(
-            out,
-            "# HELP {name} Polls that did not end with a bundle applied, by reason."
-        );
-        let _ = writeln!(out, "# TYPE {name} counter");
-        for reason in BundleError::REASONS {
-            let value = metrics.map(|m| m.rejected(reason)).unwrap_or(0);
-            let _ = writeln!(out, "{name}{{reason=\"{reason}\"}} {value}");
-        }
-
-        for (name, help, value) in [
-            (
-                "svidlet_bundle_swap_total",
-                "Times this node swapped to a different bundle.",
-                metrics
-                    .map(|m| m.swaps.load(Ordering::Relaxed))
-                    .unwrap_or(0),
-            ),
-            (
-                "svidlet_bundle_poll_total",
-                "Rollout manifest polls attempted.",
-                metrics
-                    .map(|m| m.polls.load(Ordering::Relaxed))
-                    .unwrap_or(0),
-            ),
-            (
-                "svidlet_rollout_manifest_invalid_total",
-                "Rollout manifests refused as unsigned, mis-signed or unparsable.",
-                metrics
-                    .map(|m| m.manifest_invalid.load(Ordering::Relaxed))
-                    .unwrap_or(0),
-            ),
-            (
-                "svidlet_registry_fetch_errors_total",
-                "Failed registry requests.",
-                metrics
-                    .map(|m| m.fetch_errors.load(Ordering::Relaxed))
-                    .unwrap_or(0),
-            ),
-        ] {
-            simple(out, name, help, "counter", "", value as f64);
-        }
-
-        simple(
-            out,
-            "svidlet_bundle_node_bucket",
-            "This node's stable position in 0..100, which decides its rollout ring.",
-            "gauge",
-            "",
-            bundle.map(|b| b.bucket() as f64).unwrap_or(f64::NAN),
-        );
     }
 }
 
@@ -460,19 +298,13 @@ fn counter_by_reason(out: &mut String, name: &str, help: &str, by_reason: &[(&st
 
 /// Answer one request. Split out from [`serve`] so it can be tested without a
 /// socket.
-pub fn respond(
-    request_line: &str,
-    metrics: &Metrics,
-    store: &Store,
-    policy: &PolicyManager,
-    bundle: Option<&BundleSource>,
-) -> String {
+pub fn respond(request_line: &str, metrics: &Metrics, store: &Store) -> String {
     let path = request_line.split_whitespace().nth(1).unwrap_or("/");
     match path {
         "/metrics" => http(
             200,
             "text/plain; version=0.0.4; charset=utf-8",
-            &metrics.render(store, policy, bundle),
+            &metrics.render(store),
         ),
         // The DaemonSet's liveness probe: the process answers, so its runtime
         // is alive. Deliberately not gated on the PKI backend — an outage there
@@ -483,13 +315,7 @@ pub fn respond(
 }
 
 /// Serve `/metrics` and `/healthz` until the process exits.
-pub async fn serve(
-    addr: String,
-    metrics: Arc<Metrics>,
-    store: Arc<Store>,
-    policy: Arc<PolicyManager>,
-    bundle: Option<Arc<BundleSource>>,
-) {
+pub async fn serve(addr: String, metrics: Arc<Metrics>, store: Arc<Store>) {
     let listener = match TcpListener::bind(&addr).await {
         Ok(l) => l,
         Err(e) => {
@@ -511,21 +337,13 @@ pub async fn serve(
         };
         let metrics = metrics.clone();
         let store = store.clone();
-        let policy = policy.clone();
-        let bundle = bundle.clone();
         tokio::spawn(async move {
             // Read just enough to see the request line; a scrape has no body,
             // and anything oversized is ignored rather than buffered.
             let mut buf = [0u8; 1024];
             let n = socket.read(&mut buf).await.unwrap_or(0);
             let head = String::from_utf8_lossy(&buf[..n]);
-            let response = respond(
-                head.lines().next().unwrap_or(""),
-                &metrics,
-                &store,
-                &policy,
-                bundle.as_deref(),
-            );
+            let response = respond(head.lines().next().unwrap_or(""), &metrics, &store);
             let _ = socket.write_all(response.as_bytes()).await;
             let _ = socket.shutdown().await;
         });
@@ -547,22 +365,6 @@ fn http(status: u16, content_type: &str, body: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::PolicySettings;
-
-    fn policy(enabled: bool) -> Arc<PolicyManager> {
-        PolicyManager::new(PolicySettings {
-            enabled: true,
-            bundle: None,
-            endpoint: enabled.then(|| "http://policy.invalid:9000".to_string()),
-            ca_cert_path: None,
-            token_path: None,
-            required: false,
-            initial_timeout: Duration::from_secs(10),
-            directory: "policy".into(),
-            reconnect_backoff: Duration::from_secs(1),
-        })
-    }
-
     /// Every non-comment line must be `name{labels} value`, with a value
     /// Prometheus can parse.
     fn assert_parses(text: &str) {
@@ -592,7 +394,7 @@ mod tests {
         metrics.published();
         metrics.renewed();
         metrics.renewed();
-        let out = metrics.render(&Store::new(), &policy(false), None);
+        let out = metrics.render(&Store::new());
 
         assert_parses(&out);
         assert!(out.contains("svidlet_certificates_issued_total{reason=\"publish\"} 1"));
@@ -609,7 +411,7 @@ mod tests {
     #[test]
     fn every_error_code_series_exists_before_its_first_failure() {
         let metrics = Metrics::default();
-        let out = metrics.render(&Store::new(), &policy(false), None);
+        let out = metrics.render(&Store::new());
         for code in ErrorCode::ALL {
             for reason in ["publish", "renew"] {
                 assert!(
@@ -628,7 +430,7 @@ mod tests {
         metrics.publish_failed(ErrorCode::Policy);
         metrics.renew_failed(ErrorCode::Transport);
         metrics.renew_failed(ErrorCode::Transport);
-        let out = metrics.render(&Store::new(), &policy(false), None);
+        let out = metrics.render(&Store::new());
 
         assert!(out.contains("svidlet_issue_failures_total{reason=\"publish\",code=\"policy\"} 1"));
         assert!(out.contains("svidlet_issue_failures_total{reason=\"renew\",code=\"transport\"} 2"));
@@ -645,7 +447,7 @@ mod tests {
         metrics.observe_publish(Duration::from_millis(200));
         // Beyond the last bucket: counted in _count but in no bucket but +Inf.
         metrics.observe_publish(Duration::from_secs(9));
-        let out = metrics.render(&Store::new(), &policy(false), None);
+        let out = metrics.render(&Store::new());
         assert_parses(&out);
 
         let value = |needle: &str| -> f64 {
@@ -717,7 +519,7 @@ mod tests {
             failures: 0,
         });
 
-        let out = Metrics::default().render(&store, &policy(false), None);
+        let out = Metrics::default().render(&store);
         assert!(out.contains("svidlet_certificates_active 1"));
         assert!(out.contains("svidlet_renewals_due 1"));
         let expiry: f64 = out
@@ -737,20 +539,19 @@ mod tests {
     fn routes_answer_the_paths_a_daemonset_probes() {
         let metrics = Metrics::default();
         let store = Store::new();
-        let policy = policy(true);
 
-        let ok = respond("GET /metrics HTTP/1.1", &metrics, &store, &policy, None);
+        let ok = respond("GET /metrics HTTP/1.1", &metrics, &store);
         assert!(ok.starts_with("HTTP/1.1 200 OK"));
         assert!(ok.contains("version=0.0.4"));
         assert!(ok.contains("svidlet_certificates_active"));
 
-        let health = respond("GET /healthz HTTP/1.1", &metrics, &store, &policy, None);
+        let health = respond("GET /healthz HTTP/1.1", &metrics, &store);
         assert!(health.starts_with("HTTP/1.1 200 OK"));
         assert!(health.ends_with("ok\n"));
 
         for bad in ["GET / HTTP/1.1", "GET /nope HTTP/1.1", "", "garbage"] {
             assert!(
-                respond(bad, &metrics, &store, &policy, None).starts_with("HTTP/1.1 404"),
+                respond(bad, &metrics, &store).starts_with("HTTP/1.1 404"),
                 "{bad:?} should 404"
             );
         }

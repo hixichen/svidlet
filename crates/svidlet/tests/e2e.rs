@@ -16,7 +16,7 @@ use time::OffsetDateTime;
 use tonic::Request;
 
 use svidlet::config::{
-    volume_context as vc, AuthSettings, Config, PolicySettings, VaultSettings, CA_FILE, CERT_FILE,
+    volume_context as vc, AuthSettings, Config, PolicyGate, VaultSettings, CA_FILE, CERT_FILE,
     KEY_FILE, REVISION_FILE,
 };
 use svidlet::csi::node::NodeService;
@@ -24,7 +24,6 @@ use svidlet::csi::proto::csi::node_server::Node;
 use svidlet::csi::proto::csi::{NodePublishVolumeRequest, NodeUnpublishVolumeRequest};
 use svidlet::issue::Publisher;
 use svidlet::metrics::Metrics;
-use svidlet::policy::{PolicyBundle, PolicyDocument, PolicyManager};
 use svidlet::store::Store;
 use svidlet_issue::{IdTemplate, IssuedBundle, SignRequest};
 
@@ -138,26 +137,14 @@ fn scratch(name: &str) -> PathBuf {
 }
 
 fn config(kubelet_root: &Path) -> Config {
-    config_with(
-        kubelet_root,
-        IdTemplate::DEFAULT,
-        None,
-        policy_settings(None),
-    )
+    config_with(kubelet_root, IdTemplate::DEFAULT, None, gate(false))
 }
 
-/// Policy is off unless a test asks for it.
-fn policy_settings(endpoint: Option<&str>) -> PolicySettings {
-    PolicySettings {
-        enabled: true,
-        bundle: None,
-        endpoint: endpoint.map(str::to_string),
-        ca_cert_path: None,
-        token_path: None,
-        required: false,
-        initial_timeout: std::time::Duration::from_millis(100),
-        directory: "policy".into(),
-        reconnect_backoff: std::time::Duration::from_millis(10),
+/// Whether a pod may start before its policy arrives. Off unless a test says so.
+fn gate(required: bool) -> PolicyGate {
+    PolicyGate {
+        required,
+        initial_timeout: std::time::Duration::from_millis(300),
     }
 }
 
@@ -165,7 +152,7 @@ fn config_with(
     kubelet_root: &Path,
     template: &str,
     pattern: Option<&str>,
-    policy: PolicySettings,
+    policy: PolicyGate,
 ) -> Config {
     Config {
         driver_name: "csi.svidlet.io".into(),
@@ -190,6 +177,7 @@ fn config_with(
             },
         },
         policy,
+        policy_gid: None,
         cert_ttl: std::time::Duration::from_secs(3600),
         renew_fraction: (0.5, 0.7),
         renew_check_interval: std::time::Duration::from_secs(30),
@@ -208,18 +196,11 @@ struct Fixture {
     node: NodeService,
     ca: Arc<TestCa>,
     store: Arc<Store>,
-    policy: Arc<PolicyManager>,
     root: PathBuf,
 }
 
 fn fixture(name: &str, lifetime_secs: i64) -> Fixture {
-    fixture_with(
-        name,
-        lifetime_secs,
-        IdTemplate::DEFAULT,
-        None,
-        policy_settings(None),
-    )
+    fixture_with(name, lifetime_secs, IdTemplate::DEFAULT, None, gate(false))
 }
 
 fn fixture_with(
@@ -227,22 +208,20 @@ fn fixture_with(
     lifetime_secs: i64,
     template: &str,
     pattern: Option<&str>,
-    policy_settings: PolicySettings,
+    policy: PolicyGate,
 ) -> Fixture {
     svidlet::rand::seed();
     let root = scratch(name);
     let ca = Arc::new(TestCa::new(lifetime_secs));
     let store = Arc::new(Store::new());
-    let cfg = config_with(&root, template, pattern, policy_settings);
+    let cfg = config_with(&root, template, pattern, policy);
     let id_policy = Arc::new(cfg.id_policy().expect("the template compiles"));
-    let policy = PolicyManager::new(cfg.policy.clone());
     let publisher = Arc::new(Publisher::new(
         Arc::new(cfg),
         id_policy,
         ca.clone(),
         store.clone(),
         Arc::new(Metrics::default()),
-        policy.clone(),
     ));
     publisher.prime_ca().unwrap();
     Fixture {
@@ -250,7 +229,6 @@ fn fixture_with(
         publisher,
         ca,
         store,
-        policy,
         root,
     }
 }
@@ -587,7 +565,6 @@ async fn a_changed_trust_bundle_reaches_running_pods() {
         rotated.clone(),
         fx.store.clone(),
         Arc::new(Metrics::default()),
-        fx.policy.clone(),
     ));
     assert_eq!(publisher.refresh_ca().unwrap(), 1);
 
@@ -645,7 +622,7 @@ async fn a_custom_template_changes_the_shape_of_the_identity() {
         3600,
         "spiffe://{trust_domain}/ns/{namespace}/sa/{service_account}",
         None,
-        policy_settings(None),
+        gate(false),
     );
     let target = fx.root.join("mount");
     fx.node
@@ -667,7 +644,7 @@ async fn a_template_can_pin_the_identity_to_the_node_and_pod() {
         3600,
         "spiffe://{trust_domain}/node/{node_name}/ns/{namespace}/pod/{pod_name}",
         None,
-        policy_settings(None),
+        gate(false),
     );
     let target = fx.root.join("mount");
     fx.node
@@ -689,7 +666,7 @@ async fn a_template_needing_a_field_the_kubelet_did_not_send_fails_loudly() {
         3600,
         "spiffe://{trust_domain}/pod/{pod_name}/sa/{service_account}",
         None,
-        policy_settings(None),
+        gate(false),
     );
     let target = fx.root.join("mount");
 
@@ -716,7 +693,7 @@ async fn an_id_pattern_refuses_identities_the_operator_disallows() {
         3600,
         IdTemplate::DEFAULT,
         Some(r"spiffe://example\.org/cluster/a/ns/(payments|billing)/sa/.+"),
-        policy_settings(None),
+        gate(false),
     );
 
     let allowed = fx.root.join("allowed");
@@ -756,7 +733,7 @@ async fn recovery_ignores_certificates_the_current_template_would_not_issue() {
         3600,
         "spiffe://{trust_domain}/ns/{namespace}/sa/{service_account}",
         None,
-        policy_settings(None),
+        gate(false),
     );
     let target = fx
         .root
@@ -790,243 +767,14 @@ async fn recovery_ignores_certificates_the_current_template_would_not_issue() {
     std::fs::remove_dir_all(&fx.root).unwrap();
 }
 
-// ------------------------------------------------------------ policy bundles
-
-fn policy_bundle(revision: &str, docs: &[(&str, &str)]) -> PolicyBundle {
-    PolicyBundle::build(
-        revision.into(),
-        docs.iter()
-            .map(|(n, c)| PolicyDocument {
-                name: (*n).into(),
-                content: c.as_bytes().to_vec(),
-            })
-            .collect(),
-    )
-    .unwrap()
-}
-
-fn policy_fixture(name: &str, required: bool) -> Fixture {
-    let mut settings = policy_settings(Some("http://policy.invalid:9000"));
-    settings.required = required;
-    fixture_with(name, 3600, IdTemplate::DEFAULT, None, settings)
-}
+// ------------------------------------------------- the policy gate, if enabled
 
 #[tokio::test]
-async fn policy_is_published_next_to_the_certificate() {
-    let fx = policy_fixture("policy-publish", false);
-    let target = fx.root.join("mount");
-    let id = "spiffe://example.org/cluster/a/ns/payments/sa/api";
-
-    // The backend already has a bundle when the pod starts.
-    fx.policy.subscribe(id);
-    fx.policy.apply(
-        id,
-        policy_bundle(
-            "git-abc123",
-            &[("authz.rego", "allow := true"), ("peers.json", "[]")],
-        ),
-    );
-
-    fx.node
-        .node_publish_volume(Request::new(publish_request(&target, "payments", "api")))
-        .await
-        .unwrap();
-
-    assert_eq!(
-        std::fs::read_to_string(target.join("policy/authz.rego")).unwrap(),
-        "allow := true"
-    );
-    assert_eq!(
-        std::fs::read_to_string(target.join("policy/peers.json")).unwrap(),
-        "[]"
-    );
-    // The revision is a single file to stat, so an application can notice a
-    // change without walking the directory.
-    assert_eq!(
-        std::fs::read_to_string(target.join(REVISION_FILE)).unwrap(),
-        "git-abc123\n"
-    );
-    // The certificate is there too, and unaffected.
-    assert_eq!(published_spiffe_id(&target), id);
-
-    std::fs::remove_dir_all(&fx.root).unwrap();
-}
-
-#[tokio::test]
-async fn publishing_subscribes_and_unpublishing_stops_following() {
-    let fx = policy_fixture("policy-subscribe", false);
-    let target = fx.root.join("mount");
-    let id = "spiffe://example.org/cluster/a/ns/payments/sa/api";
-
-    fx.node
-        .node_publish_volume(Request::new(publish_request(&target, "payments", "api")))
-        .await
-        .unwrap();
-    assert_eq!(fx.policy.wanted(), vec![(id.to_string(), String::new())]);
-
-    fx.node
-        .node_unpublish_volume(Request::new(NodeUnpublishVolumeRequest {
-            volume_id: "csi-abcdef".into(),
-            target_path: target.display().to_string(),
-        }))
-        .await
-        .unwrap();
-    assert_eq!(fx.policy.subscription_count(), 0);
-
-    std::fs::remove_dir_all(&fx.root).unwrap();
-}
-
-#[tokio::test]
-async fn a_policy_update_rewrites_the_volume_and_leaves_the_certificate_alone() {
-    let fx = policy_fixture("policy-update", false);
-    let target = fx.root.join("mount");
-    let id = "spiffe://example.org/cluster/a/ns/payments/sa/api";
-
-    fx.policy.subscribe(id);
-    fx.policy
-        .apply(id, policy_bundle("r1", &[("authz.rego", "v1")]));
-    fx.node
-        .node_publish_volume(Request::new(publish_request(&target, "payments", "api")))
-        .await
-        .unwrap();
-    let cert_before = std::fs::read_to_string(target.join(CERT_FILE)).unwrap();
-
-    // Upstream moves.
-    assert!(fx.policy.apply(
-        id,
-        policy_bundle("r2", &[("authz.rego", "v2"), ("extra.json", "{}")])
-    ));
-    assert_eq!(fx.policy.take_dirty(), vec![id.to_string()]);
-
-    let entry = fx.store.get(&target).unwrap();
-    assert!(fx
-        .publisher
-        .apply_policy(&entry.spiffe_id, &target)
-        .unwrap());
-
-    assert_eq!(
-        std::fs::read_to_string(target.join("policy/authz.rego")).unwrap(),
-        "v2"
-    );
-    assert_eq!(
-        std::fs::read_to_string(target.join("policy/extra.json")).unwrap(),
-        "{}"
-    );
-    assert_eq!(
-        std::fs::read_to_string(target.join(REVISION_FILE)).unwrap(),
-        "r2\n"
-    );
-    assert_eq!(
-        std::fs::read_to_string(target.join(CERT_FILE)).unwrap(),
-        cert_before,
-        "a policy update must not disturb the certificate"
-    );
-    assert_eq!(
-        fx.ca.signed_ids().len(),
-        1,
-        "no re-issue for a policy change"
-    );
-
-    // Applying the same bundle again rewrites nothing.
-    assert!(!fx
-        .publisher
-        .apply_policy(&entry.spiffe_id, &target)
-        .unwrap());
-
-    std::fs::remove_dir_all(&fx.root).unwrap();
-}
-
-#[tokio::test]
-async fn a_removed_document_disappears_from_the_volume() {
-    let fx = policy_fixture("policy-shrink", false);
-    let target = fx.root.join("mount");
-    let id = "spiffe://example.org/cluster/a/ns/payments/sa/api";
-
-    fx.policy.subscribe(id);
-    fx.policy
-        .apply(id, policy_bundle("r1", &[("a.rego", "1"), ("b.rego", "2")]));
-    fx.node
-        .node_publish_volume(Request::new(publish_request(&target, "payments", "api")))
-        .await
-        .unwrap();
-    assert!(target.join("policy/b.rego").exists());
-
-    fx.policy.apply(id, policy_bundle("r2", &[("a.rego", "1")]));
-    let entry = fx.store.get(&target).unwrap();
-    fx.publisher
-        .apply_policy(&entry.spiffe_id, &target)
-        .unwrap();
-
-    // The whole directory is rebuilt each time, so a document deleted upstream
-    // is really gone rather than lingering from the previous revision.
-    assert!(target.join("policy/a.rego").exists());
-    assert!(!target.join("policy/b.rego").exists());
-
-    std::fs::remove_dir_all(&fx.root).unwrap();
-}
-
-#[tokio::test]
-async fn a_certificate_renewal_keeps_the_policy_it_already_published() {
-    let fx = policy_fixture("policy-renew", false);
-    let target = fx.root.join("mount");
-    let id = "spiffe://example.org/cluster/a/ns/payments/sa/api";
-
-    fx.policy.subscribe(id);
-    fx.policy
-        .apply(id, policy_bundle("r1", &[("authz.rego", "v1")]));
-    fx.node
-        .node_publish_volume(Request::new(publish_request(&target, "payments", "api")))
-        .await
-        .unwrap();
-
-    // The policy backend goes away and the plugin forgets its cache, as it
-    // would across a restart. A renewal must not clear the policy directory.
-    fx.policy.unsubscribe(id);
-    fx.policy.subscribe(id);
-    assert!(fx.policy.bundle(id).is_none());
-
-    let entry = fx.store.get(&target).unwrap();
-    svidlet::renew::renew_one(&fx.publisher, &entry);
-
-    assert_eq!(
-        std::fs::read_to_string(target.join("policy/authz.rego")).unwrap(),
-        "v1"
-    );
-    assert_eq!(
-        std::fs::read_to_string(target.join(REVISION_FILE)).unwrap(),
-        "r1\n"
-    );
-    assert_eq!(fx.ca.signed_ids().len(), 2, "the certificate did renew");
-
-    std::fs::remove_dir_all(&fx.root).unwrap();
-}
-
-#[tokio::test]
-async fn a_policy_outage_does_not_stop_a_certificate_being_issued() {
-    let fx = policy_fixture("policy-optional", false);
-    let target = fx.root.join("mount");
-
-    // Nothing has ever arrived from the backend.
-    fx.node
-        .node_publish_volume(Request::new(publish_request(&target, "payments", "api")))
-        .await
-        .unwrap();
-
-    assert_eq!(
-        published_spiffe_id(&target),
-        "spiffe://example.org/cluster/a/ns/payments/sa/api"
-    );
-    // No policy directory is created, so a workload can tell "no policy yet"
-    // from "an empty policy".
-    assert!(!target.join("policy").exists());
-    assert!(!target.join(REVISION_FILE).exists());
-
-    std::fs::remove_dir_all(&fx.root).unwrap();
-}
-
-#[tokio::test]
-async fn policy_required_refuses_to_publish_when_none_arrives() {
-    let fx = policy_fixture("policy-required", true);
+async fn policy_required_refuses_to_publish_when_the_daemon_writes_nothing() {
+    // svidlet does not talk to a policy backend any more. All it does is look
+    // for the revision file svidlet-policy would have written beside the
+    // certificate — one direction, through the volume, no shared credential.
+    let fx = fixture_with("gate-timeout", 3600, IdTemplate::DEFAULT, None, gate(true));
     let target = fx.root.join("mount");
 
     let err = fx
@@ -1037,373 +785,94 @@ async fn policy_required_refuses_to_publish_when_none_arrives() {
 
     assert_eq!(err.code(), tonic::Code::Unavailable);
     assert!(err.message().contains("SVIDLET_POLICY_REQUIRED"));
-    assert!(fx.ca.signed_ids().is_empty(), "no certificate is minted");
+    assert!(err.message().contains("svidlet-policy"));
+    // Nothing is left behind for the kubelet's retry to trip over.
+    assert!(!target.exists());
     assert_eq!(fx.store.len(), 0);
-    // The subscription is dropped again, so a pod that never started is not
-    // left being tracked.
-    assert_eq!(fx.policy.subscription_count(), 0);
 
     std::fs::remove_dir_all(&fx.root).unwrap();
 }
 
 #[tokio::test]
-async fn policy_required_publishes_as_soon_as_the_bundle_lands() {
-    let fx = policy_fixture("policy-required-ok", true);
+async fn policy_required_succeeds_once_the_daemon_publishes() {
+    let fx = fixture_with("gate-ok", 3600, IdTemplate::DEFAULT, None, gate(true));
     let target = fx.root.join("mount");
-    let id = "spiffe://example.org/cluster/a/ns/payments/sa/api";
 
-    // Deliver the bundle shortly after the publish call starts waiting.
-    let policy = fx.policy.clone();
-    let deliver = tokio::spawn(async move {
-        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        policy.apply(id, policy_bundle("r1", &[("authz.rego", "allow")]));
+    // Stand in for svidlet-policy: wait for the certificate to appear, then
+    // write the policy chain, exactly as the daemon does.
+    let writer_target = target.clone();
+    let writer = tokio::spawn(async move {
+        for _ in 0..100 {
+            if writer_target.join(CERT_FILE).exists() {
+                let bundle = svidlet::policy::PolicyBundle::build(
+                    "git-r1".into(),
+                    vec![svidlet::policy::PolicyDocument {
+                        name: "authz.rego".into(),
+                        content: b"allow := true".to_vec(),
+                    }],
+                )
+                .unwrap();
+                svidlet::volume::publish_policy(&writer_target, &bundle, 0o644).unwrap();
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("the certificate never appeared");
     });
 
     fx.node
         .node_publish_volume(Request::new(publish_request(&target, "payments", "api")))
         .await
         .unwrap();
-    deliver.await.unwrap();
+    writer.await.unwrap();
 
     assert_eq!(
-        std::fs::read_to_string(target.join("policy/authz.rego")).unwrap(),
-        "allow"
+        std::fs::read_to_string(target.join(REVISION_FILE)).unwrap(),
+        "git-r1\n"
     );
-    std::fs::remove_dir_all(&fx.root).unwrap();
-}
-
-// ------------------------------------------------- policy over a real stream
-
-mod policy_stream {
-    //! The policy client against a real gRPC server.
-    //!
-    //! Everything else in this file drives [`PolicyManager`] directly. This
-    //! runs the generated client against the generated server over a real
-    //! socket, which is the only way to exercise connecting, subscribing,
-    //! streaming and reconnecting.
-
-    use super::*;
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    use tokio::sync::mpsc;
-    use tokio_stream::wrappers::{TcpListenerStream, UnboundedReceiverStream};
-    use tokio_stream::StreamExt;
-    use tonic::{Response, Status, Streaming};
-
-    use svidlet::policy::proto::policy_service_server::{PolicyService, PolicyServiceServer};
-    use svidlet::policy::proto::{
-        watch_request, PolicyDocument as ProtoDocument, PolicyUpdate, WatchRequest,
-    };
-
-    /// A policy backend that answers each Subscribe with one bundle.
-    #[derive(Default, Clone)]
-    struct Backend {
-        subscribes: Arc<AtomicUsize>,
-        /// The revision handed out, which a test can change under the client.
-        revision: Arc<Mutex<String>>,
-        /// End the stream after answering, as a backend recycling connections
-        /// or being restarted behind a load balancer would.
-        end_after_first: bool,
-    }
-
-    #[tonic::async_trait]
-    impl PolicyService for Backend {
-        type WatchStream = UnboundedReceiverStream<Result<PolicyUpdate, Status>>;
-
-        async fn watch(
-            &self,
-            request: tonic::Request<Streaming<WatchRequest>>,
-        ) -> Result<Response<Self::WatchStream>, Status> {
-            let mut inbound = request.into_inner();
-            let (tx, rx) = mpsc::unbounded_channel();
-            let subscribes = self.subscribes.clone();
-            let revision = self.revision.clone();
-            let end_after_first = self.end_after_first;
-
-            tokio::spawn(async move {
-                while let Some(Ok(message)) = inbound.next().await {
-                    let Some(watch_request::Request::Subscribe(sub)) = message.request else {
-                        continue;
-                    };
-                    subscribes.fetch_add(1, Ordering::SeqCst);
-                    let update = PolicyUpdate {
-                        spiffe_id: sub.spiffe_id,
-                        revision: revision.lock().unwrap().clone(),
-                        documents: vec![ProtoDocument {
-                            name: "authz.rego".into(),
-                            content: b"allow := true".to_vec(),
-                        }],
-                        empty: false,
-                    };
-                    if tx.send(Ok(update)).is_err() || end_after_first {
-                        return;
-                    }
-                }
-            });
-
-            Ok(Response::new(UnboundedReceiverStream::new(rx)))
-        }
-    }
-
-    async fn serve(backend: Backend) -> (String, tokio::task::JoinHandle<()>) {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = format!("http://{}", listener.local_addr().unwrap());
-        let handle = tokio::spawn(async move {
-            let _ = tonic::transport::Server::builder()
-                .add_service(PolicyServiceServer::new(backend))
-                .serve_with_incoming(TcpListenerStream::new(listener))
-                .await;
-        });
-        (addr, handle)
-    }
-
-    async fn eventually<F: Fn() -> bool>(what: &str, check: F) {
-        for _ in 0..100 {
-            if check() {
-                return;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        }
-        panic!("timed out waiting for {what}");
-    }
-
-    #[tokio::test]
-    async fn a_pod_starting_pulls_its_policy_over_the_stream() {
-        let subscribes = Arc::new(AtomicUsize::new(0));
-        let (addr, server) = serve(Backend {
-            subscribes: subscribes.clone(),
-            revision: Arc::new(Mutex::new("git-r1".into())),
-            end_after_first: false,
-        })
-        .await;
-
-        let mut settings = policy_settings(Some(&addr));
-        settings.initial_timeout = std::time::Duration::from_secs(10);
-        settings.required = true;
-        let fx = fixture_with("stream", 3600, IdTemplate::DEFAULT, None, settings);
-
-        // The real client, connecting over a real socket.
-        let watcher = tokio::spawn(svidlet::policy::grpc::watch_loop(
-            fx.policy.clone(),
-            "node-1".into(),
-        ));
-
-        let target = fx.root.join("mount");
-        // Policy is required, so this call blocks until the bundle streams in.
-        fx.node
-            .node_publish_volume(Request::new(publish_request(&target, "payments", "api")))
-            .await
-            .unwrap();
-
-        assert_eq!(
-            std::fs::read_to_string(target.join("policy/authz.rego")).unwrap(),
-            "allow := true"
-        );
-        assert_eq!(
-            std::fs::read_to_string(target.join(REVISION_FILE)).unwrap(),
-            "git-r1\n"
-        );
-        assert_eq!(subscribes.load(Ordering::SeqCst), 1);
-        assert!(fx
-            .policy
-            .metrics
-            .connected
-            .load(std::sync::atomic::Ordering::Relaxed));
-
-        watcher.abort();
-        server.abort();
-        std::fs::remove_dir_all(&fx.root).unwrap();
-    }
-
-    #[tokio::test]
-    async fn the_stream_reconnects_and_picks_up_what_changed_while_it_was_down() {
-        let subscribes = Arc::new(AtomicUsize::new(0));
-        let revision = Arc::new(Mutex::new("git-r1".to_string()));
-        // This backend hangs up after every answer, so the client has to
-        // reconnect and resubscribe to keep receiving anything.
-        let (addr, server) = serve(Backend {
-            subscribes: subscribes.clone(),
-            revision: revision.clone(),
-            end_after_first: true,
-        })
-        .await;
-
-        let fx = fixture_with(
-            "stream-reconnect",
-            3600,
-            IdTemplate::DEFAULT,
-            None,
-            policy_settings(Some(&addr)),
-        );
-        let watcher = tokio::spawn(svidlet::policy::grpc::watch_loop(
-            fx.policy.clone(),
-            "node-1".into(),
-        ));
-
-        let target = fx.root.join("mount");
-        fx.node
-            .node_publish_volume(Request::new(publish_request(&target, "payments", "api")))
-            .await
-            .unwrap();
-
-        let id = "spiffe://example.org/cluster/a/ns/payments/sa/api";
-        eventually("the first bundle", || {
-            fx.policy
-                .bundle(id)
-                .map(|b| b.revision == "git-r1")
-                .unwrap_or(false)
-        })
-        .await;
-
-        // Upstream moves while the node is between connections.
-        *revision.lock().unwrap() = "git-r2".to_string();
-
-        eventually("the resubscribe", || subscribes.load(Ordering::SeqCst) >= 2).await;
-        eventually("the new revision", || {
-            fx.policy
-                .bundle(id)
-                .map(|b| b.revision == "git-r2")
-                .unwrap_or(false)
-        })
-        .await;
-        assert!(
-            fx.policy
-                .metrics
-                .stream_reconnects
-                .load(std::sync::atomic::Ordering::Relaxed)
-                > 0
-                || subscribes.load(Ordering::SeqCst) >= 2
-        );
-
-        // The apply loop writes the new revision into the mounted volume,
-        // without re-issuing the certificate.
-        assert_eq!(
-            svidlet::renew::apply_dirty_policy(fx.publisher.clone()).await,
-            1
-        );
-        assert_eq!(
-            std::fs::read_to_string(target.join(REVISION_FILE)).unwrap(),
-            "git-r2\n"
-        );
-        assert_eq!(fx.ca.signed_ids().len(), 1);
-
-        watcher.abort();
-        server.abort();
-        std::fs::remove_dir_all(&fx.root).unwrap();
-    }
-}
-
-// --------------------------------------------------------- background passes
-
-#[tokio::test]
-async fn the_renewal_pass_renews_everything_that_is_due() {
-    let fx = fixture("renew-pass", 3600);
-    let target = fx.root.join("mount");
-    fx.node
-        .node_publish_volume(Request::new(publish_request(&target, "default", "web")))
-        .await
-        .unwrap();
-
-    // Nothing is due yet.
-    assert_eq!(svidlet::renew::renew_due(fx.publisher.clone()).await, 0);
-    assert_eq!(fx.ca.signed_ids().len(), 1);
-
-    // Bring the deadline forward, as the passage of time would.
-    let mut entry = fx.store.get(&target).unwrap();
-    entry.renew_at = svidlet::log::unix_now() - 1;
-    fx.store.insert(entry);
-
-    assert_eq!(svidlet::renew::renew_due(fx.publisher.clone()).await, 1);
-    assert_eq!(fx.ca.signed_ids().len(), 2);
-    // Renewing moved the deadline back into the future.
-    assert_eq!(svidlet::renew::renew_due(fx.publisher.clone()).await, 0);
-
-    std::fs::remove_dir_all(&fx.root).unwrap();
-}
-
-#[tokio::test]
-async fn the_reaper_drops_volumes_the_kubelet_removed_while_we_were_down() {
-    let fx = fixture("reaper", 3600);
-    let target = fx.root.join("mount");
-    fx.node
-        .node_publish_volume(Request::new(publish_request(&target, "default", "web")))
-        .await
-        .unwrap();
-    assert_eq!(svidlet::renew::reap_orphans(&fx.publisher), 0);
-
-    // The kubelet tore the pod down without an unpublish reaching us.
-    std::fs::remove_dir_all(&target).unwrap();
-
-    assert_eq!(svidlet::renew::reap_orphans(&fx.publisher), 1);
-    assert_eq!(fx.store.len(), 0);
-    assert_eq!(svidlet::renew::reap_orphans(&fx.publisher), 0);
-
-    std::fs::remove_dir_all(&fx.root).unwrap();
-}
-
-#[tokio::test]
-async fn the_ca_refresh_pass_survives_a_backend_outage() {
-    let fx = fixture("ca-pass", 3600);
-    let target = fx.root.join("mount");
-    fx.node
-        .node_publish_volume(Request::new(publish_request(&target, "default", "web")))
-        .await
-        .unwrap();
-    let ca_before = std::fs::read_to_string(target.join(CA_FILE)).unwrap();
-
-    fx.ca.break_signing("vault is sealed");
-    svidlet::renew::refresh_ca_once(fx.publisher.clone()).await;
-
-    // ca_chain() still works on the test CA, so nothing changed; the point is
-    // that the pass does not panic or clear ca.crt.
-    assert_eq!(
-        std::fs::read_to_string(target.join(CA_FILE)).unwrap(),
-        ca_before
-    );
-
-    std::fs::remove_dir_all(&fx.root).unwrap();
-}
-
-#[tokio::test]
-async fn the_policy_flag_turns_the_whole_feature_off() {
-    // An endpoint is configured — and unreachable — but the flag is off. This
-    // is the local-testing shape: the ConfigMap stays as it is in production
-    // and one variable takes the policy backend out of the picture.
-    let mut settings = policy_settings(Some("http://policy.invalid:9000"));
-    settings.enabled = false;
-    // Even `required` must not make publishing wait once the flag is off,
-    // or turning it off would still block every pod.
-    settings.required = true;
-    settings.initial_timeout = std::time::Duration::from_secs(30);
-
-    let fx = fixture_with("policy-off", 3600, IdTemplate::DEFAULT, None, settings);
-    let target = fx.root.join("mount");
-
-    // No stream, no waiting: this returns immediately rather than after 30s.
-    let started = std::time::Instant::now();
-    fx.node
-        .node_publish_volume(Request::new(publish_request(&target, "payments", "api")))
-        .await
-        .unwrap();
-    assert!(
-        started.elapsed() < std::time::Duration::from_secs(5),
-        "publishing waited for a policy backend that is switched off"
-    );
-
     assert_eq!(
         published_spiffe_id(&target),
         "spiffe://example.org/cluster/a/ns/payments/sa/api"
     );
-    assert!(!target.join("policy").exists());
-    assert!(!target.join(REVISION_FILE).exists());
-    assert_eq!(fx.policy.subscription_count(), 0);
 
-    // And the watcher returns instead of retrying an endpoint it must ignore.
-    tokio::time::timeout(
-        std::time::Duration::from_secs(2),
-        svidlet::policy::grpc::watch_loop(fx.policy.clone(), "node-1".into()),
+    std::fs::remove_dir_all(&fx.root).unwrap();
+}
+
+#[tokio::test]
+async fn a_certificate_renewal_never_disturbs_the_policy_chain() {
+    // Structural, not careful coding: the two writers own different names.
+    let fx = fixture("chains", 3600);
+    let target = fx.root.join("mount");
+    fx.node
+        .node_publish_volume(Request::new(publish_request(&target, "payments", "api")))
+        .await
+        .unwrap();
+
+    let bundle = svidlet::policy::PolicyBundle::build(
+        "git-r1".into(),
+        vec![svidlet::policy::PolicyDocument {
+            name: "authz.rego".into(),
+            content: b"allow := true".to_vec(),
+        }],
     )
-    .await
-    .expect("the watch loop returns rather than connecting");
+    .unwrap();
+    svidlet::volume::publish_policy(&target, &bundle, 0o644).unwrap();
+
+    let entry = fx.store.get(&target).unwrap();
+    for _ in 0..3 {
+        svidlet::renew::renew_one(&fx.publisher, &entry);
+    }
+    svidlet::renew::refresh_ca_once(fx.publisher.clone()).await;
+
+    assert_eq!(
+        std::fs::read_to_string(target.join("policy/authz.rego")).unwrap(),
+        "allow := true"
+    );
+    assert_eq!(
+        svidlet::volume::published_revision(&target).as_deref(),
+        Some("git-r1")
+    );
+    assert_eq!(fx.ca.signed_ids().len(), 4);
 
     std::fs::remove_dir_all(&fx.root).unwrap();
 }

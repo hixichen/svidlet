@@ -26,12 +26,12 @@ pub async fn watch_loop(manager: Arc<PolicyManager>, node_name: String) {
         debug!("the policy stream is disabled");
         return;
     }
-    let Some(endpoint) = manager.settings().endpoint.clone() else {
+    let Some(endpoint) = manager.settings().stream.endpoint.clone() else {
         return;
     };
     info!("policy backend", endpoint = endpoint, node = node_name);
 
-    let base = manager.settings().reconnect_backoff;
+    let base = manager.settings().stream.reconnect_backoff;
     let mut backoff = base;
 
     loop {
@@ -101,7 +101,7 @@ async fn connect(
 
     if endpoint.starts_with("https://") {
         let mut tls = ClientTlsConfig::new().with_enabled_roots();
-        if let Some(path) = &manager.settings().ca_cert_path {
+        if let Some(path) = &manager.settings().stream.ca_cert_path {
             let pem =
                 std::fs::read(path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
             tls = tls.ca_certificate(tonic::transport::Certificate::from_pem(pem));
@@ -216,21 +216,13 @@ pub fn apply(manager: &Arc<PolicyManager>, update: PolicyUpdate) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::PolicySettings;
+
     use crate::policy::proto::PolicyDocument as ProtoDocument;
 
     fn manager() -> Arc<PolicyManager> {
-        PolicyManager::new(PolicySettings {
-            enabled: true,
-            bundle: None,
-            endpoint: Some("http://policy.invalid:9000".into()),
-            ca_cert_path: None,
-            token_path: None,
-            required: false,
-            initial_timeout: Duration::from_millis(50),
-            directory: "policy".into(),
-            reconnect_backoff: Duration::from_millis(10),
-        })
+        PolicyManager::new(crate::policy::testkit::test_config(Some(
+            "http://policy.invalid:9000",
+        )))
     }
 
     fn update(spiffe_id: &str, revision: &str, docs: &[(&str, &str)], empty: bool) -> PolicyUpdate {
@@ -364,7 +356,7 @@ mod tests {
         // An endpoint is configured but the feature is switched off: no
         // connection is attempted, so a local run needs no policy backend.
         let mut settings = manager().settings().clone();
-        settings.enabled = false;
+        settings.stream.enabled = false;
         let m = PolicyManager::new(settings);
         tokio::time::timeout(Duration::from_secs(2), watch_loop(m, "node-1".into()))
             .await
@@ -373,17 +365,7 @@ mod tests {
 
     #[tokio::test]
     async fn the_watch_loop_exits_immediately_when_policy_is_disabled() {
-        let m = PolicyManager::new(PolicySettings {
-            enabled: true,
-            bundle: None,
-            endpoint: None,
-            ca_cert_path: None,
-            token_path: None,
-            required: false,
-            initial_timeout: Duration::from_millis(10),
-            directory: "policy".into(),
-            reconnect_backoff: Duration::from_millis(10),
-        });
+        let m = PolicyManager::new(crate::policy::testkit::test_config(None));
         tokio::time::timeout(Duration::from_secs(2), watch_loop(m, "node-1".into()))
             .await
             .expect("returns rather than looping");
