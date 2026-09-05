@@ -1,3 +1,22 @@
+# Build output.
 /target
+
+# Local development state written by hack/local-vault.sh. Holds the dev-mode
+# Vault's root token and a live AppRole secret ID -- either would let its holder
+# mint any identity in the cluster that Vault is configured for.
 /.local-vault
+
+# Ed25519 bundle signing keys written by `hack/build-bundle.sh keygen`. The
+# private half signs the rollout manifest every node in the fleet trusts, so it
+# must never enter the repository; in production it belongs in Vault Transit or
+# an equivalent, not in a file at all. The public half is safe to publish -- add
+# it by name if you want it tracked.
 /.bundle-keys
+
+# Credential shapes that get dropped into a repository by accident. Nothing in
+# svidlet reads these paths; they are here so a stray copy cannot be committed
+# without noticing.
+*.key
+*.p12
+*.pfx
+secret-id

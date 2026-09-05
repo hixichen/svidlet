@@ -275,6 +275,40 @@ volumes:
 `tls.key` is written mode `0640`, so a non-root workload needs `fsGroup` set; the
 CSIDriver's `fsGroupPolicy: File` makes the kubelet apply it.
 
+## Credentials
+
+Nothing secret belongs in this repository, and `.gitignore` is written to make an
+accidental commit hard rather than to tidy up afterwards.
+
+| Secret | Where it lives | Never |
+|---|---|---|
+| Vault AppRole secret ID | a Kubernetes Secret, mounted at `SVIDLET_SECRET_ID_FILE` | in Git, in the image, in a ConfigMap |
+| Vault token (dev only) | `.local-vault/`, written by `hack/local-vault.sh` | anywhere but a workstation |
+| Bundle signing key (private) | Vault Transit, or a CI secret store | on a node, in Git — nodes only ever need the public half |
+| Bundle signing key (public) | `SVIDLET_BUNDLE_PUBLIC_KEY`, a ConfigMap, or this repo | — it is safe to publish |
+
+`.gitignore` therefore excludes `/.local-vault` and `/.bundle-keys` — the two
+directories the local tooling writes real key material into — plus `*.key`, `*.p12`,
+`*.pfx` and `secret-id`, which are the shapes that get dropped into a repository by
+accident. Nothing in svidlet reads those paths; they are there so a stray copy cannot be
+committed without noticing.
+
+Two things follow from the design that are worth stating plainly:
+
+- **The AppRole secret ID is the most valuable secret in the system.** Whoever can read
+  it can mint any identity in that cluster, from anywhere, until it is rotated. This is
+  the weakest part of the design and [docs/DESIGN.md](docs/DESIGN.md) says so at length;
+  `SVIDLET_VAULT_AUTH=kubernetes` removes it entirely where Vault can validate
+  ServiceAccount tokens.
+- **Nodes never hold a signing key.** Bundle verification is offline against a public
+  key, so compromising a node yields no ability to sign a bundle for anyone else.
+  `hack/build-bundle.sh keygen` writes a private key to a local file because that is
+  the right shape for a demo and the wrong shape for production, and the script says so
+  in its header.
+
+The manifests in `deploy/` carry `replace-me` placeholders rather than working values,
+so applying them unedited fails loudly instead of running with a checked-in credential.
+
 ## Configuration
 
 All configuration is environment variables, so one image and one manifest differ
