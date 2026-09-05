@@ -2,6 +2,13 @@
 
 **A lightweight SPIFFE X.509 issuer for Kubernetes, in Rust.**
 
+> **This is an experimental project, written to learn Rust.** It is not a better SPIFFE
+> implementation than SPIRE or cert-manager's `csi-driver-spiffe`, and it is not trying
+> to be — both are mature, and both do more. What this aims at is a narrower thing:
+> lightweight, easy to deploy, and easy to maintain — one static binary, one DaemonSet,
+> no control plane and no API-server dependency — for pod identity across multiple
+> Kubernetes clusters. Read it in that spirit.
+
 Svidlet gives pods short-lived X.509 certificates carrying a SPIFFE ID
 (`spiffe://<trust-domain>/cluster/<cluster>/ns/<namespace>/sa/<serviceaccount>`)
 so services can authenticate each other with mutual TLS at the application layer.
