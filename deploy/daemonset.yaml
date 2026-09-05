@@ -1,0 +1,202 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: svidlet-system
+  labels:
+    # The plugin needs CAP_SYS_ADMIN to mount tmpfs; tenant workloads that
+    # consume its certificates do not, and stay under restricted PSS.
+    pod-security.kubernetes.io/enforce: privileged
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: svidlet
+  namespace: svidlet-system
+# Deliberately no Role, RoleBinding or ClusterRole: svidlet never talks to the
+# API server. Issuance is one HTTPS call to the PKI backend.
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: svidlet
+  namespace: svidlet-system
+data:
+  SVIDLET_TRUST_DOMAIN: example.org
+  SVIDLET_CLUSTER: cluster-a
+  SVIDLET_CERT_TTL: 24h
+  SVIDLET_LOG_LEVEL: info
+
+  # Shape of every SPIFFE ID this node issues. The cluster lives in the path,
+  # not the trust domain, so cross-cluster mTLS needs no federation.
+  # Placeholders: trust_domain, cluster, namespace, service_account,
+  # pod_name, pod_uid, node_name.
+  SVIDLET_SPIFFE_ID_TEMPLATE: "spiffe://{trust_domain}/cluster/{cluster}/ns/{namespace}/sa/{service_account}"
+  # An independent second gate. The template says what svidlet builds; this says
+  # what it is allowed to build. Anchored on both ends.
+  # SVIDLET_SPIFFE_ID_PATTERN: "spiffe://example\\.org/cluster/cluster-a/ns/(payments|billing)/sa/.+"
+
+  VAULT_ADDR: https://vault.example.internal:8200
+  SVIDLET_PKI_MOUNT: pki
+  # Defaults to spiffe-$SVIDLET_CLUSTER.
+  SVIDLET_PKI_ROLE: spiffe-cluster-a
+
+  # approle | kubernetes | token.
+  #
+  # AppRole is the default because it works everywhere, including bare metal —
+  # but it is a shared bearer secret, and it is the weakest part of this design
+  # (see docs/DESIGN.md). Where Vault can validate ServiceAccount tokens, prefer:
+  #
+  #   SVIDLET_VAULT_AUTH: kubernetes
+  #   SVIDLET_VAULT_K8S_ROLE: svidlet
+  #
+  # which proves the plugin's own identity with no secret to distribute or rotate.
+  SVIDLET_VAULT_AUTH: approle
+  SVIDLET_APPROLE_MOUNT: approle
+  # Not a secret: the role ID names the AppRole, the secret ID authenticates.
+  SVIDLET_ROLE_ID: replace-me
+
+  # Authorization policy, streamed from a backend fronting a git repository.
+  # Leave the endpoint unset to disable: no stream is opened and no policy
+  # directory is written.
+  # SVIDLET_POLICY_ENDPOINT: https://policy.example.internal:9000
+  #
+  # The master switch. Setting this to "false" ignores the endpoint above
+  # entirely — no stream, no subscriptions, no waiting — while leaving the rest
+  # of this ConfigMap alone. Use it for local runs, and to take the policy
+  # backend out of the picture when narrowing down a problem.
+  SVIDLET_POLICY_ENABLED: "true"
+  # Off means a policy-backend outage still lets certificates be issued. On means
+  # a pod that would run unpoliced does not start.
+  # SVIDLET_POLICY_REQUIRED: "false"
+  # SVIDLET_POLICY_INITIAL_TIMEOUT: 10s
+
+  # Or pull policy as signed, content-addressed OCI bundles with a staged ring
+  # rollout — see docs/POLICY.md. Setting the rollout reference switches this
+  # on; a trusted public key is then mandatory, and the plugin refuses to start
+  # without one rather than run unable to verify anything.
+  # SVIDLET_BUNDLE_ROLLOUT_REF: registry.example.internal/policy/rollout:current
+  # SVIDLET_BUNDLE_PUBLIC_KEY_FILE: /etc/svidlet/bundle/signing.pub
+  # SVIDLET_BUNDLE_POLL_INTERVAL: 60s
+  # SVIDLET_BUNDLE_POLL_JITTER: 30s
+  # Superseded versions kept unpacked, so a rollback needs no registry.
+  # SVIDLET_BUNDLE_KEEP_VERSIONS: "2"
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: svidlet-vault-approle
+  namespace: svidlet-system
+type: Opaque
+stringData:
+  # Rotate on a fixed cadence. svidlet re-reads this file on every login, so a
+  # rotation takes effect without restarting the DaemonSet.
+  secret-id: replace-me
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: svidlet
+  namespace: svidlet-system
+  labels:
+    app.kubernetes.io/name: svidlet
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: svidlet
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate:
+      # A restart adopts existing certificates instead of re-issuing them, so a
+      # fast rollout does not create a signing storm — but a slower one still
+      # limits how many nodes are briefly unable to serve new pods.
+      maxUnavailable: 10%
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: svidlet
+    spec:
+      serviceAccountName: svidlet
+      priorityClassName: system-node-critical
+      hostNetwork: false
+      tolerations:
+        - operator: Exists
+      containers:
+        - name: svidlet
+          image: ghcr.io/hixichen/svidlet:0.0.1
+          imagePullPolicy: IfNotPresent
+          envFrom:
+            - configMapRef:
+                name: svidlet
+          env:
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+          ports:
+            - name: metrics
+              containerPort: 9464
+          securityContext:
+            # Required to mount a tmpfs per volume and to propagate that mount
+            # back to the kubelet. This is the same privilege every CSI node
+            # plugin needs.
+            privileged: true
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: true
+          volumeMounts:
+            - name: kubelet-dir
+              mountPath: /var/lib/kubelet
+              # Bidirectional so the tmpfs svidlet mounts inside a pod's volume
+              # directory is visible to the kubelet and to the workload.
+              mountPropagation: Bidirectional
+            - name: vault-approle
+              mountPath: /etc/svidlet/vault
+              readOnly: true
+            # The node-local bundle cache: versions/, current, state.json.
+            # A hostPath so a restart resumes the bundle it already had rather
+            # than waiting for the registry.
+            - name: bundle-cache
+              mountPath: /var/lib/svidlet/policy
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: metrics
+            initialDelaySeconds: 5
+            periodSeconds: 20
+            # Liveness is not tied to the PKI backend: a Vault outage must not
+            # restart nodes whose certificates are still valid for hours.
+            failureThreshold: 3
+          resources:
+            requests:
+              cpu: 10m
+              memory: 24Mi
+            limits:
+              memory: 96Mi
+      volumes:
+        - name: kubelet-dir
+          hostPath:
+            path: /var/lib/kubelet
+            type: Directory
+        - name: vault-approle
+          secret:
+            secretName: svidlet-vault-approle
+            defaultMode: 0400
+        - name: bundle-cache
+          hostPath:
+            path: /var/lib/svidlet/policy
+            type: DirectoryOrCreate
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: svidlet-metrics
+  namespace: svidlet-system
+  labels:
+    app.kubernetes.io/name: svidlet
+spec:
+  clusterIP: None
+  selector:
+    app.kubernetes.io/name: svidlet
+  ports:
+    - name: metrics
+      port: 9464
+      targetPort: metrics

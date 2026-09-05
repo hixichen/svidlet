@@ -1,0 +1,16 @@
+apiVersion: storage.k8s.io/v1
+kind: CSIDriver
+metadata:
+  name: csi.svidlet.io
+spec:
+  # No controller, no attach step: everything happens on the node.
+  attachRequired: false
+  # This is what makes the kubelet pass pod.namespace and serviceAccount.name
+  # in the volume context. Without it svidlet has no identity to issue and
+  # refuses to publish — it will not fall back to anything pod-supplied.
+  podInfoOnMount: true
+  volumeLifecycleModes:
+    - Ephemeral
+  # Lets a pod's fsGroup own the mounted files, so a non-root workload can read
+  # tls.key without it having to be world readable.
+  fsGroupPolicy: File

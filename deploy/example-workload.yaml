@@ -1,0 +1,83 @@
+# A workload that receives a SPIFFE certificate, declaring the volume itself.
+#
+# The pod runs under restricted Pod Security Standards: a `csi` ephemeral
+# volume is allowed there, a hostPath is not.
+#
+# Note the mount is on `app` only. `sidecar` shares the pod but never sees the
+# identity — per-container holding is the point of mounting rather than
+# projecting a Secret.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: api
+  namespace: payments
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: api
+  namespace: payments
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: api
+  template:
+    metadata:
+      labels:
+        app: api
+    spec:
+      serviceAccountName: api
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        # tls.key is mode 0640; fsGroup plus the CSIDriver's
+        # `fsGroupPolicy: File` is what makes it readable by this user without
+        # making it readable by everyone.
+        fsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: app
+          image: cgr.dev/chainguard/busybox:latest
+          command:
+            - sh
+            - -c
+            - |
+              set -eu
+              echo "waiting for the SVID"
+              while [ ! -s /var/run/svid/tls.crt ]; do sleep 1; done
+              echo "identity:"
+              openssl x509 -in /var/run/svid/tls.crt -noout -text 2>/dev/null |
+                grep -A1 'Subject Alternative Name' || cat /var/run/svid/tls.crt
+              # Present only when a policy backend is configured. Both the
+              # certificate and the policy set are swapped atomically, so
+              # reloading on a change never sees a mismatched pair.
+              if [ -d /var/run/svid/policy ]; then
+                echo "policy revision: $(cat /var/run/svid/policy.revision)"
+                ls /var/run/svid/policy
+              fi
+              sleep infinity
+          volumeMounts:
+            - name: svid
+              mountPath: /var/run/svid
+              readOnly: true
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+        - name: sidecar
+          image: cgr.dev/chainguard/busybox:latest
+          command: ["sleep", "infinity"]
+          # No volumeMounts: this container cannot read the identity.
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+      volumes:
+        - name: svid
+          csi:
+            driver: csi.svidlet.io
+            readOnly: true

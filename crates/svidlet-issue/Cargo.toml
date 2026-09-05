@@ -1,0 +1,19 @@
+[package]
+name = "svidlet-issue"
+description = "SPIFFE X.509 SVID issuance: CSR building, Issuer trait, Vault PKI backend"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+rcgen.workspace = true
+regex-lite.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+ureq.workspace = true
+x509-parser.workspace = true
+
+[dev-dependencies]
+rcgen = { workspace = true, features = ["x509-parser"] }
+time = "0.3"

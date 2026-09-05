@@ -1,0 +1,78 @@
+// Minimal subset of the CSI v1 spec (https://github.com/container-storage-interface/spec).
+//
+// Only the Identity service and the four Node RPCs an ephemeral-inline node
+// plugin must answer are declared. Field numbers match the upstream csi.proto
+// exactly, so this is wire-compatible with the kubelet; fields we never read
+// (volume_capability, staging_target_path, secrets, ...) are simply omitted and
+// skipped by the decoder.
+syntax = "proto3";
+package csi.v1;
+
+service Identity {
+  rpc GetPluginInfo(GetPluginInfoRequest) returns (GetPluginInfoResponse) {}
+  rpc GetPluginCapabilities(GetPluginCapabilitiesRequest) returns (GetPluginCapabilitiesResponse) {}
+  rpc Probe(ProbeRequest) returns (ProbeResponse) {}
+}
+
+service Node {
+  rpc NodePublishVolume(NodePublishVolumeRequest) returns (NodePublishVolumeResponse) {}
+  rpc NodeUnpublishVolume(NodeUnpublishVolumeRequest) returns (NodeUnpublishVolumeResponse) {}
+  rpc NodeGetCapabilities(NodeGetCapabilitiesRequest) returns (NodeGetCapabilitiesResponse) {}
+  rpc NodeGetInfo(NodeGetInfoRequest) returns (NodeGetInfoResponse) {}
+}
+
+message GetPluginInfoRequest {}
+
+message GetPluginInfoResponse {
+  string name = 1;
+  string vendor_version = 2;
+  map<string, string> manifest = 3;
+}
+
+message GetPluginCapabilitiesRequest {}
+
+// Svidlet is node-only: it advertises no controller service and no volume
+// expansion, so the capability list is always empty.
+message GetPluginCapabilitiesResponse {
+  repeated PluginCapability capabilities = 2;
+}
+
+message PluginCapability {}
+
+message ProbeRequest {}
+
+// `ready` (field 1) is omitted: per the CSI spec a caller assumes the plugin is
+// ready when the field is absent.
+message ProbeResponse {}
+
+message NodePublishVolumeRequest {
+  string volume_id = 1;
+  string target_path = 3;
+  bool readonly = 5;
+  map<string, string> volume_context = 7;
+}
+
+message NodePublishVolumeResponse {}
+
+message NodeUnpublishVolumeRequest {
+  string volume_id = 1;
+  string target_path = 2;
+}
+
+message NodeUnpublishVolumeResponse {}
+
+message NodeGetCapabilitiesRequest {}
+
+// Empty: Svidlet needs neither staging nor volume stats nor expansion.
+message NodeGetCapabilitiesResponse {
+  repeated NodeServiceCapability capabilities = 1;
+}
+
+message NodeServiceCapability {}
+
+message NodeGetInfoRequest {}
+
+message NodeGetInfoResponse {
+  string node_id = 1;
+  int64 max_volumes_per_node = 2;
+}

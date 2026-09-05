@@ -1,0 +1,57 @@
+// Authorization policy distribution.
+//
+// A node opens one long-lived bidirectional stream to the policy backend — a
+// service fronting a git repository, typically — and keeps it open. It sends a
+// Subscribe for every identity it hosts and an Unsubscribe when a pod goes
+// away; the backend pushes a PolicyUpdate whenever the upstream changes.
+//
+// One stream per node, not per pod: a node running fifty workloads holds one
+// connection, and a change upstream reaches every node that cares about it
+// without anybody polling.
+syntax = "proto3";
+package svidlet.policy.v1;
+
+service PolicyService {
+  rpc Watch(stream WatchRequest) returns (stream PolicyUpdate) {}
+}
+
+message WatchRequest {
+  // Which node is asking. For the backend's audit trail; it is not trusted for
+  // authorization, since the transport already authenticates the node.
+  string node_name = 1;
+
+  oneof request {
+    Subscribe subscribe = 2;
+    Unsubscribe unsubscribe = 3;
+  }
+}
+
+message Subscribe {
+  string spiffe_id = 1;
+  // The revision this node already holds, so the backend can skip re-sending
+  // an identical bundle after a reconnect. Empty when nothing is held.
+  string known_revision = 2;
+}
+
+message Unsubscribe {
+  string spiffe_id = 1;
+}
+
+message PolicyUpdate {
+  string spiffe_id = 1;
+  // Opaque upstream revision — a git commit, typically. Compared for equality
+  // only; svidlet never parses it.
+  string revision = 2;
+  repeated PolicyDocument documents = 3;
+  // Set when the backend has no policy for this identity. Distinguishes
+  // "nothing configured" from "not answered yet", which matters when
+  // SVIDLET_POLICY_REQUIRED is on.
+  bool empty = 4;
+}
+
+message PolicyDocument {
+  // File name inside the volume's policy directory. Must be a single path
+  // segment; svidlet rejects anything containing a separator.
+  string name = 1;
+  bytes content = 2;
+}

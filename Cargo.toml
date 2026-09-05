@@ -1,0 +1,33 @@
+[workspace]
+resolver = "2"
+members = ["crates/svidlet", "crates/svidlet-issue"]
+
+[workspace.package]
+version = "0.0.1"
+edition = "2021"
+license = "Apache-2.0"
+repository = "https://github.com/hixichen/svidlet"
+
+[workspace.dependencies]
+base64 = "0.23"
+basic-toml = "0.1"
+libc = "0.2"
+ring = "0.17"
+prost = "0.14"
+regex-lite = "0.1"
+rcgen = { version = "0.14", default-features = false, features = ["crypto", "ring", "pem"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", default-features = false, features = ["rt", "macros", "net", "time", "signal", "io-util", "sync"] }
+tokio-stream = { version = "0.1", default-features = false, features = ["net", "sync"] }
+tonic = { version = "0.14", default-features = false, features = ["server", "router", "codegen", "channel", "tls-ring", "tls-webpki-roots"] }
+tonic-prost = "0.14"
+ureq = { version = "3", default-features = false, features = ["rustls", "json"] }
+x509-parser = { version = "0.18", features = ["verify"] }
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

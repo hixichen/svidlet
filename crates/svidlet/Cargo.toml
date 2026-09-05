@@ -1,0 +1,34 @@
+[package]
+name = "svidlet"
+description = "Lightweight SPIFFE X.509 issuer for Kubernetes — CSI node plugin"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+svidlet-issue = { path = "../svidlet-issue" }
+base64.workspace = true
+basic-toml.workspace = true
+libc.workspace = true
+ring.workspace = true
+prost.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tokio-stream.workspace = true
+tonic.workspace = true
+tonic-prost.workspace = true
+ureq.workspace = true
+
+[build-dependencies]
+tonic-prost-build = "0.14"
+protoc-bin-vendored = "3"
+
+[dev-dependencies]
+base64.workspace = true
+rcgen = { workspace = true, features = ["x509-parser"] }
+ring.workspace = true
+serde_json.workspace = true
+svidlet-issue = { path = "../svidlet-issue" }
+time = "0.3"

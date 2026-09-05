@@ -1,0 +1,30 @@
+// Kubelet plugin registration API (k8s.io/kubelet/pkg/apis/pluginregistration/v1).
+// The kubelet's plugin watcher dials the -reg.sock in plugins_registry/ and
+// calls GetInfo; svidlet answers it directly instead of running
+// node-driver-registrar as a second container.
+syntax = "proto3";
+package pluginregistration;
+
+service Registration {
+  rpc GetInfo(InfoRequest) returns (PluginInfo) {}
+  rpc NotifyRegistrationStatus(RegistrationStatus) returns (RegistrationStatusResponse) {}
+}
+
+message InfoRequest {}
+
+message PluginInfo {
+  // "CSIPlugin" or "DevicePlugin".
+  string type = 1;
+  // The CSI driver name; must match the CSIDriver object.
+  string name = 2;
+  // Path of the plugin's own gRPC socket, as seen by the kubelet.
+  string endpoint = 3;
+  repeated string supported_versions = 4;
+}
+
+message RegistrationStatus {
+  bool plugin_registered = 1;
+  string error = 2;
+}
+
+message RegistrationStatusResponse {}
