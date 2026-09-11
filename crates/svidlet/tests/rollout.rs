@@ -287,6 +287,7 @@ fn settings(stub: &Stub, key: String, dir: PathBuf) -> BundleSettings {
         directory: dir,
         keep_versions: 2,
         max_bytes: 1024 * 1024,
+        full_fetch_every: 60,
     }
 }
 
@@ -492,6 +493,64 @@ fn freeze_halts_every_change_including_a_rollback() {
         std::fs::read_to_string(dir.join("current/rules/authz.rego")).unwrap(),
         "one"
     );
+
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// A genuine signature is not enough: a registry or a stale pull-through cache
+/// can serve an *old signed* manifest — pinning the fleet to an old bundle, or
+/// undoing a freeze. The persisted sequence mark refuses it, the poll fails as
+/// `reason="stale"`, and the node keeps the bundle it has. That is the replay
+/// case the freshness fields exist for.
+#[test]
+fn a_replayed_manifest_is_refused_and_the_node_keeps_its_bundle() {
+    let stub = Stub::start();
+    let ci = Ci::new();
+    let dir = scratch("replay");
+
+    let v1 = stub.publish_blob(bundle("v1", "allow := true"));
+    let v2 = stub.publish_blob(bundle("v2", "allow := false"));
+
+    let sequenced = |sequence: u64, digest: &str| {
+        let toml = manifest(&ring("all", "", digest))
+            .replace("schema = 1", &format!("schema = 1\nsequence = {sequence}"));
+        ci.sign(toml.as_bytes())
+    };
+
+    // Sequence 2 is accepted and applied.
+    stub.publish_rollout(sequenced(2, &v2));
+    let node = source(&stub, &ci, dir.clone(), "prod-eu", "node-1");
+    assert_eq!(node.poll().unwrap().expect("v2 applies").revision, v2);
+
+    // The replay: sequence 1, correctly signed, after 2 was verified.
+    stub.publish_rollout(sequenced(1, &v1));
+    let err = node.poll().unwrap_err();
+    assert!(matches!(err, Error::Stale(_)), "{err}");
+    assert_eq!(err.reason(), "stale");
+    assert_eq!(node.current().digest, v2, "the node keeps v2");
+    // The failed poll does not count as a success, so bundle_age keeps
+    // telling the truth about a replay in progress.
+    assert!(
+        node.age_seconds().unwrap() < 5,
+        "age is only from the good polls"
+    );
+
+    // The high-water mark survives a restart, so a replay is not a window a
+    // restart opens.
+    let restarted = source(&stub, &ci, dir.clone(), "prod-eu", "node-1");
+    let err = restarted.poll().unwrap_err();
+    assert!(matches!(err, Error::Stale(_)), "{err}");
+    assert_eq!(restarted.current().digest, v2);
+
+    // An expired manifest is refused the same way — past valid_until, serving
+    // it counts as a failed poll rather than hiding behind bundle_age.
+    let expired = manifest(&ring("all", "", &v1))
+        .replace("schema = 1", "schema = 1\nsequence = 3\nvalid_until = 1");
+    stub.publish_rollout(ci.sign(expired.as_bytes()));
+    let err = restarted.poll().unwrap_err();
+    assert!(matches!(err, Error::Stale(_)), "{err}");
+    assert!(err.to_string().contains("expired"), "{err}");
+    assert_eq!(restarted.current().digest, v2);
 
     std::fs::remove_dir_all(&dir).unwrap();
 }

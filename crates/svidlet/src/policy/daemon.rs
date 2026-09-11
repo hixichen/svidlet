@@ -92,8 +92,13 @@ impl Daemon {
             .collect()
     }
 
-    /// Walk the kubelet's records and work out which identities this node
+    /// Walk the exposure farm and work out which identities this node
     /// currently hosts, by reading the certificates svidlet published.
+    ///
+    /// The farm — one bind mount per published volume under `volumes_dir` —
+    /// is this process's whole view of the node. It never mounts the kubelet
+    /// root: that directory holds every secret volume on the node, and this
+    /// process exists to parse input other systems produced.
     ///
     /// Subscriptions are updated here rather than by the caller: a scan that
     /// reported changes and left someone else to act on them is a footgun, and
@@ -107,8 +112,8 @@ impl Daemon {
         let mut found: BTreeMap<PathBuf, SpiffeId> = BTreeMap::new();
         let mut unreadable = 0u64;
 
-        for discovered in recover::discover(&self.cfg.kubelet_root, &self.cfg.driver_name) {
-            let chain = match volume::read_cert_chain(&discovered.target_path) {
+        for target in recover::discover_exposed(&self.cfg.volumes_dir) {
+            let chain = match volume::read_cert_chain(&target) {
                 Ok(chain) => chain,
                 // Normal and transient: svidlet may be mid-publish, or the pod
                 // may be going away. Not worth a warning on every scan.
@@ -122,7 +127,7 @@ impl Daemon {
                 Err(e) => {
                     debug!(
                         "volume has no readable certificate yet",
-                        path = discovered.target_path.display(),
+                        path = target.display(),
                         error = e,
                     );
                     unreadable += 1;
@@ -142,13 +147,13 @@ impl Daemon {
             ) {
                 warn!(
                     "volume holds an identity this fleet does not issue; not publishing policy",
-                    path = discovered.target_path.display(),
+                    path = target.display(),
                     spiffe_id = facts.spiffe_id,
                     reason = reason,
                 );
                 continue;
             }
-            found.insert(discovered.target_path, facts.spiffe_id);
+            found.insert(target, facts.spiffe_id);
         }
 
         self.metrics

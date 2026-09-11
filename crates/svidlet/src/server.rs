@@ -92,9 +92,12 @@ pub async fn run(cfg: Config) -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    // Adopt whatever this node already has. Nothing is re-issued.
+    // Adopt whatever this node already has. Nothing is re-issued. The loop
+    // re-runs the same adoption periodically: a volume that cannot be adopted
+    // the first time is never re-published by the kubelet, so without the
+    // loop its certificate would expire under a running pod.
     let adopting = publisher.clone();
-    let adopted = tokio::task::spawn_blocking(move || {
+    tokio::task::spawn_blocking(move || {
         recover::adopt(
             &adopting.cfg,
             &adopting.policy,
@@ -103,13 +106,11 @@ pub async fn run(cfg: Config) -> Result<(), Box<dyn std::error::Error>> {
         )
     })
     .await?;
-    metrics
-        .recovered
-        .fetch_add(adopted as u64, std::sync::atomic::Ordering::Relaxed);
 
     tokio::spawn(renew::renewal_loop(publisher.clone()));
     tokio::spawn(renew::ca_refresh_loop(publisher.clone()));
     tokio::spawn(renew::reaper_loop(publisher.clone()));
+    tokio::spawn(renew::adopt_loop(publisher.clone()));
 
     if !cfg.metrics_addr.is_empty() {
         tokio::spawn(metrics::serve(
@@ -315,6 +316,8 @@ mod tests {
             renew_check_interval: Duration::from_secs(30),
             startup_spread: Duration::from_secs(300),
             ca_refresh_interval: Duration::from_secs(3600),
+            readopt_interval: Duration::from_secs(60),
+            volumes_dir: PathBuf::from("/var/lib/svidlet/volumes"),
             tmpfs_size: "1m".into(),
             key_mode: 0o640,
             key_gid: None,

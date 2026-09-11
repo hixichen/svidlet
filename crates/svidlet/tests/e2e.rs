@@ -154,6 +154,19 @@ fn config_with(
     pattern: Option<&str>,
     policy: PolicyGate,
 ) -> Config {
+    config_with_gids(kubelet_root, template, pattern, policy, None)
+}
+
+/// Like [`config_with`], but with a policy group configured — which is what
+/// switches on the exposure farm the svidlet-policy daemon discovers volumes
+/// through.
+fn config_with_gids(
+    kubelet_root: &Path,
+    template: &str,
+    pattern: Option<&str>,
+    policy: PolicyGate,
+    policy_gid: Option<u32>,
+) -> Config {
     Config {
         driver_name: "csi.svidlet.io".into(),
         node_name: "node-1".into(),
@@ -163,6 +176,7 @@ fn config_with(
         registration_socket: kubelet_root.join("reg.sock"),
         advertised_endpoint: "/var/lib/kubelet/plugins/csi.svidlet.io/csi.sock".into(),
         kubelet_root: kubelet_root.to_path_buf(),
+        volumes_dir: kubelet_root.join("volumes-farm"),
         spiffe_id_template: template.to_string(),
         spiffe_id_pattern: pattern.map(str::to_string),
         vault: VaultSettings {
@@ -177,12 +191,13 @@ fn config_with(
             },
         },
         policy,
-        policy_gid: None,
+        policy_gid,
         cert_ttl: std::time::Duration::from_secs(3600),
         renew_fraction: (0.5, 0.7),
         renew_check_interval: std::time::Duration::from_secs(30),
         startup_spread: std::time::Duration::from_secs(300),
         ca_refresh_interval: std::time::Duration::from_secs(3600),
+        readopt_interval: std::time::Duration::from_secs(60),
         tmpfs_size: "1m".into(),
         key_mode: 0o640,
         key_gid: None,
@@ -216,6 +231,32 @@ fn fixture_with(
     let ca = Arc::new(TestCa::new(lifetime_secs));
     let store = Arc::new(Store::new());
     let cfg = config_with(&root, template, pattern, policy);
+    let id_policy = Arc::new(cfg.id_policy().expect("the template compiles"));
+    let publisher = Arc::new(Publisher::new(
+        Arc::new(cfg),
+        id_policy,
+        ca.clone(),
+        store.clone(),
+        Arc::new(Metrics::default()),
+    ));
+    publisher.prime_ca().unwrap();
+    Fixture {
+        node: NodeService::new(publisher.clone()),
+        publisher,
+        ca,
+        store,
+        root,
+    }
+}
+
+/// A fixture with a policy group configured, which is what switches on the
+/// exposure farm the svidlet-policy daemon discovers volumes through.
+fn farm_fixture(name: &str, lifetime_secs: i64) -> Fixture {
+    svidlet::rand::seed();
+    let root = scratch(name);
+    let ca = Arc::new(TestCa::new(lifetime_secs));
+    let store = Arc::new(Store::new());
+    let cfg = config_with_gids(&root, IdTemplate::DEFAULT, None, gate(false), Some(2000));
     let id_policy = Arc::new(cfg.id_policy().expect("the template compiles"));
     let publisher = Arc::new(Publisher::new(
         Arc::new(cfg),
@@ -609,6 +650,65 @@ async fn unpublish_removes_the_volume_and_stops_renewal() {
 
     // The kubelet retries until it gets an OK, so this must be idempotent.
     fx.node.node_unpublish_volume(request()).await.unwrap();
+
+    std::fs::remove_dir_all(&fx.root).unwrap();
+}
+
+/// With a policy group configured, publishing a volume also exposes it in the
+/// farm — the bind-mount directory that is the svidlet-policy daemon's whole
+/// view of the node — and unpublishing removes it again. Without the group,
+/// no farm entry is ever created and the deployment is exactly as it was.
+#[tokio::test]
+async fn a_policy_group_exposes_the_volume_to_the_daemon_through_the_farm() {
+    let fx = farm_fixture("farm", 3600);
+    let target = fx.root.join("mount");
+    let farm = fx.root.join("volumes-farm").join("csi-abcdef");
+
+    fx.node
+        .node_publish_volume(Request::new(publish_request(&target, "payments", "api")))
+        .await
+        .unwrap();
+
+    // The farm entry appears, and it is the same volume: the certificate the
+    // daemon would read to learn the volume's identity resolves there.
+    assert!(farm.exists(), "the farm entry appears on publish");
+    assert_eq!(
+        std::fs::canonicalize(farm.join(CERT_FILE)).unwrap(),
+        std::fs::canonicalize(target.join(CERT_FILE)).unwrap()
+    );
+    // The daemon reads the certificate but never the key; the entry gives it
+    // no more than the volume's own permissions do.
+    assert_eq!(
+        svidlet::volume::published_revision(&farm),
+        None,
+        "no policy published yet"
+    );
+
+    let request = || {
+        Request::new(NodeUnpublishVolumeRequest {
+            volume_id: "csi-abcdef".into(),
+            target_path: target.display().to_string(),
+        })
+    };
+    fx.node.node_unpublish_volume(request()).await.unwrap();
+    assert!(!farm.exists(), "the farm entry disappears on unpublish");
+    assert!(!target.exists());
+
+    std::fs::remove_dir_all(&fx.root).unwrap();
+}
+
+/// Without a policy group there is no farm: the daemon is not expected to
+/// run, and nothing about the published volume changes.
+#[tokio::test]
+async fn without_a_policy_group_no_farm_entry_is_created() {
+    let fx = fixture("no-farm", 3600);
+    let target = fx.root.join("mount");
+    fx.node
+        .node_publish_volume(Request::new(publish_request(&target, "payments", "api")))
+        .await
+        .unwrap();
+
+    assert!(!fx.root.join("volumes-farm").exists());
 
     std::fs::remove_dir_all(&fx.root).unwrap();
 }

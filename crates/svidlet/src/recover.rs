@@ -95,20 +95,27 @@ pub fn discover(kubelet_root: &Path, driver_name: &str) -> Vec<Discovered> {
 
 /// Adopt every discovered volume into `store`, and return how many were adopted.
 ///
-/// Volumes whose certificate is missing, unreadable, or does not carry a SPIFFE
-/// ID this plugin would have issued are left alone and logged: the kubelet will
-/// call `NodePublishVolume` again if the pod still needs one.
+/// Runs once at start-up and then periodically. Volumes whose certificate is
+/// missing, unreadable, or does not carry a SPIFFE ID this plugin would have
+/// issued are left alone and retried on the next pass: the kubelet does not
+/// re-call `NodePublishVolume` for a volume that is still mounted, so a volume
+/// that is never adopted keeps running until its certificate expires under it.
 pub fn adopt(cfg: &Config, policy: &IdPolicy, store: &Store, metrics: &Metrics) -> usize {
     let now = crate::log::unix_now();
     let mut adopted = 0;
     let mut skipped = 0;
 
     for found in discover(&cfg.kubelet_root, &cfg.driver_name) {
+        // A re-adoption pass must not reset the renewal state of a volume the
+        // store already knows — least of all its failure backoff.
+        if store.get(&found.target_path).is_some() {
+            continue;
+        }
         let chain = match volume::read_cert_chain(&found.target_path) {
             Ok(c) => c,
             Err(e) => {
                 warn!(
-                    "no certificate to adopt at published volume; it will be re-issued",
+                    "no certificate to adopt at published volume; will retry on the next pass",
                     path = found.target_path.display(),
                     error = e,
                 );
@@ -138,7 +145,7 @@ pub fn adopt(cfg: &Config, policy: &IdPolicy, store: &Store, metrics: &Metrics) 
             &cfg.node_name,
         ) {
             warn!(
-                "not adopting a published certificate; it will be re-issued",
+                "not adopting a published certificate; will retry on the next pass",
                 spiffe_id = facts.spiffe_id,
                 path = found.target_path.display(),
                 reason = reason,
@@ -165,7 +172,7 @@ pub fn adopt(cfg: &Config, policy: &IdPolicy, store: &Store, metrics: &Metrics) 
             uid: found.pod_uid,
         };
         store.insert(Entry {
-            volume_id: found.volume_id,
+            volume_id: found.volume_id.clone(),
             target_path: found.target_path.clone(),
             spiffe_id: facts.spiffe_id.clone(),
             pod,
@@ -174,24 +181,59 @@ pub fn adopt(cfg: &Config, policy: &IdPolicy, store: &Store, metrics: &Metrics) 
             renew_at,
             failures: 0,
         });
+        // The bind mount normally survives a plugin restart, but a first boot
+        // or a wiped farm directory re-creates it here — the policy daemon
+        // can only see volumes through the farm.
+        if cfg.policy_gid.is_some() {
+            let name = volume::farm_name(&found.volume_id);
+            if let Err(e) = volume::expose(&cfg.volumes_dir, &name, &found.target_path) {
+                warn!(
+                    "adopted volume could not be exposed to svidlet-policy",
+                    path = found.target_path.display(),
+                    error = e,
+                );
+            }
+        }
         adopted += 1;
     }
 
     metrics
         .adoption_skipped
         .fetch_add(skipped as u64, std::sync::atomic::Ordering::Relaxed);
+    metrics
+        .recovered
+        .fetch_add(adopted as u64, std::sync::atomic::Ordering::Relaxed);
     if skipped > 0 {
-        // Each of these becomes a fresh signing request, so it is worth
-        // noticing when the number is not zero.
+        // Each of these is a certificate that will expire under a running pod
+        // if no later pass adopts it, so it is worth noticing.
         warn!(
             "some published volumes could not be adopted",
             adopted = adopted,
             skipped = skipped
         );
+    } else if adopted > 0 {
+        info!("adopted published volumes", adopted = adopted);
     } else {
-        info!("restart recovery complete", adopted = adopted);
+        debug!("adoption pass: nothing to do");
     }
     adopted
+}
+
+/// List the volumes svidlet has exposed for the policy daemon.
+///
+/// The daemon's whole view of the node: one entry per published volume, each
+/// a bind mount of the volume's tmpfs. Anything that is not readable is
+/// reported by the caller rather than failing the walk.
+pub fn discover_exposed(volumes_dir: &Path) -> Vec<PathBuf> {
+    let mut found = Vec::new();
+    let Ok(entries) = std::fs::read_dir(volumes_dir) else {
+        return found;
+    };
+    for entry in entries.flatten() {
+        found.push(entry.path());
+    }
+    found.sort();
+    found
 }
 
 /// Whether a certificate found on disk is one this node would have issued.

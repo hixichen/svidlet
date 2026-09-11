@@ -228,6 +228,25 @@ impl Node for NodeService {
             }
         };
 
+        // Make the volume visible to the policy daemon through the farm —
+        // that directory is the daemon's whole view of the node, so without
+        // this step no policy would ever arrive for the volume.
+        if self.publisher.cfg.policy_gid.is_some() {
+            let name = volume::farm_name(&req.volume_id);
+            if let Err(e) = volume::expose(&self.publisher.cfg.volumes_dir, &name, &target) {
+                error!(
+                    "could not expose the volume to svidlet-policy",
+                    spiffe_id = spiffe_id,
+                    target = req.target_path,
+                    error = e,
+                );
+                let _ = volume::unpublish(&target);
+                return Err(Status::internal(format!(
+                    "could not expose the volume to svidlet-policy: {e}"
+                )));
+            }
+        }
+
         // The only thing svidlet knows about policy: whether a revision file
         // has appeared beside the certificate it just wrote. The policy daemon
         // discovers this volume by reading that certificate, so the certificate
@@ -235,6 +254,12 @@ impl Node for NodeService {
         if self.publisher.cfg.policy.required {
             let timeout = self.publisher.cfg.policy.initial_timeout;
             if !wait_for_policy(&target, timeout).await {
+                if self.publisher.cfg.policy_gid.is_some() {
+                    let _ = volume::unexpose(
+                        &self.publisher.cfg.volumes_dir,
+                        &volume::farm_name(&req.volume_id),
+                    );
+                }
                 let _ = volume::unpublish(&target);
                 error!(
                     "no policy arrived; refusing to publish",
@@ -291,6 +316,14 @@ impl Node for NodeService {
         let target = PathBuf::from(&req.target_path);
 
         let removed = self.publisher.store.remove(&target);
+        // Out of the farm first, so the policy daemon stops writing into the
+        // volume before the tmpfs underneath it goes away.
+        if self.publisher.cfg.policy_gid.is_some() {
+            let _ = volume::unexpose(
+                &self.publisher.cfg.volumes_dir,
+                &volume::farm_name(&req.volume_id),
+            );
+        }
         let target_for_task = target.clone();
         tokio::task::spawn_blocking(move || volume::unpublish(&target_for_task))
             .await

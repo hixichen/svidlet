@@ -23,6 +23,18 @@ pub struct Rollout {
     /// automated promotion.
     #[serde(default)]
     pub freeze: bool,
+    /// Monotonic version of the manifest itself, bumped by CI on every signed
+    /// release. Without it, a party that can serve old signed responses — a
+    /// compromised registry, a stale pull-through cache — can pin nodes to an
+    /// old bundle, or undo a freeze by replaying a pre-freeze manifest. A node
+    /// refuses any sequence below the highest it has already verified.
+    #[serde(default)]
+    pub sequence: Option<u64>,
+    /// Unix seconds after which nodes refuse this manifest. Bounds how long a
+    /// replayed manifest stays useful to an attacker: once it expires, serving
+    /// it counts as a failed poll and `bundle_age_seconds` climbs.
+    #[serde(default)]
+    pub valid_until: Option<i64>,
     #[serde(default, rename = "ring")]
     pub rings: Vec<Ring>,
 }
@@ -126,6 +138,50 @@ fn check_digest_form(digest: &str, ring: &str) -> Result<(), Error> {
         return Err(Error::Malformed(format!(
             "ring {ring:?} names bundle {digest:?}, whose digest is not 64 hex characters"
         )));
+    }
+    Ok(())
+}
+
+/// Refuse a manifest that is older than what this node has already verified,
+/// or past its own deadline.
+///
+/// `last_sequence` is the highest sequence the node has verified, persisted
+/// across restarts; 0 means none seen. Once any manifest carries a sequence,
+/// every later one must: a manifest without one after that point is a
+/// downgrade, not a legacy release. Equal sequences are fine — the same
+/// manifest fetched twice is the common case.
+///
+/// A refusal here fails the poll: the node keeps the bundle it has, which is
+/// the fail-stale property — but it shows up as `reason=\"stale\"` and stops
+/// `bundle_age_seconds` from confirming the poll, so a replay is visible
+/// rather than silent.
+pub fn check_freshness(rollout: &Rollout, last_sequence: u64, now: i64) -> Result<(), Error> {
+    match rollout.sequence {
+        Some(sequence) => {
+            if last_sequence > 0 && sequence < last_sequence {
+                return Err(Error::Stale(format!(
+                    "rollout manifest sequence {sequence} is below the {last_sequence} this node \
+                     has already verified; refusing a replay"
+                )));
+            }
+        }
+        None => {
+            if last_sequence > 0 {
+                return Err(Error::Stale(
+                    "rollout manifest carries no sequence, but this node has verified one that \
+                     does; refusing the downgrade"
+                        .into(),
+                ));
+            }
+        }
+    }
+    if let Some(deadline) = rollout.valid_until {
+        if now > deadline {
+            return Err(Error::Stale(format!(
+                "rollout manifest expired {} seconds ago (valid_until = {deadline})",
+                now - deadline
+            )));
+        }
     }
     Ok(())
 }
@@ -307,6 +363,48 @@ bundle = "{DIGEST_B}"
         let frozen = Rollout::parse(b"schema = 1\nfreeze = true\n").unwrap();
         assert!(frozen.freeze);
         assert!(!Rollout::parse(b"schema = 1\n").unwrap().freeze);
+    }
+
+    #[test]
+    fn freshness_fields_are_optional_but_parse_when_present() {
+        let rollout =
+            Rollout::parse(b"schema = 1\nsequence = 42\nvalid_until = 2000000000\n").unwrap();
+        assert_eq!(rollout.sequence, Some(42));
+        assert_eq!(rollout.valid_until, Some(2_000_000_000));
+
+        let rollout = Rollout::parse(b"schema = 1\n").unwrap();
+        assert_eq!(rollout.sequence, None);
+        assert_eq!(rollout.valid_until, None);
+    }
+
+    #[test]
+    fn a_replayed_manifest_is_refused() {
+        let rollout = Rollout::parse(b"schema = 1\nsequence = 7\n").unwrap();
+        // First sight, and an equal re-fetch, are fine.
+        assert!(check_freshness(&rollout, 0, 1000).is_ok());
+        assert!(check_freshness(&rollout, 7, 1000).is_ok());
+        // Older than what the node has verified: a replay.
+        let err = check_freshness(&rollout, 8, 1000).unwrap_err();
+        assert!(matches!(err, super::Error::Stale(_)), "{err}");
+        assert!(err.to_string().contains("replay"), "{err}");
+    }
+
+    #[test]
+    fn dropping_the_sequence_after_it_was_introduced_is_a_downgrade() {
+        let rollout = Rollout::parse(b"schema = 1\n").unwrap();
+        assert!(check_freshness(&rollout, 0, 1000).is_ok());
+        let err = check_freshness(&rollout, 3, 1000).unwrap_err();
+        assert!(matches!(err, super::Error::Stale(_)), "{err}");
+        assert!(err.to_string().contains("downgrade"), "{err}");
+    }
+
+    #[test]
+    fn an_expired_manifest_is_refused_and_a_live_one_is_not() {
+        let rollout = Rollout::parse(b"schema = 1\nvalid_until = 2000\n").unwrap();
+        assert!(check_freshness(&rollout, 0, 2000).is_ok());
+        let err = check_freshness(&rollout, 0, 2001).unwrap_err();
+        assert!(matches!(err, super::Error::Stale(_)), "{err}");
+        assert!(err.to_string().contains("expired"), "{err}");
     }
 
     #[test]

@@ -46,6 +46,13 @@ pub struct Config {
     pub advertised_endpoint: String,
     /// Kubelet root, used to rebuild state after a restart.
     pub kubelet_root: PathBuf,
+    /// Directory through which published volumes are exposed to
+    /// `svidlet-policy`, one bind mount per volume. This — not the kubelet
+    /// root — is the only hostPath the policy daemon mounts, so a process
+    /// that exists to parse untrusted bundles cannot read every secret volume
+    /// on the node. Used only when `policy_gid` is set; without a policy
+    /// daemon the directory stays empty.
+    pub volumes_dir: PathBuf,
 
     /// Shape of the SPIFFE IDs this node issues.
     pub spiffe_id_template: String,
@@ -70,6 +77,11 @@ pub struct Config {
     /// so a fleet-wide upgrade does not become a fleet-wide signing storm.
     pub startup_spread: Duration,
     pub ca_refresh_interval: Duration,
+    /// How often restart recovery re-runs. A volume that could not be adopted
+    /// when it first appeared would otherwise never join the renewal list —
+    /// the kubelet does not re-call NodePublishVolume for a mounted volume —
+    /// and its certificate would silently expire under a running pod.
+    pub readopt_interval: Duration,
 
     /// tmpfs `size=` option for each published volume.
     pub tmpfs_size: String,
@@ -111,7 +123,7 @@ pub struct PolicyGate {
 }
 
 /// Signed, content-addressed policy bundles pulled from an OCI registry with a
-/// staged ring rollout. See docs/POLICY.md.
+/// staged ring rollout. See ../svidlet-policy/authz-management-plane.md.
 #[derive(Debug, Clone)]
 pub struct BundleSettings {
     /// `registry/repository:tag` of the signed rollout manifest.
@@ -137,22 +149,29 @@ pub struct BundleSettings {
     pub keep_versions: usize,
     /// Refuse a bundle larger than this, unpacked.
     pub max_bytes: usize,
+    /// Every Nth poll fetches the rollout manifest without its ETag. A 304
+    /// carries no body, so a stale cache can answer 304 forever and the node
+    /// would never see a manifest body to check `sequence` against. The full
+    /// fetch is what makes the freshness fields meaningful.
+    pub full_fetch_every: usize,
 }
 
 /// Configuration for `svidlet-policy`, the policy distribution daemon.
 ///
 /// A separate process from the CSI plugin, with separate credentials: it never
 /// sees the Vault credential that mints identities, and it does not need root.
-/// What it does need is the kubelet's volume directory, so it can find the
-/// volumes svidlet published and write policy beside their certificates.
+/// What it does need is the directory svidlet exposes published volumes
+/// through — one bind mount per volume under `volumes_dir` — so it can find
+/// the volumes svidlet published and write policy beside their certificates.
+/// It never mounts the kubelet root: that directory holds every secret volume
+/// on the node, and this process exists to parse untrusted input.
 #[derive(Debug, Clone)]
 pub struct PolicyConfig {
     pub node_name: String,
     pub cluster: String,
     pub trust_domain: String,
-    /// Only volumes belonging to this driver are touched.
-    pub driver_name: String,
-    pub kubelet_root: PathBuf,
+    /// Where svidlet exposes published volumes for this daemon.
+    pub volumes_dir: PathBuf,
     /// Shape of the identities this fleet issues, so a certificate found on
     /// disk can be checked before its policy is written.
     pub spiffe_id_template: String,
@@ -192,18 +211,14 @@ impl PolicyConfig {
 
     pub fn from_source(get: &dyn Fn(&str) -> Option<String>) -> Result<PolicyConfig> {
         let env = Env(get);
-        let driver_name = env
-            .opt("SVIDLET_DRIVER_NAME")
-            .unwrap_or_else(|| "csi.svidlet.io".into());
 
         let cfg = PolicyConfig {
             node_name: env.req("NODE_NAME")?,
             cluster: env.req("SVIDLET_CLUSTER")?,
             trust_domain: env.req("SVIDLET_TRUST_DOMAIN")?,
-            driver_name,
-            kubelet_root: PathBuf::from(
-                env.opt("SVIDLET_KUBELET_ROOT")
-                    .unwrap_or_else(|| "/var/lib/kubelet".into()),
+            volumes_dir: PathBuf::from(
+                env.opt("SVIDLET_VOLUMES_DIR")
+                    .unwrap_or_else(|| "/var/lib/svidlet/volumes".into()),
             ),
             spiffe_id_template: env
                 .opt("SVIDLET_SPIFFE_ID_TEMPLATE")
@@ -232,6 +247,18 @@ impl PolicyConfig {
                 })?,
             },
         };
+        // The two sources are mutually exclusive, and the reason is trust, not
+        // plumbing: the stream is authenticated by transport alone, the bundle
+        // by a signature the fleet pins. Running both would let the weaker
+        // source override the stronger one for any identity it named.
+        if cfg.stream.enabled && cfg.stream.endpoint.is_some() && cfg.bundle.is_some() {
+            return Err(ConfigError(
+                "SVIDLET_POLICY_ENDPOINT and SVIDLET_BUNDLE_ROLLOUT_REF are both set; choose one. \
+                 The stream is transport-trusted while bundles are signed, so combining them would \
+                 let the weaker source override the stronger one"
+                    .into(),
+            ));
+        }
         cfg.id_policy()?;
         Ok(cfg)
     }
@@ -364,6 +391,10 @@ impl Config {
                 env.opt("SVIDLET_KUBELET_ROOT")
                     .unwrap_or_else(|| "/var/lib/kubelet".into()),
             ),
+            volumes_dir: PathBuf::from(
+                env.opt("SVIDLET_VOLUMES_DIR")
+                    .unwrap_or_else(|| "/var/lib/svidlet/volumes".into()),
+            ),
             spiffe_id_template,
             spiffe_id_pattern,
             vault: vault_settings(&env, &cluster)?,
@@ -385,6 +416,7 @@ impl Config {
             startup_spread: env.duration("SVIDLET_STARTUP_SPREAD", Duration::from_secs(300))?,
             ca_refresh_interval: env
                 .duration("SVIDLET_CA_REFRESH_INTERVAL", Duration::from_secs(3600))?,
+            readopt_interval: env.duration("SVIDLET_READOPT_INTERVAL", Duration::from_secs(60))?,
             tmpfs_size: env.opt("SVIDLET_TMPFS_SIZE").unwrap_or_else(|| "1m".into()),
             key_mode: env.mode("SVIDLET_KEY_MODE", 0o640)?,
             key_gid: match env.opt("SVIDLET_KEY_GID") {
@@ -406,6 +438,29 @@ impl Config {
                 })?,
             },
         };
+
+        // The policy daemon shares every volume's group with nobody: it must
+        // be able to write the policy chain but never read tls.key, which is
+        // 0640 and owned by the workload's group. The two GIDs being equal
+        // would hand a non-root process that parses untrusted archives every
+        // private key on the node.
+        if cfg.policy_gid.is_some() && cfg.policy_gid == cfg.key_gid {
+            return Err(ConfigError(
+                "SVIDLET_POLICY_GID and SVIDLET_KEY_GID are the same group; the policy daemon \
+                 would be able to read every tls.key on the node. Give it a group of its own"
+                    .into(),
+            ));
+        }
+        // Requiring policy without giving the daemon a way to write it makes
+        // every pod start fail: the tmpfs root stays root-only and no revision
+        // file can ever appear.
+        if cfg.policy.required && cfg.policy_gid.is_none() {
+            return Err(ConfigError(
+                "SVIDLET_POLICY_REQUIRED is set but SVIDLET_POLICY_GID is not; svidlet-policy \
+                 could never write into a root-only volume, so no pod would ever start"
+                    .into(),
+            ));
+        }
 
         // Compile the identity policy here so a bad template or pattern stops
         // the process at start-up rather than failing the first pod that lands.
@@ -453,7 +508,8 @@ fn bundle_settings(env: &Env<'_>) -> Result<Option<BundleSettings>> {
                 .unwrap_or_else(|| "/var/lib/svidlet/policy".into()),
         ),
         keep_versions: env.count("SVIDLET_BUNDLE_KEEP_VERSIONS", 2)?,
-        max_bytes: env.count("SVIDLET_BUNDLE_MAX_BYTES", 10 * 1024 * 1024)?,
+        max_bytes: env.count("SVIDLET_BUNDLE_MAX_BYTES", 1024 * 1024)?,
+        full_fetch_every: env.count("SVIDLET_BUNDLE_FULL_FETCH_EVERY", 60)?,
     }))
 }
 
@@ -642,6 +698,8 @@ mod tests {
             cfg.csi_socket.display().to_string()
         );
         assert_eq!(cfg.kubelet_root, PathBuf::from("/var/lib/kubelet"));
+        assert_eq!(cfg.volumes_dir, PathBuf::from("/var/lib/svidlet/volumes"));
+        assert_eq!(cfg.readopt_interval, Duration::from_secs(60));
         assert_eq!(cfg.spiffe_id_template, IdTemplate::DEFAULT);
         assert_eq!(cfg.spiffe_id_pattern, None);
         assert_eq!(cfg.cert_ttl, Duration::from_secs(86_400));
@@ -803,10 +861,42 @@ mod tests {
     }
 
     #[test]
+    fn the_policy_group_must_not_own_the_private_keys() {
+        // The daemon writes the policy chain as POLICY_GID; tls.key is 0640
+        // owned by KEY_GID. The same number for both means the process that
+        // parses untrusted archives can read every private key on the node.
+        let err = with(&[("SVIDLET_POLICY_GID", "1000"), ("SVIDLET_KEY_GID", "1000")]).unwrap_err();
+        assert!(err.0.contains("SVIDLET_POLICY_GID"), "{err}");
+        assert!(err.0.contains("SVIDLET_KEY_GID"), "{err}");
+
+        // Different groups are the whole point of having two.
+        let cfg = with(&[("SVIDLET_POLICY_GID", "2000"), ("SVIDLET_KEY_GID", "1000")]).unwrap();
+        assert_eq!(cfg.policy_gid, Some(2000));
+        assert_eq!(cfg.key_gid, Some(1000));
+    }
+
+    #[test]
+    fn requiring_policy_without_a_policy_group_would_stop_every_pod() {
+        let err = with(&[("SVIDLET_POLICY_REQUIRED", "true")]).unwrap_err();
+        assert!(err.0.contains("SVIDLET_POLICY_GID"), "{err}");
+
+        // The pair that works: required, and a group the daemon writes with.
+        let cfg = with(&[
+            ("SVIDLET_POLICY_REQUIRED", "true"),
+            ("SVIDLET_POLICY_GID", "2000"),
+        ])
+        .unwrap();
+        assert!(cfg.policy.required);
+    }
+
+    #[test]
     fn booleans_accept_the_usual_spellings_and_reject_the_rest() {
+        // The gate is only valid with a policy group configured — without one
+        // no bundle could ever be written and every pod start would fail.
+        const GID: &str = "2000";
         for on in ["true", "TRUE", "yes", "1", "on"] {
             assert!(
-                with(&[("SVIDLET_POLICY_REQUIRED", on)])
+                with(&[("SVIDLET_POLICY_REQUIRED", on), ("SVIDLET_POLICY_GID", GID)])
                     .unwrap()
                     .policy
                     .required,
@@ -815,10 +905,13 @@ mod tests {
         }
         for off in ["false", "False", "no", "0", "off"] {
             assert!(
-                !with(&[("SVIDLET_POLICY_REQUIRED", off)])
-                    .unwrap()
-                    .policy
-                    .required,
+                !with(&[
+                    ("SVIDLET_POLICY_REQUIRED", off),
+                    ("SVIDLET_POLICY_GID", GID)
+                ])
+                .unwrap()
+                .policy
+                .required,
                 "{off}"
             );
         }
@@ -853,8 +946,7 @@ mod tests {
         // The whole point of the split: this process starts without any of the
         // settings that let svidlet mint an identity.
         let cfg = load_policy(policy_base()).unwrap();
-        assert_eq!(cfg.driver_name, "csi.svidlet.io");
-        assert_eq!(cfg.kubelet_root, PathBuf::from("/var/lib/kubelet"));
+        assert_eq!(cfg.volumes_dir, PathBuf::from("/var/lib/svidlet/volumes"));
         assert_eq!(cfg.metrics_addr, "0.0.0.0:9465");
         assert_eq!(cfg.file_mode, 0o644);
         assert_eq!(cfg.scan_interval, Duration::from_secs(5));
@@ -884,6 +976,30 @@ mod tests {
         .unwrap();
         assert!(!cfg.enabled());
         assert_eq!(cfg.stream.endpoint.as_deref(), Some("https://policy:9000"));
+    }
+
+    #[test]
+    fn the_two_policy_sources_are_mutually_exclusive() {
+        // The stream is transport-trusted; the bundle is signed. Both at once
+        // would let the weaker source override the stronger one per identity.
+        let err = with_policy(&[
+            ("SVIDLET_POLICY_ENDPOINT", "https://policy:9000"),
+            ("SVIDLET_BUNDLE_ROLLOUT_REF", "registry/policy:current"),
+            ("SVIDLET_BUNDLE_PUBLIC_KEY", "x".repeat(44).as_str()),
+        ])
+        .unwrap_err();
+        assert!(err.0.contains("choose one"), "{err}");
+
+        // With the master switch off the configuration is inert, so both may
+        // stay set — turning the feature off must not require editing it.
+        let cfg = with_policy(&[
+            ("SVIDLET_POLICY_ENDPOINT", "https://policy:9000"),
+            ("SVIDLET_BUNDLE_ROLLOUT_REF", "registry/policy:current"),
+            ("SVIDLET_BUNDLE_PUBLIC_KEY", "x".repeat(44).as_str()),
+            ("SVIDLET_POLICY_ENABLED", "false"),
+        ])
+        .unwrap();
+        assert!(!cfg.enabled());
     }
 
     #[test]

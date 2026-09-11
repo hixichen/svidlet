@@ -1,6 +1,6 @@
 //! Pull-based policy distribution: signed OCI bundles with a staged rollout.
 //!
-//! See docs/POLICY.md. The shape of one poll:
+//! See ../svidlet-policy/authz-management-plane.md. The shape of one poll:
 //!
 //! 1. fetch the rollout manifest by tag, with an ETag so an unchanged one is a 304;
 //! 2. verify its Ed25519 signature against the fleet's public key;
@@ -51,6 +51,10 @@ pub enum Error {
     /// Understood and deliberately refused: too large, escapes its directory,
     /// an unsupported schema.
     Rejected(String),
+    /// Validly signed but old: a sequence below one already verified, or past
+    /// its `valid_until`. This is the replay case — the signature is genuine,
+    /// which is exactly what makes it dangerous.
+    Stale(String),
     /// A local filesystem operation failed.
     Io(String),
 }
@@ -64,17 +68,19 @@ impl Error {
             Error::Signature(_) => "signature",
             Error::Malformed(_) => "malformed",
             Error::Rejected(_) => "rejected",
+            Error::Stale(_) => "stale",
             Error::Io(_) => "io",
         }
     }
 
     /// Every reason, so the metric can pre-declare its label set.
-    pub const REASONS: [&'static str; 6] = [
+    pub const REASONS: [&'static str; 7] = [
         "config",
         "fetch",
         "signature",
         "malformed",
         "rejected",
+        "stale",
         "io",
     ];
 }
@@ -87,6 +93,7 @@ impl fmt::Display for Error {
             Error::Signature(m) => write!(f, "signature verification failed: {m}"),
             Error::Malformed(m) => write!(f, "unusable content: {m}"),
             Error::Rejected(m) => write!(f, "refused: {m}"),
+            Error::Stale(m) => write!(f, "stale: {m}"),
             Error::Io(m) => write!(f, "io error: {m}"),
         }
     }
@@ -101,7 +108,7 @@ pub struct BundleMetrics {
     pub manifest_invalid: AtomicU64,
     pub fetch_errors: AtomicU64,
     /// Indexed by [`Error::REASONS`].
-    pub rejected: [AtomicU64; 6],
+    pub rejected: [AtomicU64; 7],
     /// Unix seconds of the last poll that reached a verified manifest.
     pub last_success: AtomicU64,
 }
@@ -256,9 +263,19 @@ impl BundleSource {
     ///
     /// Blocking: the registry client blocks, so callers run this off the reactor.
     pub fn poll(&self) -> Result<Option<crate::policy::PolicyBundle>, Error> {
-        self.metrics.polls.fetch_add(1, Ordering::Relaxed);
+        let poll = self.metrics.polls.fetch_add(1, Ordering::Relaxed) + 1;
 
-        let etag = self.current_etag();
+        // Every Nth poll goes out without an ETag. A 304 carries no body, so a
+        // cache serving stale responses could keep this node from ever seeing
+        // a manifest to check `sequence` against; the periodic full fetch is
+        // what keeps the freshness check meaningful.
+        let etag = if self.settings.full_fetch_every > 0
+            && poll.is_multiple_of(self.settings.full_fetch_every as u64)
+        {
+            None
+        } else {
+            self.current_etag()
+        };
         let fetched = self.registry.manifest(&self.rollout_ref, etag.as_deref())?;
         let (manifest, new_etag) = match fetched {
             registry::Fetched::Unchanged => {
@@ -272,12 +289,25 @@ impl BundleSource {
         let envelope = self.registry.single_layer(&self.rollout_ref, &manifest)?;
         let toml = verify::open(&envelope, &self.key)?;
         let rollout = Rollout::parse(&toml)?;
+        // A genuine signature is not enough: the manifest must also be at
+        // least as new as anything this node has verified, and not expired.
+        // Checked before the poll counts as a success, so a replayed manifest
+        // shows up in `bundle_age_seconds` rather than hiding behind it.
+        let last_sequence = self
+            .state
+            .lock()
+            .expect("bundle state poisoned")
+            .last_sequence;
+        rollout::check_freshness(&rollout, last_sequence, unix_now())?;
         let _ = self.store.save_manifest(&toml);
-        // The manifest verified, so the poll succeeded — but the ETag is only
-        // recorded once the bundle it names is on disk. Recording it here would
-        // make a failed blob fetch permanent: the next poll would 304 and never
-        // retry.
+        // The manifest verified and is fresh, so the poll succeeded — but the
+        // ETag is only recorded once the bundle it names is on disk. Recording
+        // it here would make a failed blob fetch permanent: the next poll
+        // would 304 and never retry.
         self.record_success(None);
+        if let Some(sequence) = rollout.sequence {
+            self.record_sequence(sequence);
+        }
 
         // Nothing further to do, and the manifest is confirmed current: it is
         // now safe to remember its ETag.
@@ -392,6 +422,19 @@ impl BundleSource {
         let _ = self.store.save_state(&snapshot);
     }
 
+    /// Advance the high-water mark for manifest sequences. Monotonic: a lower
+    /// sequence never moves it backwards, and the mark is what
+    /// [`rollout::check_freshness`] refuses replays against.
+    fn record_sequence(&self, sequence: u64) {
+        let mut state = self.state.lock().expect("bundle state poisoned");
+        if sequence > state.last_sequence {
+            state.last_sequence = sequence;
+            let snapshot = state.clone();
+            drop(state);
+            let _ = self.store.save_state(&snapshot);
+        }
+    }
+
     fn record_success(&self, etag: Option<String>) {
         let now = unix_now();
         self.metrics
@@ -420,7 +463,10 @@ impl BundleSource {
 
     fn record_error(&self, error: &Error) {
         self.metrics.reject(error);
-        if matches!(error, Error::Signature(_) | Error::Malformed(_)) {
+        if matches!(
+            error,
+            Error::Signature(_) | Error::Malformed(_) | Error::Stale(_)
+        ) {
             self.metrics
                 .manifest_invalid
                 .fetch_add(1, Ordering::Relaxed);
@@ -540,6 +586,7 @@ mod tests {
             Error::Signature("x".into()),
             Error::Malformed("x".into()),
             Error::Rejected("x".into()),
+            Error::Stale("x".into()),
             Error::Io("x".into()),
         ];
         let mut seen: Vec<&str> = samples.iter().map(Error::reason).collect();

@@ -249,7 +249,10 @@ impl PolicyManager {
     /// The bundle to publish for an identity.
     ///
     /// A per-identity bundle from the gRPC stream wins over the fleet-wide one
-    /// from the OCI rollout: the more specific source is the more deliberate.
+    /// from the OCI rollout. Reaching that situation takes running both
+    /// sources at once, which configuration refuses: the stream is
+    /// transport-trusted while the bundle is signed, so the precedence here is
+    /// defence in depth, not a supported mode.
     pub fn bundle(&self, spiffe_id: &str) -> Option<PolicyBundle> {
         let state = self.state.lock().expect("policy state poisoned");
         state
@@ -420,8 +423,7 @@ pub mod testkit {
             node_name: "node-1".into(),
             cluster: "a".into(),
             trust_domain: "example.org".into(),
-            driver_name: "csi.svidlet.io".into(),
-            kubelet_root: "/var/lib/kubelet".into(),
+            volumes_dir: "/var/lib/svidlet/volumes".into(),
             spiffe_id_template: svidlet_issue::IdTemplate::DEFAULT.into(),
             spiffe_id_pattern: None,
             stream: PolicySettings {

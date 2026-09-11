@@ -1,12 +1,22 @@
-//! A ~100-line logfmt logger.
+//! Structured logging: a thin veneer over `tracing` + `tracing-subscriber`.
 //!
-//! A DaemonSet with a 16 MB budget does not need a subscriber framework: this
-//! writes one line per event to stderr, which is where a container runtime
-//! collects it.
+//! Every event carries named fields — `info!("published", spiffe_id = id,
+//! target = path)` becomes a `tracing` event with real field values, rendered
+//! by the subscriber as one line per event:
+//! `2026-09-06T…  INFO published spiffe_id=… target=…`. The macros stay at
+//! their ~100 call sites; only this module knows about the subscriber.
+//!
+//! Both binaries call [`init`] once at start-up. Until then, events are
+//! dropped: the `tracing` facade is a no-op with no subscriber installed,
+//! which is what tests rely on to stay quiet.
+//!
+//! The level comes from `SVIDLET_LOG_LEVEL` (error | warn | info | debug),
+//! exactly as `Config` validates it. One level for the whole process — a
+//! DaemonSet does not need per-crate filtering. The subscriber is the minimal
+//! build (fmt + registry only, no JSON/EnvFilter features): the memory
+//! budget buys the fields, not the format options.
 
-use std::fmt::Write as _;
-use std::io::Write as _;
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::io;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Level {
@@ -17,15 +27,6 @@ pub enum Level {
 }
 
 impl Level {
-    fn as_str(self) -> &'static str {
-        match self {
-            Level::Error => "error",
-            Level::Warn => "warn",
-            Level::Info => "info",
-            Level::Debug => "debug",
-        }
-    }
-
     pub fn parse(s: &str) -> Option<Level> {
         match s.trim().to_ascii_lowercase().as_str() {
             "error" => Some(Level::Error),
@@ -35,54 +36,33 @@ impl Level {
             _ => None,
         }
     }
-}
 
-static LEVEL: AtomicU8 = AtomicU8::new(Level::Info as u8);
-
-pub fn set_level(level: Level) {
-    LEVEL.store(level as u8, Ordering::Relaxed);
-}
-
-pub fn enabled(level: Level) -> bool {
-    (level as u8) <= LEVEL.load(Ordering::Relaxed)
-}
-
-/// Emit one logfmt line. Values containing spaces or quotes are quoted.
-pub fn log(level: Level, msg: &str, fields: &[(&str, &dyn std::fmt::Display)]) {
-    if !enabled(level) {
-        return;
-    }
-    let mut line = String::with_capacity(128);
-    let _ = write!(line, "ts={} level={} msg=", unix_now(), level.as_str());
-    write_value(&mut line, msg);
-    for (key, value) in fields {
-        let _ = write!(line, " {key}=");
-        write_value(&mut line, &value.to_string());
-    }
-    line.push('\n');
-    let _ = std::io::stderr().write_all(line.as_bytes());
-}
-
-fn write_value(out: &mut String, value: &str) {
-    let needs_quotes = value.is_empty()
-        || value
-            .chars()
-            .any(|c| c.is_whitespace() || c == '"' || c == '=' || c == '\\');
-    if !needs_quotes {
-        out.push_str(value);
-        return;
-    }
-    out.push('"');
-    for c in value.chars() {
-        match c {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '\n' => out.push_str("\\n"),
-            '\t' => out.push_str("\\t"),
-            c => out.push(c),
+    fn to_tracing(self) -> tracing::level_filters::LevelFilter {
+        match self {
+            Level::Error => tracing::level_filters::LevelFilter::ERROR,
+            Level::Warn => tracing::level_filters::LevelFilter::WARN,
+            Level::Info => tracing::level_filters::LevelFilter::INFO,
+            Level::Debug => tracing::level_filters::LevelFilter::DEBUG,
         }
     }
-    out.push('"');
+}
+
+/// Install the process-wide subscriber: one text line per event on stderr,
+/// no ANSI colours (a container runtime or log ingester would otherwise have
+/// to strip them), no target prefix.
+///
+/// A second call is a no-op: the first installed subscriber stays. Neither
+/// binary ever needs two, but a re-run start-up path must not crash-loop on
+/// logging of all things.
+pub fn init(level: Level) {
+    // `try_init`, not `init`: installing a subscriber panics if one is already
+    // set, and a failed install keeps the first subscriber rather than dying.
+    let _ = tracing_subscriber::fmt::fmt()
+        .with_max_level(level.to_tracing())
+        .with_writer(io::stderr)
+        .with_ansi(false)
+        .with_target(false)
+        .try_init();
 }
 
 /// Seconds since the Unix epoch. Also the clock the renewal schedule uses:
@@ -98,28 +78,28 @@ pub fn unix_now() -> i64 {
 #[macro_export]
 macro_rules! error {
     ($msg:expr $(, $k:ident = $v:expr)* $(,)?) => {
-        $crate::log::log($crate::log::Level::Error, $msg, &[$((stringify!($k), &$v as &dyn std::fmt::Display)),*])
+        ::tracing::error!($($k = %$v,)* $msg)
     };
 }
 
 #[macro_export]
 macro_rules! warn {
     ($msg:expr $(, $k:ident = $v:expr)* $(,)?) => {
-        $crate::log::log($crate::log::Level::Warn, $msg, &[$((stringify!($k), &$v as &dyn std::fmt::Display)),*])
+        ::tracing::warn!($($k = %$v,)* $msg)
     };
 }
 
 #[macro_export]
 macro_rules! info {
     ($msg:expr $(, $k:ident = $v:expr)* $(,)?) => {
-        $crate::log::log($crate::log::Level::Info, $msg, &[$((stringify!($k), &$v as &dyn std::fmt::Display)),*])
+        ::tracing::info!($($k = %$v,)* $msg)
     };
 }
 
 #[macro_export]
 macro_rules! debug {
     ($msg:expr $(, $k:ident = $v:expr)* $(,)?) => {
-        $crate::log::log($crate::log::Level::Debug, $msg, &[$((stringify!($k), &$v as &dyn std::fmt::Display)),*])
+        ::tracing::debug!($($k = %$v,)* $msg)
     };
 }
 
@@ -128,17 +108,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn values_are_quoted_only_when_needed() {
-        let mut out = String::new();
-        write_value(&mut out, "plain");
-        assert_eq!(out, "plain");
-
-        let mut out = String::new();
-        write_value(&mut out, "two words");
-        assert_eq!(out, "\"two words\"");
-
-        let mut out = String::new();
-        write_value(&mut out, "say \"hi\"");
-        assert_eq!(out, "\"say \\\"hi\\\"\"");
+    fn levels_parse_the_names_config_allows() {
+        assert_eq!(Level::parse("error"), Some(Level::Error));
+        assert_eq!(Level::parse(" WARN "), Some(Level::Warn));
+        assert_eq!(Level::parse("warning"), Some(Level::Warn));
+        assert_eq!(Level::parse("Info"), Some(Level::Info));
+        assert_eq!(Level::parse("debug"), Some(Level::Debug));
+        assert_eq!(Level::parse("trace"), Some(Level::Debug));
+        assert_eq!(Level::parse("verbose"), None);
+        assert!(
+            Level::Error < Level::Warn && Level::Warn < Level::Info && Level::Info < Level::Debug
+        );
     }
 }

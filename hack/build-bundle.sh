@@ -67,6 +67,20 @@ rollout() {
   local file="${1:?usage: $0 rollout <rollout.toml>}"
   [ -f "${PRIVATE_KEY}" ] || { echo "no signing key; run '$0 keygen'" >&2; exit 1; }
 
+  # Nodes refuse a manifest whose sequence is below the highest they have
+  # verified, and one that carries none after they have seen one — that is
+  # the replay protection. Signing a manifest without a sequence would
+  # therefore brick the next rollout.
+  grep -q '^sequence' "${file}" || {
+    echo "${file} has no 'sequence'; bump it on every signed release or nodes \
+will refuse future manifests" >&2
+    exit 1
+  }
+  grep -q '^valid_until' "${file}" || {
+    echo "warning: ${file} has no 'valid_until'; a replayed manifest stays \
+acceptable to nodes indefinitely" >&2
+  }
+
   openssl pkeyutl -sign -inkey "${PRIVATE_KEY}" -rawin \
     -in "${file}" -out "${WORK}/sig"
 

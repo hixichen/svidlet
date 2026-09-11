@@ -153,6 +153,38 @@ pub async fn refresh_ca_once(publisher: Arc<Publisher>) {
     .await;
 }
 
+/// Re-run restart recovery on a slow tick.
+///
+/// A volume that could not be adopted when it first appeared — its
+/// certificate still being written, a record still mid-parse — is not
+/// re-published by the kubelet: the volume is mounted, so as far as the
+/// kubelet is concerned the work is done. Without this loop such a volume
+/// would never join the renewal list and its certificate would expire under a
+/// running pod. Adoption is idempotent, so a pass over a healthy node costs a
+/// directory walk and nothing else.
+pub async fn adopt_loop(publisher: Arc<Publisher>) {
+    let interval = publisher.cfg.readopt_interval;
+    loop {
+        tokio::time::sleep(interval).await;
+        let adopting = publisher.clone();
+        let outcome = tokio::task::spawn_blocking(move || {
+            crate::recover::adopt(
+                &adopting.cfg,
+                &adopting.policy,
+                &adopting.store,
+                &adopting.metrics,
+            )
+        })
+        .await;
+        // Like the renewal loop, this one must never fail quietly: its silent
+        // death is indistinguishable from a healthy node until certificates
+        // start expiring.
+        if let Err(e) = outcome {
+            error!("adoption pass panicked", error = e);
+        }
+    }
+}
+
 /// Remove entries whose target path no longer exists.
 ///
 /// `NodeUnpublishVolume` is the normal way a volume leaves the store; this
@@ -177,6 +209,12 @@ pub fn reap_orphans(publisher: &Publisher) -> usize {
                 spiffe_id = entry.spiffe_id,
             );
             publisher.store.remove(&entry.target_path);
+            if publisher.cfg.policy_gid.is_some() {
+                let _ = volume::unexpose(
+                    &publisher.cfg.volumes_dir,
+                    &volume::farm_name(&entry.volume_id),
+                );
+            }
             let _ = volume::unpublish(&entry.target_path);
             reaped += 1;
         }

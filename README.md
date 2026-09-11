@@ -22,8 +22,8 @@ key on the node, has a PKI backend sign a certificate for
 mounts it into only the containers that should hold it. It renews in the background and
 can also ship the authorization policy that goes with the identity.
 
-No control plane, no API-server access, no sidecars, no CRDs, no datastore. 2.2 MB
-resident idle, 5.9 MB with 2000 certificates on the node.
+No control plane, no API-server access, no sidecars, no CRDs, no datastore. 3.2 MB
+resident idle, 6.7 MB with 2000 certificates on the node.
 
 ## Goal
 
@@ -33,8 +33,8 @@ honestly do it:
 - **Lightweight.** One process per node for identity, plus an optional second for policy
   — against three Go processes, or an agent with a server and its datastore. The budget
   is **16 MB resident or under**, which is what makes it deployable on edge and
-  resource-constrained nodes where the existing agents do not fit. Measured: 3.3 MB idle,
-  7.2 MB with 2000 certificates, both processes together.
+  resource-constrained nodes where the existing agents do not fit. Measured: 5.7 MB idle,
+  9.2 MB with 2000 certificates, both processes together.
 - **Easy to deploy.** A DaemonSet, a ConfigMap and a Secret. One PKI credential per
   cluster, set up once; adding a workload never touches the PKI backend.
 - **Easy to maintain.** Nothing to run but the DaemonSet. No control plane to upgrade, no
@@ -70,7 +70,8 @@ It is a single small Rust process per node, running as a CSI node plugin:
 - optionally, **authorization policy** is published into the same volume and refreshed
   when it changes upstream — either streamed per identity from a policy backend, or
   pulled as a signed, content-addressed bundle with a staged ring rollout
-  ([docs/POLICY.md](docs/POLICY.md)).
+  ([../svidlet-policy/authz-management-plane.md](../svidlet-policy/authz-management-plane.md)); applications enforce it in-process via a thin SDK with
+  embedded CEL ([../svidlet-policy/authz-enforcement-plane.md](../svidlet-policy/authz-enforcement-plane.md)) — Svidlet itself never enters the request path.
 
 The SPIFFE ID layout is a template, not a constant — see [Identity shape](#identity-shape).
 
@@ -99,7 +100,7 @@ OCI bundles with a staged ring rollout.
 Policy distribution runs in a second process so that a compromise of the policy path
 cannot mint identities — see [Policy](#policy).
 
-225 tests, plus six integration tests that run against a real Vault
+241 tests, plus six integration tests that run against a real Vault
 (`./hack/local-vault.sh`).
 
 Not started: a validating admission controller for workload provenance (the
@@ -222,19 +223,23 @@ Within the daemon there are two sources, and most deployments want one or the ot
 | Staged rollout | no | rings, bake time, freeze |
 | Provenance | transport trust only | signed artifact, content-addressed |
 
-A per-identity bundle from the stream takes precedence over the fleet bundle for that
-identity. `SVIDLET_POLICY_ENABLED=false` switches off both. If you distribute no policy
-at all, drop the `svidlet-policy` container from the DaemonSet and leave
-`SVIDLET_POLICY_GID` unset: the volume stays root-only and nothing changes for svidlet.
+The two sources are mutually exclusive on one node — the stream is transport-trusted
+while bundles are signed, and combining them would let the weaker source override the
+stronger one. `SVIDLET_POLICY_ENABLED=false` switches off whichever is configured. If
+you distribute no policy at all, drop the `svidlet-policy` container from the DaemonSet
+and leave `SVIDLET_POLICY_GID` unset: the volume stays root-only and nothing changes
+for svidlet.
 
 ### Pulled: signed OCI bundles with a ring rollout
 
-Designed in [docs/POLICY.md](docs/POLICY.md). CI turns each reviewed commit into a
-signed OCI artifact; nodes poll a small signed **rollout manifest** that assigns bundle
-digests to **rings**, work out their own ring, and converge.
+Designed in [../svidlet-policy/authz-management-plane.md](../svidlet-policy/authz-management-plane.md). CI turns each reviewed commit
+into a signed OCI artifact; nodes poll a small signed
+**rollout manifest** that assigns bundle digests to **rings**, work out their own ring,
+and converge.
 
 ```toml
 schema = 1
+sequence = 42                # monotonic; nodes refuse older manifests (replay protection)
 freeze = false               # the kill switch: halts every change, including rollbacks
 
 [[ring]]
@@ -307,8 +312,11 @@ SVIDLET_POLICY_ENABLED=false cargo run -p svidlet     # no policy backend needed
 
 ## Try it
 
+`make help` lists every target; the Makefile wraps the same commands, so the two
+never drift. The gate a change must pass is `make ci`.
+
 ```sh
-cargo test                  # 225 tests, no cluster and no Vault needed
+cargo test                  # 241 tests, no cluster and no Vault needed
 ./hack/coverage.sh          # coverage report; fails under 80%
 ./hack/bench-memory.sh      # resident memory under load
 
@@ -344,7 +352,7 @@ kubectl apply -f deploy/csidriver.yaml
 kubectl apply -f deploy/daemonset.yaml     # then set the ConfigMap and Secret
 ```
 
-[docs/HOWTO.md](docs/HOWTO.md) covers what a workload does with the result: reading the
+[docs/USAGE.md](docs/USAGE.md) covers what a workload does with the result: reading the
 files across a renewal, checking a peer's SPIFFE ID (the step that makes mTLS mean
 anything), exchanging the certificate for AWS or GCP credentials, and what "revoke"
 means in a system with no CRL.
@@ -363,7 +371,7 @@ volumes:
 `tls.key` is written mode `0640`. For a non-root workload to read it, set
 `SVIDLET_KEY_GID` to the workload's `runAsGroup` — svidlet then owns the key with that
 group directly, rather than depending on the kubelet's `fsGroup` handling, which has not
-been verified on a real cluster. See [HOWTO.md](docs/HOWTO.md).
+been verified on a real cluster. See [USAGE.md](docs/USAGE.md).
 
 ## Credentials
 
@@ -547,22 +555,22 @@ the kubelet:
 
 | Certificates on the node | `svidlet` | `svidlet-policy` | Both |
 |---|---|---|---|
-| 0 (idle) | 2.0 MB | 1.3 MB | 3.3 MB |
-| 100 | 3.1 MB | 1.3 MB | 4.4 MB |
-| 500 | 3.8 MB | 1.4 MB | 5.3 MB |
-| 2000 | 5.8 MB | 1.4 MB | 7.2 MB |
+| 0 (idle) | 3.2 MB | 2.5 MB | 5.7 MB |
+| 100 | 4.6 MB | 2.5 MB | 7.1 MB |
+| 500 | 5.1 MB | 2.5 MB | 7.6 MB |
+| 2000 | 6.7 MB | 2.5 MB | 9.2 MB |
 
 The two processes are the point, not an accident — see
 [Policy](#policy) and
-[docs/DESIGN.md](docs/DESIGN.md#two-processes-one-volume). Separating them costs
-1.3 MB. Drop the second container if you distribute no policy and the figure is the
-first column alone.
+[../svidlet-policy/authz-management-plane.md](../svidlet-policy/authz-management-plane.md). Separating them
+costs 2.5 MB, most of it the `tracing` logging stack both processes now carry. Drop the
+second container if you distribute no policy and the figure is the first column alone.
 
 The budget is **16 MB resident or under**, for both processes together. At the design's
-planning ceiling of 20–50 containers per node the pair sits at roughly 3.5 MB, and even
-at 2000 certificates — far more than a node will hold — it is under half the budget. The
-image is ~5 MB for both binaries, statically linked against musl, with no API-server
-client and no sidecars.
+planning ceiling of 20–50 containers per node the pair sits at roughly 7 MB, and even
+at 2000 certificates — far more than a node will hold — it is still under the budget.
+The image is ~4 MB for both binaries, statically linked against musl, with no
+API-server client and no sidecars.
 
 The `svidlet-policy` figures are idle: the benchmark drives certificates, not policy, so
 the daemon was scanning and finding nothing. A node genuinely distributing policy will
@@ -620,8 +628,16 @@ hack/bench-memory.sh      Resident memory against a real Vault under real CSI lo
 hack/build-bundle.sh      What CI does: package, sign and push a bundle and rollout
 hack/coverage.sh          Coverage report with an 80% floor
 docs/DESIGN.md            Design document
-docs/POLICY.md            Policy bundle distribution: rings, signing, rollout
-docs/HOWTO.md             Using a certificate: verify a peer, reach AWS/GCP, revoke
+docs/config.md            Configuration reference: every environment variable, by process
+../svidlet-policy/authz-management-plane.md   Authorization management (svidlet-policy repo):
+                          two processes, exposure farm,
+                          signed bundles, rings, rollout, freshness
+../svidlet-policy/authz-enforcement-plane.md Authorization enforcement (svidlet-policy repo):
+                          authz.toml, the CEL environment, and the in-process SDK
+                          environment, and the in-process SDK
+../svidlet-policy/POLICY_STORE_BACKEND.md  The gRPC policy backend: a stateless fan-out
+docs/USAGE.md             Using a certificate: the capability catalogue — mTLS, peer checks,
+                          cloud exchange, backends; and what it cannot do
 ```
 
 `svidlet-issue` knows nothing about CSI or Kubernetes. It is the piece that survives the

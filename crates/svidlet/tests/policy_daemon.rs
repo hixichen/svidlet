@@ -38,22 +38,11 @@ fn scratch(name: &str) -> PathBuf {
     dir
 }
 
-/// Stand in for svidlet: publish a certificate for `spiffe_id` into a volume at
-/// the path the kubelet would use, with the record the kubelet writes.
+/// Stand in for svidlet: publish a certificate for `spiffe_id` into a volume,
+/// then expose it to the daemon through the farm the way svidlet does.
 fn publish_certificate(root: &Path, pod_uid: &str, spiffe_id: &str) -> PathBuf {
-    let dir = root
-        .join("pods")
-        .join(pod_uid)
-        .join("volumes/kubernetes.io~csi/svid");
-    let target = dir.join("mount");
+    let target = root.join("real").join(pod_uid);
     std::fs::create_dir_all(&target).unwrap();
-    std::fs::write(
-        dir.join("vol_data.json"),
-        format!(
-            r#"{{"driverName":"csi.svidlet.io","specVolID":"svid","volumeHandle":"csi-{pod_uid}"}}"#
-        ),
-    )
-    .unwrap();
 
     let key = KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
     let mut ca_params = CertificateParams::default();
@@ -83,12 +72,20 @@ fn publish_certificate(root: &Path, pod_uid: &str, spiffe_id: &str) -> PathBuf {
         MODES,
     )
     .unwrap();
+    // The daemon's whole view of the node is the farm; a volume that is not
+    // exposed does not exist as far as it is concerned.
+    volume::expose(
+        &root.join("farm"),
+        &volume::farm_name(&format!("csi-{pod_uid}-svid")),
+        &target,
+    )
+    .unwrap();
     target
 }
 
 fn config(root: &Path) -> PolicyConfig {
     let mut cfg = test_config(Some("http://policy.invalid:9000"));
-    cfg.kubelet_root = root.to_path_buf();
+    cfg.volumes_dir = root.join("farm");
     cfg.trust_domain = "example.org".into();
     cfg.cluster = "a".into();
     cfg
@@ -134,9 +131,15 @@ fn the_daemon_learns_identities_from_the_certificates_svidlet_wrote() {
     assert!(gone.is_empty());
     assert_eq!(daemon.volume_count(), 2);
 
-    let targets: Vec<PathBuf> = daemon.volumes().into_iter().map(|v| v.target).collect();
-    assert!(targets.contains(&api));
-    assert!(targets.contains(&web));
+    // The daemon addresses volumes through the farm; canonicalising resolves
+    // the farm entry to the volume svidlet published.
+    let targets: Vec<PathBuf> = daemon
+        .volumes()
+        .into_iter()
+        .map(|v| std::fs::canonicalize(&v.target).unwrap())
+        .collect();
+    assert!(targets.contains(&std::fs::canonicalize(&api).unwrap()));
+    assert!(targets.contains(&std::fs::canonicalize(&web).unwrap()));
 
     std::fs::remove_dir_all(&root).unwrap();
 }
@@ -209,14 +212,14 @@ fn the_daemon_never_touches_the_certificate_chain() {
 fn a_pod_going_away_is_noticed_and_unsubscribed() {
     let root = scratch("gone");
     publish_certificate(&root, "pod-a", API);
-    let web = publish_certificate(&root, "pod-b", WEB);
+    publish_certificate(&root, "pod-b", WEB);
 
     let (daemon, policy) = daemon_for(config(&root));
     daemon.scan();
     assert_eq!(policy.subscription_count(), 2);
 
-    // The kubelet tears the pod down.
-    std::fs::remove_dir_all(web.parent().unwrap()).unwrap();
+    // svidlet unexposes the volume as the pod goes away.
+    volume::unexpose(&root.join("farm"), "csi-pod-b-svid").unwrap();
     let (appeared, gone) = daemon.scan();
 
     assert!(appeared.is_empty());
@@ -274,13 +277,9 @@ fn a_volume_without_a_certificate_yet_is_skipped_quietly() {
     // svidlet mounts the tmpfs before it has a signature, so the daemon will
     // routinely see an empty volume. That is not an error.
     let root = scratch("no-cert");
-    let dir = root.join("pods/pod-a/volumes/kubernetes.io~csi/svid");
-    std::fs::create_dir_all(dir.join("mount")).unwrap();
-    std::fs::write(
-        dir.join("vol_data.json"),
-        r#"{"driverName":"csi.svidlet.io","specVolID":"svid","volumeHandle":"csi-a"}"#,
-    )
-    .unwrap();
+    let target = root.join("real").join("pod-a");
+    std::fs::create_dir_all(&target).unwrap();
+    volume::expose(&root.join("farm"), "csi-pod-a-svid", &target).unwrap();
 
     let (daemon, _policy) = daemon_for(config(&root));
     let (appeared, gone) = daemon.scan();
@@ -293,13 +292,21 @@ fn a_volume_without_a_certificate_yet_is_skipped_quietly() {
 }
 
 #[test]
-fn other_drivers_volumes_are_not_touched() {
-    let root = scratch("other-driver");
-    let dir = root.join("pods/pod-a/volumes/kubernetes.io~csi/data");
-    std::fs::create_dir_all(dir.join("mount")).unwrap();
-    std::fs::write(
-        dir.join("vol_data.json"),
-        r#"{"driverName":"ebs.csi.aws.com","specVolID":"data","volumeHandle":"vol-1"}"#,
+fn a_volume_that_is_not_exposed_is_invisible() {
+    // The boundary the farm exists for: the daemon cannot reach a volume
+    // svidlet did not expose, wherever on the host it lives — including
+    // anything under the kubelet root, which this process never mounts.
+    let root = scratch("not-exposed");
+    let target = root.join("real").join("pod-a");
+    std::fs::create_dir_all(&target).unwrap();
+    volume::publish_identity(
+        &target,
+        &Identity {
+            key_pem: "KEY\n".into(),
+            cert_chain_pem: "CERT\n".into(),
+            ca_pem: "CA\n".into(),
+        },
+        MODES,
     )
     .unwrap();
 

@@ -46,6 +46,11 @@ pub struct State {
     pub last_error: String,
     #[serde(default)]
     pub manifest_etag: String,
+    /// The highest rollout-manifest sequence this node has verified. Persisted
+    /// so a restart does not open a replay window; 0 means no sequenced
+    /// manifest has been seen yet.
+    #[serde(default)]
+    pub last_sequence: u64,
 }
 
 pub struct Store {
@@ -405,6 +410,7 @@ mod tests {
             last_success: 1200,
             last_error: String::new(),
             manifest_etag: "\"abc\"".into(),
+            last_sequence: 7,
         };
         store.save_state(&state).unwrap();
         assert_eq!(store.load_state(), state);

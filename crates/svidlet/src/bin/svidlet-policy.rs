@@ -2,7 +2,7 @@
 //!
 //! Runs beside `svidlet` in the same DaemonSet pod and writes into the same CSI
 //! volumes, but holds none of svidlet's credentials and does not need root.
-//! See docs/DESIGN.md, "Two processes, one volume".
+//! See ../svidlet-policy/authz-management-plane.md, "Two processes, one volume".
 
 use std::sync::Arc;
 
@@ -14,7 +14,7 @@ use svidlet::{info, log, rand, warn};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cfg = PolicyConfig::from_env()?;
-    log::set_level(cfg.log_level);
+    log::init(cfg.log_level);
     rand::seed();
 
     let runtime = tokio::runtime::Builder::new_current_thread()
@@ -32,7 +32,7 @@ async fn run(cfg: PolicyConfig) -> Result<(), Box<dyn std::error::Error>> {
         version = env!("CARGO_PKG_VERSION"),
         node = cfg.node_name,
         cluster = cfg.cluster,
-        kubelet_root = cfg.kubelet_root.display(),
+        volumes_dir = cfg.volumes_dir.display(),
     );
 
     if !cfg.enabled() {

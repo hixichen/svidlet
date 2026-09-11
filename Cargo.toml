@@ -19,6 +19,8 @@ rcgen = { version = "0.14", default-features = false, features = ["crypto", "rin
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", default-features = false, features = ["rt", "macros", "net", "time", "signal", "io-util", "sync"] }
+tracing = { version = "0.1", default-features = false, features = ["std"] }
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "registry"] }
 tokio-stream = { version = "0.1", default-features = false, features = ["net", "sync"] }
 tonic = { version = "0.14", default-features = false, features = ["server", "router", "codegen", "channel", "tls-ring", "tls-webpki-roots"] }
 tonic-prost = "0.14"

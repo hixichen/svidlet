@@ -203,6 +203,111 @@ pub fn read_cert_chain(target: &Path) -> io::Result<String> {
         .or_else(|_| fs::read_to_string(target.join(CERT_FILE)))
 }
 
+/// The name a volume gets in the exposure farm: its volume ID reduced to one
+/// safe path segment. Derived from the volume ID rather than the target path
+/// because both the publish path and restart recovery know the ID.
+pub fn farm_name(volume_id: &str) -> String {
+    let mut name: String = volume_id
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    // A leading dot would hide the entry and step on the ".." namespace the
+    // volume writer reserves for its own bookkeeping.
+    if name.starts_with('.') {
+        name = format!("v{name}");
+    }
+    if name.is_empty() {
+        name = "volume".into();
+    }
+    name
+}
+
+/// Expose a published volume to the policy daemon through the farm.
+///
+/// On Linux this is a bind mount: the daemon's container mounts only the farm
+/// directory, so a symlink would dangle in its mount namespace — the bind is
+/// what makes the volume's tmpfs visible there without giving the daemon the
+/// kubelet root (and with it, every secret volume on the node). Elsewhere, a
+/// symlink is enough for development and tests.
+///
+/// Idempotent: re-exposing an already exposed volume does nothing.
+pub fn expose(farm_root: &Path, name: &str, target: &Path) -> io::Result<()> {
+    fs::create_dir_all(farm_root)?;
+    let point = farm_root.join(name);
+    expose_at(&point, target)
+}
+
+/// Remove a volume from the farm. Tolerates "already gone": unpublish paths
+/// are retried.
+pub fn unexpose(farm_root: &Path, name: &str) -> io::Result<()> {
+    let point = farm_root.join(name);
+    if fs::symlink_metadata(&point).is_err() {
+        return Ok(());
+    }
+    unexpose_at(&point)
+}
+
+#[cfg(target_os = "linux")]
+fn expose_at(point: &Path, target: &Path) -> io::Result<()> {
+    if point.exists() && is_mount_point(point)? {
+        return Ok(());
+    }
+    fs::create_dir(point)?;
+    let target_c = cstring(target.as_os_str().as_encoded_bytes())?;
+    let point_c = cstring(point.as_os_str().as_encoded_bytes())?;
+    // SAFETY: both pointers are NUL-terminated strings that outlive the call.
+    let rc = unsafe {
+        libc::mount(
+            target_c.as_ptr(),
+            point_c.as_ptr(),
+            std::ptr::null(),
+            libc::MS_BIND,
+            std::ptr::null(),
+        )
+    };
+    if rc != 0 {
+        let err = io::Error::last_os_error();
+        let _ = fs::remove_dir(point);
+        return Err(err);
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn unexpose_at(point: &Path) -> io::Result<()> {
+    if is_mount_point(point).unwrap_or(false) {
+        unmount(point)?;
+    }
+    match fs::remove_dir(point) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e),
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn expose_at(point: &Path, target: &Path) -> io::Result<()> {
+    if fs::symlink_metadata(point).is_ok() {
+        return Ok(());
+    }
+    std::os::unix::fs::symlink(target, point)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn unexpose_at(point: &Path) -> io::Result<()> {
+    match fs::remove_file(point) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e),
+    }
+}
+
 /// Unmount the tmpfs and remove the target directory.
 ///
 /// Both steps tolerate "already gone": the kubelet retries
@@ -646,5 +751,51 @@ mod tests {
         unpublish(&dir).unwrap();
         assert!(!dir.exists());
         unpublish(&dir).unwrap();
+    }
+
+    #[test]
+    fn farm_names_are_single_safe_path_segments() {
+        assert_eq!(farm_name("csi-pod-a-svid"), "csi-pod-a-svid");
+        // Anything that could traverse or separate is flattened.
+        assert_eq!(farm_name("../../etc"), "v.._.._etc");
+        assert_eq!(farm_name("a/b\\c"), "a_b_c");
+        assert_eq!(farm_name(".hidden"), "v.hidden");
+        assert_eq!(farm_name(""), "volume");
+        for id in ["csi-abc", "../x", "..", "."] {
+            let name = farm_name(id);
+            assert!(!name.contains('/'), "{id:?} -> {name:?}");
+            assert!(!name.starts_with('.'), "{id:?} -> {name:?}");
+            assert_ne!(name, "..");
+        }
+    }
+
+    #[test]
+    fn an_exposed_volume_is_readable_through_the_farm() {
+        let dir = scratch("farm");
+        let target = dir.join("target");
+        let farm = dir.join("farm");
+        fs::create_dir_all(&target).unwrap();
+        publish_identity(&target, &identity("1"), MODES).unwrap();
+
+        expose(&farm, "csi-pod-a-svid", &target).unwrap();
+        // Re-exposing is a no-op, which is what restart recovery relies on.
+        expose(&farm, "csi-pod-a-svid", &target).unwrap();
+
+        assert_eq!(
+            fs::read_to_string(farm.join("csi-pod-a-svid").join(CERT_FILE)).unwrap(),
+            "CERT-1\n"
+        );
+
+        unexpose(&farm, "csi-pod-a-svid").unwrap();
+        assert!(!farm.join("csi-pod-a-svid").exists());
+        // Idempotent, like unpublish.
+        unexpose(&farm, "csi-pod-a-svid").unwrap();
+        // The volume itself is untouched by coming and going from the farm.
+        assert_eq!(
+            fs::read_to_string(target.join(CERT_FILE)).unwrap(),
+            "CERT-1\n"
+        );
+
+        fs::remove_dir_all(&dir).unwrap();
     }
 }

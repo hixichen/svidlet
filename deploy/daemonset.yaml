@@ -27,7 +27,7 @@ data:
   SVIDLET_LOG_LEVEL: info
   # Group that owns tls.key, which is mode 0640. Must match the workload's
   # runAsGroup or a non-root workload cannot read its own key. See
-  # docs/HOWTO.md; do not "fix" a permission error by widening SVIDLET_KEY_MODE.
+  # docs/USAGE.md; do not "fix" a permission error by widening SVIDLET_KEY_MODE.
   SVIDLET_KEY_GID: "1000"
 
   # Shape of every SPIFFE ID this node issues. The cluster lives in the path,
@@ -67,7 +67,9 @@ data:
   #
   # Authorization policy, streamed from a backend fronting a git repository.
   # Leave the endpoint unset to disable: no stream is opened and no policy
-  # directory is written.
+  # directory is written. Mutually exclusive with SVIDLET_BUNDLE_ROLLOUT_REF
+  # below: the stream is transport-trusted while bundles are signed, and one
+  # node never answers to both.
   # SVIDLET_POLICY_ENDPOINT: https://policy.example.internal:9000
   #
   # The master switch. Setting this to "false" ignores the endpoint above
@@ -80,13 +82,16 @@ data:
   # policy-backend outage still lets certificates be issued.
   # SVIDLET_POLICY_REQUIRED: "false"
   # The group that may write the policy chain into a published volume. Must
-  # match the svidlet-policy container's runAsGroup, or it cannot write.
-  SVIDLET_POLICY_GID: "1000"
+  # match the svidlet-policy container's runAsGroup, or it cannot write — and
+  # must differ from SVIDLET_KEY_GID, or the daemon could read every tls.key
+  # on the node (svidlet refuses to start if they are equal).
+  SVIDLET_POLICY_GID: "2000"
   # SVIDLET_POLICY_INITIAL_TIMEOUT: 10s
 
   # Or pull policy as signed, content-addressed OCI bundles with a staged ring
-  # rollout — see docs/POLICY.md. Setting the rollout reference switches this
-  # on; a trusted public key is then mandatory, and the plugin refuses to start
+  # rollout — see ../svidlet-policy/authz-management-plane.md. Setting the rollout reference switches
+  # this on (and is mutually exclusive with SVIDLET_POLICY_ENDPOINT above); a
+  # trusted public key is then mandatory, and the plugin refuses to start
   # without one rather than run unable to verify anything.
   # SVIDLET_BUNDLE_ROLLOUT_REF: registry.example.internal/policy/rollout:current
   # SVIDLET_BUNDLE_PUBLIC_KEY_FILE: /etc/svidlet/bundle/signing.pub
@@ -162,12 +167,14 @@ spec:
               # Bidirectional so the tmpfs svidlet mounts inside a pod's volume
               # directory is visible to the kubelet and to the workload.
               mountPropagation: Bidirectional
+            - name: volumes-farm
+              mountPath: /var/lib/svidlet/volumes
+              # Bidirectional so the per-volume bind mounts svidlet creates here
+              # propagate to the host and into the svidlet-policy container.
+              mountPropagation: Bidirectional
             - name: vault-approle
               mountPath: /etc/svidlet/vault
               readOnly: true
-            # The node-local bundle cache: versions/, current, state.json.
-            # A hostPath so a restart resumes the bundle it already had rather
-            # than waiting for the registry.
           livenessProbe:
             httpGet:
               path: /healthz
@@ -180,14 +187,17 @@ spec:
           resources:
             requests:
               cpu: 10m
-              # Measured: 2.2 MB idle, 5.9 MB with 2000 certificates on the node.
+              # Measured: 3.2 MB idle, 6.7 MB with 2000 certificates on the node.
               memory: 24Mi
             limits:
               memory: 48Mi
         # Policy distribution, deliberately a separate process. It holds no
-        # Vault credential, needs no capabilities, and cannot mint an identity;
-        # the most it could do if compromised is write policy files. Drop this
-        # container entirely if you do not distribute policy.
+        # Vault credential, needs no capabilities, and cannot mint an identity.
+        # It mounts only the exposure farm — not the kubelet root — so a
+        # compromise cannot read other pods' secret volumes, and its group
+        # (2000) differs from SVIDLET_KEY_GID, so it cannot read tls.key
+        # either; the most it could do is write or delete policy files. Drop
+        # this container entirely if you do not distribute policy.
         - name: svidlet-policy
           image: ghcr.io/hixichen/svidlet:0.0.1
           command: ["/svidlet-policy"]
@@ -205,21 +215,25 @@ spec:
               containerPort: 9465
           securityContext:
             # Everything svidlet needs and this does not: no privilege, no
-            # capabilities, not root.
+            # capabilities, not root. The group must match SVIDLET_POLICY_GID
+            # and differ from SVIDLET_KEY_GID.
             privileged: false
             runAsNonRoot: true
-            runAsUser: 1000
-            runAsGroup: 1000
+            runAsUser: 2000
+            runAsGroup: 2000
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true
             capabilities:
               drop: ["ALL"]
           volumeMounts:
-            # HostToContainer, not Bidirectional: this process reads the
-            # tmpfs mounts svidlet made and writes files into them. It never
-            # mounts anything itself.
-            - name: kubelet-dir
-              mountPath: /var/lib/kubelet
+            # The exposure farm: one bind mount per published volume, created
+            # by svidlet. This is the daemon's whole view of the node's
+            # volumes — it never mounts the kubelet root, which would hand it
+            # every secret volume on the node. HostToContainer, not
+            # Bidirectional: it reads the mounts svidlet made and writes files
+            # into them; it never mounts anything itself.
+            - name: volumes-farm
+              mountPath: /var/lib/svidlet/volumes
               mountPropagation: HostToContainer
             - name: bundle-cache
               mountPath: /var/lib/svidlet/policy
@@ -241,6 +255,10 @@ spec:
           hostPath:
             path: /var/lib/kubelet
             type: Directory
+        - name: volumes-farm
+          hostPath:
+            path: /var/lib/svidlet/volumes
+            type: DirectoryOrCreate
         - name: vault-approle
           secret:
             secretName: svidlet-vault-approle

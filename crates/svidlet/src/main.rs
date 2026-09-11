@@ -5,7 +5,7 @@ use svidlet::{log, rand, server};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cfg = Config::from_env()?;
-    log::set_level(cfg.log_level);
+    log::init(cfg.log_level);
     rand::seed();
 
     // A current-thread reactor with a small blocking pool: everything expensive
