@@ -1,0 +1,13 @@
+# Adds svidlet-node-bootstrap to the svidlet DaemonSet and switches svidlet to
+# certificate auth. A component, so any overlay can include it.
+#
+# The bootstrap containers belong to svidlet-node-bootstrap; this wires them
+# in. What svidlet needs from them — the files in /node and the shape of the
+# certificate — is fixed in docs/DEPLOY.md and checked by svidlet at start-up.
+apiVersion: kustomize.config.k8s.io/v1alpha1
+kind: Component
+resources:
+  - config.yaml
+patches:
+  - path: auth.yaml
+  - path: daemonset.yaml

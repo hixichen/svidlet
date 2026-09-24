@@ -23,6 +23,13 @@ pub mod volume_context {
     pub const EPHEMERAL: &str = "csi.storage.k8s.io/ephemeral";
 }
 
+/// Where svidlet-node-bootstrap writes the node certificate: a memory-backed
+/// `emptyDir` shared with svidlet in the same pod. Changing it means changing
+/// the bootstrap containers' mount too.
+pub const NODE_CERT_FILE: &str = "/node/node.crt";
+/// The node certificate's private key, beside it.
+pub const NODE_KEY_FILE: &str = "/node/node.key";
+
 pub const CERT_FILE: &str = "tls.crt";
 pub const KEY_FILE: &str = "tls.key";
 pub const CA_FILE: &str = "ca.crt";
@@ -305,12 +312,11 @@ pub struct VaultSettings {
 
 /// How this node proves who it is to Vault.
 ///
-/// `Cert` is the production method — the node certificate registration
-/// issued, bound to the cluster by its URI SAN — and what the shipped
-/// `DaemonSet` selects. `AppRole` remains the code default so a bare `cargo run`
-/// against a dev Vault needs nothing else, but it is a shared bearer secret
-/// and belongs on dev and kind clusters only. See docs/DESIGN.md and
-/// docs/ROADMAP.md §3.
+/// Each `deploy/` variant picks one: `Cert` with node bootstrap (the node
+/// certificate, bound to the cluster by its URI SAN), `Kubernetes` standalone,
+/// `AppRole` for dev and kind clusters. `AppRole` remains the code default so a
+/// bare `cargo run` against a dev Vault needs nothing else, but it is a shared
+/// bearer secret. See docs/DEPLOY.md.
 #[derive(Debug, Clone)]
 pub enum AuthSettings {
     AppRole {
@@ -594,11 +600,11 @@ fn vault_settings(env: &Env<'_>, cluster: &str) -> Result<VaultSettings> {
                 .unwrap_or_else(|| format!("svidlet-{cluster}")),
             cert_path: PathBuf::from(
                 env.opt("SVIDLET_NODE_CERT_FILE")
-                    .unwrap_or_else(|| "/etc/svidlet/node/tls.crt".into()),
+                    .unwrap_or_else(|| NODE_CERT_FILE.into()),
             ),
             key_path: PathBuf::from(
                 env.opt("SVIDLET_NODE_KEY_FILE")
-                    .unwrap_or_else(|| "/etc/svidlet/node/tls.key".into()),
+                    .unwrap_or_else(|| NODE_KEY_FILE.into()),
             ),
         },
         "token" => AuthSettings::Token {
@@ -871,8 +877,9 @@ mod tests {
             } => {
                 assert_eq!(mount, "cert");
                 assert_eq!(role, "svidlet-cluster-a");
-                assert_eq!(cert_path, PathBuf::from("/etc/svidlet/node/tls.crt"));
-                assert_eq!(key_path, PathBuf::from("/etc/svidlet/node/tls.key"));
+                // Where svidlet-node-bootstrap writes them.
+                assert_eq!(cert_path, PathBuf::from("/node/node.crt"));
+                assert_eq!(key_path, PathBuf::from("/node/node.key"));
             }
             other => panic!("expected cert, got {other:?}"),
         }

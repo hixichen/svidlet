@@ -1,0 +1,14 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: svidlet-node-bootstrap
+  namespace: svidlet-system
+data:
+  # The step-ca that issues node certificates, and the SHA-256 fingerprint of
+  # its root. The fingerprint is the trust anchor: bootstrap refuses a CA that
+  # does not match it, the way svidlet refuses a Vault whose certificate does
+  # not chain to VAULT_CACERT.
+  STEP_CA_URL: https://ca.example.internal
+  STEP_FINGERPRINT: replace-me
+  # step's own state (the downloaded root, provisioner config). Not secret.
+  STEPPATH: /var/lib/step

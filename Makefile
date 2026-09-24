@@ -20,6 +20,9 @@ RUN := PATH="$(HOME)/.cargo/bin:$$PATH"
 IMAGE        ?= svidlet:dev
 TRUST_DOMAIN ?= example.org
 CLUSTER      ?= cluster-a
+# Which deploy/ overlay `make deploy` and `make e2e` use:
+#   standalone | with-node-bootstrap | dev
+VARIANT      ?= standalone
 BUNDLE_DIR   ?= ./policy/bundle
 ROLLOUT_FILE ?= ./rollout.toml
 
@@ -41,7 +44,7 @@ release: ## release build of the whole workspace
 	$(RUN) cargo build --release --workspace
 
 .PHONY: test
-test: ## unit + integration tests (273; no cluster, no Vault needed)
+test: ## unit + integration tests (280; no cluster, no Vault needed)
 	$(RUN) cargo test --workspace
 
 .PHONY: test-vault
@@ -87,8 +90,8 @@ bench: ## resident memory under real CSI load (needs a running Vault)
 # ------------------------------------------------------------------- e2e
 
 .PHONY: e2e
-e2e: ## kind + dev Vault + DaemonSet + a workload, end to end (needs kind, kubectl, docker)
-	$(RUN) ./hack/kind-e2e.sh
+e2e: ## kind + in-cluster Vault + VARIANT (default dev) + a workload, end to end (needs kind, kubectl, docker)
+	VARIANT=$(if $(filter command line,$(origin VARIANT)),$(VARIANT),dev) $(RUN) ./hack/kind-e2e.sh
 
 .PHONY: image
 image: ## build the static two-binary image (scratch, musl)
@@ -115,9 +118,15 @@ vault-bootstrap: ## one-time PKI setup for a cluster: VAULT_ADDR=… VAULT_TOKEN
 	./deploy/vault-bootstrap.sh $(TRUST_DOMAIN) $(CLUSTER)
 
 .PHONY: deploy
-deploy: ## apply the CSIDriver and DaemonSet to the current kubectl context
-	kubectl apply -f deploy/csidriver.yaml
-	kubectl apply -f deploy/daemonset.yaml
+deploy: ## apply deploy/$(VARIANT) to the current kubectl context (VARIANT=with-node-bootstrap for node attestation)
+	kubectl apply -k deploy/$(VARIANT)
+
+.PHONY: manifests
+manifests: ## render every deploy/ variant and validate it against the Kubernetes 1.31 schemas (needs kubectl, kubeconform)
+	@for v in standalone with-node-bootstrap dev; do \
+		printf '%-22s' "$$v"; \
+		kubectl kustomize deploy/$$v | kubeconform -strict -kubernetes-version 1.31.0 -summary -; \
+	done
 
 # ------------------------------------------------------------------- housekeeping
 

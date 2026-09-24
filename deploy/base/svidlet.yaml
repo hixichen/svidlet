@@ -23,7 +23,6 @@ metadata:
 data:
   SVIDLET_TRUST_DOMAIN: example.org
   SVIDLET_CLUSTER: cluster-a
-  SVIDLET_CERT_TTL: 24h
   SVIDLET_LOG_LEVEL: info
   # Group that owns tls.key, which is mode 0640. Must match the workload's
   # runAsGroup or a non-root workload cannot read its own key. See
@@ -44,27 +43,15 @@ data:
   # Defaults to spiffe-$SVIDLET_CLUSTER.
   SVIDLET_PKI_ROLE: spiffe-cluster-a
 
-  # cert | kubernetes | approle | token.
+  # How the node authenticates to Vault is the one thing the overlays decide:
   #
-  # cert is the production method: the node logs in with the certificate its
-  # registration issued (spiffe://<td>/cluster/<c>/node/<n>, CN=<node name>),
-  # and Vault binds the cluster from the certificate's URI SAN. Nothing shared,
-  # nothing to rotate by hand. See docs/ROADMAP.md, "Node attestation".
+  #   deploy/standalone           kubernetes — svidlet alone; Vault verifies the
+  #                               plugin's own ServiceAccount token
+  #   deploy/with-node-bootstrap  cert — svidlet-node-bootstrap attests the node
+  #                               and hands svidlet a node certificate
+  #   deploy/dev                  approle — kind and local clusters only
   #
-  # Without a TPM or a registration service, kubernetes proves the plugin's own
-  # ServiceAccount to Vault instead:
-  #
-  #   SVIDLET_VAULT_AUTH: kubernetes
-  #   SVIDLET_VAULT_K8S_ROLE: svidlet
-  #
-  # approle is for dev and kind clusters only — a shared bearer secret, and the
-  # weakest option (see docs/DESIGN.md). hack/kind-e2e.sh shows it wired up.
-  SVIDLET_VAULT_AUTH: cert
-  # Defaults: mount "cert", role svidlet-$SVIDLET_CLUSTER, and the node
-  # certificate at /etc/svidlet/node/tls.crt and tls.key.
-  # SVIDLET_VAULT_CERT_ROLE: svidlet-cluster-a
-  # SVIDLET_NODE_CERT_FILE: /etc/svidlet/node/tls.crt
-  # SVIDLET_NODE_KEY_FILE: /etc/svidlet/node/tls.key
+  # See docs/DEPLOY.md. Everything else in this ConfigMap is shared.
 
   # Pod certificates. Six hours by default; the Subject CN is the pod name,
   # which AWS IAM Roles Anywhere requires and records as sourceIdentity.
@@ -177,17 +164,6 @@ spec:
               # Bidirectional so the per-volume bind mounts svidlet creates here
               # propagate to the host and into the svidlet-policy container.
               mountPropagation: Bidirectional
-            # The node certificate and key the registration agent (step-ca or
-            # the go-attestation service) keeps renewed on the host. Re-read on
-            # every Vault login, so renewal needs no restart.
-            - name: node-identity
-              mountPath: /etc/svidlet/node
-              readOnly: true
-            # Only for SVIDLET_VAULT_AUTH=approle (dev and kind). Optional, so
-            # production creates no such Secret at all.
-            - name: vault-approle
-              mountPath: /etc/svidlet/vault
-              readOnly: true
           livenessProbe:
             httpGet:
               path: /healthz
@@ -272,15 +248,6 @@ spec:
           hostPath:
             path: /var/lib/svidlet/volumes
             type: DirectoryOrCreate
-        - name: node-identity
-          hostPath:
-            path: /etc/svidlet/node
-            type: DirectoryOrCreate
-        - name: vault-approle
-          secret:
-            secretName: svidlet-vault-approle
-            defaultMode: 0400
-            optional: true
         - name: bundle-cache
           hostPath:
             path: /var/lib/svidlet/policy

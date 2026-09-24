@@ -1,0 +1,19 @@
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: svidlet
+  namespace: svidlet-system
+spec:
+  template:
+    spec:
+      containers:
+        - name: svidlet
+          volumeMounts:
+            - name: vault-approle
+              mountPath: /etc/svidlet/vault
+              readOnly: true
+      volumes:
+        - name: vault-approle
+          secret:
+            secretName: svidlet-vault-approle
+            defaultMode: 0400

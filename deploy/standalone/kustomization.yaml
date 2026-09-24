@@ -1,0 +1,16 @@
+# svidlet on its own, with no node bootstrap: each node authenticates to Vault
+# with the svidlet ServiceAccount's token (Vault Kubernetes auth).
+#
+#   kubectl apply -k deploy/standalone
+#
+# Nothing shared sits in the cluster, but every node presents the same
+# ServiceAccount, so Vault cannot tell nodes apart and the credential is not
+# bound to hardware. Use deploy/with-node-bootstrap where nodes can be attested.
+# Vault side: AUTH=kubernetes ./deploy/vault-bootstrap.sh (docs/DEPLOY.md).
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - ../base
+  - token-review.yaml
+patches:
+  - path: auth.yaml

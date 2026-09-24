@@ -1,0 +1,12 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: svidlet
+  namespace: svidlet-system
+data:
+  SVIDLET_VAULT_AUTH: cert
+  # The defaults already point at /node/node.crt and /node/node.key, where
+  # node bootstrap writes them:
+  # SVIDLET_NODE_CERT_FILE: /node/node.crt
+  # SVIDLET_NODE_KEY_FILE: /node/node.key
+  # SVIDLET_VAULT_CERT_ROLE: svidlet-cluster-a

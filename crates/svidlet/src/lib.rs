@@ -32,6 +32,7 @@ pub mod csi;
 pub mod issue;
 pub mod log;
 pub mod metrics;
+pub mod node;
 pub mod policy;
 pub mod rand;
 pub mod recover;

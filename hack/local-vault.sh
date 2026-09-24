@@ -84,13 +84,13 @@ start() {
       key_type=ec key_bits=256 no_store=true max_ttl=24h ttl=24h >/dev/null
   fi
   openssl ecparam -name prime256v1 -genkey -noout 2>/dev/null \
-    | openssl pkcs8 -topk8 -nocrypt -out "${NODE_DIR}/tls.key"
-  openssl req -new -key "${NODE_DIR}/tls.key" -subj "/CN=${node_name}" \
-    -out "${NODE_DIR}/tls.csr"
+    | openssl pkcs8 -topk8 -nocrypt -out "${NODE_DIR}/node.key"
+  openssl req -new -key "${NODE_DIR}/node.key" -subj "/CN=${node_name}" \
+    -out "${NODE_DIR}/node.csr"
   vault write -field=certificate pki-node/sign/node \
-    csr=@"${NODE_DIR}/tls.csr" uri_sans="${node_id}" common_name="${node_name}" \
-    exclude_cn_from_sans=true ttl=24h > "${NODE_DIR}/tls.crt"
-  chmod 0600 "${NODE_DIR}/tls.key"
+    csr=@"${NODE_DIR}/node.csr" uri_sans="${node_id}" common_name="${node_name}" \
+    exclude_cn_from_sans=true ttl=24h > "${NODE_DIR}/node.crt"
+  chmod 0600 "${NODE_DIR}/node.key"
 
   echo "==> configuring the PKI mount, role, AppRole and certificate auth"
   # The quota is lifted here: hack/bench-memory.sh publishes as fast as the
@@ -120,8 +120,8 @@ export SVIDLET_SECRET_ID_FILE=${SECRET_ID_FILE}
 export SVIDLET_VAULT_TOKEN_FILE=${TOKEN_FILE}
 export SVIDLET_VAULT_CERT_MOUNT=cert
 export SVIDLET_VAULT_CERT_ROLE=svidlet-${CLUSTER}
-export SVIDLET_NODE_CERT_FILE=${NODE_DIR}/tls.crt
-export SVIDLET_NODE_KEY_FILE=${NODE_DIR}/tls.key
+export SVIDLET_NODE_CERT_FILE=${NODE_DIR}/node.crt
+export SVIDLET_NODE_KEY_FILE=${NODE_DIR}/node.key
 export NODE_NAME=${node_name}
 VARS
 

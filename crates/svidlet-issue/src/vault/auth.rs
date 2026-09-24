@@ -210,7 +210,8 @@ impl TokenSource for KubernetesAuth {
 /// sits in a Kubernetes Secret, and there is nothing to rotate by hand.
 ///
 /// The certificate and key are re-read from disk on every login, so the
-/// registration agent can renew them (daily) without restarting svidlet.
+/// node bootstrap's renewal sidecar can replace them (daily) without
+/// restarting svidlet.
 /// Tokens are not renewed in place: Vault's cert method re-checks the client
 /// certificate on renewal, and a fresh login re-reads a rotated one anyway.
 ///

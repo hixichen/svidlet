@@ -40,6 +40,7 @@ spec:
       containers:
         - name: app
           image: cgr.dev/chainguard/busybox:latest
+          imagePullPolicy: IfNotPresent
           command:
             - sh
             - -c
@@ -69,6 +70,7 @@ spec:
               drop: ["ALL"]
         - name: sidecar
           image: cgr.dev/chainguard/busybox:latest
+          imagePullPolicy: IfNotPresent
           command: ["sleep", "infinity"]
           # No volumeMounts: this container cannot read the identity.
           securityContext:

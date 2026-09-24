@@ -4,7 +4,11 @@
 
 Status: design proposal, Phase 0 largely landed · Scope: \~100 clusters, \~120k nodes, 1–2.4M pods · Owner: platform identity
 
-**Depends on:** [DESIGN.md](DESIGN.md) (what svidlet is today) · [USAGE.md](USAGE.md) (what a workload does with the certificate) · [config.md](config.md)
+**Depends on:** [DESIGN.md](DESIGN.md) (what svidlet is today) · [DEPLOY.md](DEPLOY.md) (deploying it, alone or with node bootstrap) · [USAGE.md](USAGE.md) (what a workload does with the certificate) · [config.md](config.md)
+
+Node attestation — §3 — is built in its own repository,
+[svidlet-node-bootstrap](https://github.com/hixichen/svidlet-node-bootstrap). This repository
+covers svidlet, and the interface between the two.
 
 ---
 
@@ -22,8 +26,9 @@ What is in this repository now, against the phases in §8. Items that live outsi
 | 0 | Placement auditor v0 | Not started (separate component). |
 | 1 | svidlet: cert-auth to Vault with the node certificate | **Done** for a file-held key: `SVIDLET_VAULT_AUTH=cert`. The cert and key are re-read on every login; tokens are short and re-obtained rather than renewed. Verified live: a node certificate for another cluster, from the same registration CA, is refused. |
 | 1 | TPM-resident node key (Tier A) | Not started in svidlet. The key file path is the seam a TPM-backed signer replaces. |
-| 1 | AppRole removed from `deploy/` | **Done** for the production manifest: the DaemonSet defaults to `cert`, the AppRole Secret is no longer shipped, and its volume is optional. `hack/kind-e2e.sh` still wires AppRole explicitly, as the dev path. |
-| 1 | EK inventory, step-ca / go-attestation service, soak | Not started (outside svidlet). `hack/local-vault.sh` stands a second PKI mount in for the registration CA so cert auth is testable without a TPM. |
+| 1 | AppRole removed from `deploy/` | **Done.** `deploy/` is now variants over one base: `standalone` (Vault Kubernetes auth), `with-node-bootstrap` (cert auth) and `dev` (AppRole, kind only). Only `dev` mounts or ships an AppRole Secret. |
+| 1 | Hand-off from svidlet-node-bootstrap | **Done on svidlet's side** ([DEPLOY.md](DEPLOY.md)): the `node-bootstrap` kustomize component runs the bootstrap init container and renew sidecar in svidlet's pod over a memory-backed `/node`; svidlet reads `/node/node.crt` and `node.key` by default, checks at start-up that the certificate names this node and cluster and carries a CN, and exports `svidlet_node_certificate_expiry_seconds`. |
+| 1 | EK inventory, step-ca, enrolment and renewal containers, soak | In [svidlet-node-bootstrap](https://github.com/hixichen/svidlet-node-bootstrap). `hack/local-vault.sh` and the kind e2e stand a Vault PKI mount in for step-ca, so cert auth is testable without a TPM. |
 | 2–4 | Cloud federation rollout, token issuer, hardening | Not started. |
 
 ### What implementing Phase 0–1 taught us
@@ -119,10 +124,10 @@ On the Vault side this is one cert role per cluster (`deploy/vault-bootstrap.sh`
 | --- | --- | --- |
 | A | TPM-bound node cert via EK registration | Bare metal with TPM 2.0; VMs with vTPM chaining to a hypervisor CA |
 | B | TPM present but no EK cert | Trust the EK hash alone against inventory (allowlist is the boundary anyway) |
-| C | Kubernetes auth (`SVIDLET_VAULT_AUTH=kubernetes`) | No TPM. Documented as lower assurance in DESIGN.md |
-| — | AppRole | Dev/kind only; removed from production manifests |
+| C | No TPM. With node bootstrap: a node certificate from step-ca's per-cluster ServiceAccount-token provisioner, software key. Without: Vault Kubernetes auth (`deploy/standalone`) | Lower assurance: the key, or the token, is usable by whoever is root on the node |
+| — | AppRole | Dev/kind only (`deploy/dev`) |
 
-Tiers A and B both reach svidlet as `SVIDLET_VAULT_AUTH=cert` with the node certificate at `SVIDLET_NODE_CERT_FILE`. Today the key is read from `SVIDLET_NODE_KEY_FILE`; Tier A replaces that file with a TPM-backed signer, which is the one remaining piece of Phase 1 inside svidlet.
+Which Tier C a cluster gets is the deployment's choice, not svidlet's: `deploy/with-node-bootstrap` gives every tier the same certificate shape and the same Vault auth method, while `deploy/standalone` needs no step-ca at all. svidlet supports both. Tiers A, B and bootstrapped C all reach svidlet as `SVIDLET_VAULT_AUTH=cert` with the node certificate in `/node`. Today the key is read from a PEM file; Tier A replaces that file with a TPM-backed signer, which is the one remaining piece of Phase 1 inside svidlet.
 
 ### 3.4 Revocation
 
@@ -253,7 +258,7 @@ With cert auth the issuing node is in the audit log without any extra configurat
 
 - EK inventory schema and provisioning hook; change control on allowlist writes.
 - step-ca (or go-attestation service) deployment; ACME `device-attest-01` path validated on two vendor board families and one vTPM.
-- svidlet: cert-auth to Vault with TPM-resident node cert (Tier A); Tier B/C fallbacks; AppRole removed from `deploy/`. *(✅ cert auth with a file-held key, Tier C, AppRole out of the production manifest; TPM-backed signer outstanding.)*
+- svidlet: cert-auth to Vault with TPM-resident node cert (Tier A); Tier B/C fallbacks; AppRole removed from `deploy/`. *(✅ cert auth with a file-held key, both Tier C routes, deploy variants with AppRole confined to `dev`, the bootstrap hand-off; TPM-backed signer outstanding.)*
 - Soak on one production cluster; measure registration latency and re-registration under node reimage.
 
 **Phase 2 — Stage 1 cloud federation (+10 → +18 weeks, overlaps Phase 1)**

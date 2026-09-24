@@ -1,0 +1,9 @@
+# Vault AppRole: a shared secret in a Kubernetes Secret. Dev and kind only —
+# whoever can read the Secret can mint any identity in the cluster, from
+# anywhere. The Secret itself is not shipped; create it from the secret ID
+# vault-bootstrap.sh prints.
+apiVersion: kustomize.config.k8s.io/v1alpha1
+kind: Component
+patches:
+  - path: auth.yaml
+  - path: daemonset.yaml

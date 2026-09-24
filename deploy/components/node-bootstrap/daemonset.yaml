@@ -1,0 +1,82 @@
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: svidlet
+  namespace: svidlet-system
+spec:
+  template:
+    spec:
+      initContainers:
+        # Enrolls the node and writes /node/node.crt and /node/node.key, then
+        # exits. svidlet does not start until it has succeeded.
+        - name: node-enroll
+          image: ghcr.io/hixichen/svidlet-node-bootstrap:0.0.1
+          imagePullPolicy: IfNotPresent
+          args: ["enroll"]
+          envFrom:
+            - configMapRef:
+                name: svidlet-node-bootstrap
+          env: &bootstrap-env
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            - name: SVIDLET_TRUST_DOMAIN
+              valueFrom:
+                configMapKeyRef:
+                  name: svidlet
+                  key: SVIDLET_TRUST_DOMAIN
+            - name: SVIDLET_CLUSTER
+              valueFrom:
+                configMapKeyRef:
+                  name: svidlet
+                  key: SVIDLET_CLUSTER
+          volumeMounts: &bootstrap-mounts
+            - name: node
+              mountPath: /node
+            - name: step-state
+              mountPath: /var/lib/step
+            # Tier C (no TPM): a short-lived token only step-ca accepts.
+            - name: step-token
+              mountPath: /var/run/secrets/step
+              readOnly: true
+          # Tier A/B need the TPM, /dev/tpmrm0, which is not mounted here: a
+          # hostPath to a device that does not exist would make every
+          # TPM-less node fail to start. Add it in an overlay for TPM fleets —
+          # see svidlet-node-bootstrap for the exact device and privileges.
+        # Renews the node certificate before it expires, swapping the files
+        # atomically. A native sidecar (restartPolicy: Always, Kubernetes
+        # 1.29+): it starts after node-enroll and runs for the pod's life.
+        - name: node-renew
+          image: ghcr.io/hixichen/svidlet-node-bootstrap:0.0.1
+          imagePullPolicy: IfNotPresent
+          restartPolicy: Always
+          args: ["renew"]
+          envFrom:
+            - configMapRef:
+                name: svidlet-node-bootstrap
+          env: *bootstrap-env
+          volumeMounts: *bootstrap-mounts
+      containers:
+        # Only svidlet sees the node key. svidlet-policy, which parses
+        # untrusted bundles, never mounts /node.
+        - name: svidlet
+          volumeMounts:
+            - name: node
+              mountPath: /node
+              readOnly: true
+      volumes:
+        # Memory-backed: the node key never touches the node's disk.
+        - name: node
+          emptyDir:
+            medium: Memory
+            sizeLimit: 1Mi
+        - name: step-state
+          emptyDir: {}
+        - name: step-token
+          projected:
+            sources:
+              - serviceAccountToken:
+                  audience: step-ca
+                  expirationSeconds: 600
+                  path: token

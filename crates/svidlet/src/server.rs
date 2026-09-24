@@ -24,7 +24,7 @@ use crate::csi::registration::RegistrationService;
 use crate::issue::Publisher;
 use crate::metrics::Metrics;
 use crate::store::Store;
-use crate::{debug, info, metrics, recover, renew, volume, warn};
+use crate::{debug, error, info, metrics, recover, renew, volume, warn};
 
 pub async fn run(cfg: Config) -> Result<(), Box<dyn std::error::Error>> {
     info!(
@@ -51,6 +51,10 @@ pub async fn run(cfg: Config) -> Result<(), Box<dyn std::error::Error>> {
     let metrics = Arc::new(Metrics::default());
     let issuer = build_issuer(&cfg)?;
     metrics.set_backend(issuer.name(), issuer.auth_name());
+    if let AuthSettings::Cert { cert_path, .. } = &cfg.vault.auth {
+        metrics.set_node_certificate(cert_path.clone());
+        check_node_certificate(&cfg, cert_path);
+    }
     info!(
         "pki backend",
         backend = issuer.name(),
@@ -277,6 +281,43 @@ pub fn build_issuer(cfg: &Config) -> Result<Arc<dyn Issuer>, Box<dyn std::error:
             StaticTokenAuth::new(path.clone()),
         )),
     })
+}
+
+/// Say at start-up whether the node certificate is the one this node should
+/// log in with. Never fatal: until node bootstrap delivers a usable one, the
+/// certificates already published keep being served and renewal retries.
+fn check_node_certificate(cfg: &Config, path: &Path) {
+    let expected = crate::node::expected_id(&cfg.trust_domain, &cfg.cluster, &cfg.node_name);
+    match crate::node::read(path) {
+        Err(crate::node::ReadError::Missing(e)) => warn!(
+            "no node certificate yet; waiting for node bootstrap",
+            path = path.display(),
+            expected = expected,
+            error = e,
+        ),
+        Err(e) => error!(
+            "the node certificate is unusable",
+            path = path.display(),
+            error = e
+        ),
+        Ok(facts) => {
+            let problems = crate::node::check(&facts, &expected, crate::log::unix_now());
+            if problems.is_empty() {
+                info!(
+                    "node certificate ready",
+                    spiffe_id = facts.spiffe_id,
+                    expires_in_secs = facts.not_after - crate::log::unix_now(),
+                );
+            }
+            for problem in problems {
+                error!(
+                    "node certificate will not authenticate this node",
+                    path = path.display(),
+                    problem = problem,
+                );
+            }
+        }
+    }
 }
 
 async fn shutdown() {

@@ -59,7 +59,10 @@ The backend is behind an `Issuer` trait in the `svidlet-issue` crate; Vault PKI 
 - One PKI mount and one intermediate CA shared by all clusters (single trust domain, one `ca.crt` everywhere).
 - One PKI role per cluster whose `allowed_uri_sans` is pinned to `spiffe://<td>/cluster/<cluster>/ns/*/sa/*`, with `no_store=true` and no DNS/IP SANs permitted. `cn_validations=disabled` accepts the pod-name CN without treating it as a host name; svidlet sends `exclude_cn_from_sans=true`, and since the role allows no DNS names a request without it is refused.
 - One cert auth role per cluster, trusting the node registration CA, with `allowed_uri_sans` pinned to `spiffe://<td>/cluster/<cluster>/node/*` and a policy granting only `update` on that cluster's `pki/sign/…` path and `read` on the CA chain. Each node logs in with its own certificate, so there is no shared secret; tokens last an hour and are re-obtained, which re-reads a rotated node certificate.
-- AppRole remains for development and kind clusters, where there is no registration CA: one per cluster, with the same policy, its secret ID in a Kubernetes Secret.
+- Without node bootstrap, one Kubernetes auth role per cluster instead, bound to the svidlet ServiceAccount (`deploy/standalone`).
+- AppRole remains for development and kind clusters, where there is no registration CA: one per cluster, with the same policy, its secret ID in a Kubernetes Secret (`deploy/dev`).
+
+Node certificates come from [svidlet-node-bootstrap](https://github.com/hixichen/svidlet-node-bootstrap), which runs as an init container and a renewal sidecar in svidlet's pod; svidlet itself has no TPM or enrolment logic. How to deploy with or without it, and the interface between the two, is [DEPLOY.md](DEPLOY.md).
 - The plugin logs in once per token lifetime; it does not log in per certificate.
 
 **3. `svidlet-policy` — policy distribution (optional, separate process)**

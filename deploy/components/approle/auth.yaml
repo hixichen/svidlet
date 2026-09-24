@@ -1,0 +1,9 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: svidlet
+  namespace: svidlet-system
+data:
+  SVIDLET_VAULT_AUTH: approle
+  # Not a secret: the role ID names the AppRole, the secret ID authenticates.
+  SVIDLET_ROLE_ID: replace-me

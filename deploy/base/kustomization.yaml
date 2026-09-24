@@ -1,0 +1,9 @@
+# What every deployment of svidlet shares: the namespace, the CSIDriver, the
+# DaemonSet (svidlet and svidlet-policy) and the metrics Service. Not deployable
+# on its own — it says nothing about how a node authenticates to Vault. Apply an
+# overlay instead: deploy/standalone, deploy/with-node-bootstrap or deploy/dev.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - csidriver.yaml
+  - svidlet.yaml

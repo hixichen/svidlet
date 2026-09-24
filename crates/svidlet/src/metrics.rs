@@ -116,6 +116,8 @@ pub struct Metrics {
 
     /// Static identification of the backend in use, for `svidlet_build_info`.
     backend: std::sync::OnceLock<(&'static str, &'static str)>,
+    /// The node certificate Vault cert auth presents, when that is the method.
+    node_cert: std::sync::OnceLock<std::path::PathBuf>,
 }
 
 impl Metrics {
@@ -124,6 +126,13 @@ impl Metrics {
     }
 
     /// Record which backend and authentication method this node is using.
+    /// Report the node certificate at `path` in
+    /// `svidlet_node_certificate_expiry_seconds`, read afresh on every scrape
+    /// so a renewal by node bootstrap shows up without svidlet's involvement.
+    pub fn set_node_certificate(&self, path: std::path::PathBuf) {
+        let _ = self.node_cert.set(path);
+    }
+
     pub fn set_backend(&self, issuer: &'static str, auth: &'static str) {
         let _ = self.backend.set((issuer, auth));
     }
@@ -309,6 +318,19 @@ impl Metrics {
             "",
             store.due(now).len() as f64,
         );
+        simple(
+            &mut out,
+            "svidlet_node_certificate_expiry_seconds",
+            "Seconds until the node certificate Vault cert auth presents expires. \
+             Written and renewed by node bootstrap; a falling value means its renewal \
+             has stopped. NaN when not using cert auth or the certificate is unreadable.",
+            "gauge",
+            "",
+            self.node_cert
+                .get()
+                .and_then(|path| crate::node::read(path).ok())
+                .map_or(f64::NAN, |facts| (facts.not_after - now) as f64),
+        );
 
         out
     }
@@ -481,6 +503,41 @@ mod tests {
             out.contains("svidlet_cloud_profile_findings_total{cloud=\"aws\",rule=\"subject\"} 1")
         );
         assert_parses(&out);
+    }
+
+    #[test]
+    fn the_node_certificate_expiry_is_read_from_disk_on_every_scrape() {
+        let metrics = Metrics::default();
+        let gauge = |out: &str| -> String {
+            out.lines()
+                .find(|l| l.starts_with("svidlet_node_certificate_expiry_seconds "))
+                .unwrap()
+                .rsplit(' ')
+                .next()
+                .unwrap()
+                .to_string()
+        };
+        // Not using cert auth: nothing to report.
+        assert_eq!(gauge(&metrics.render(&Store::new())), "NaN");
+
+        let path = std::env::temp_dir().join(format!("svidlet-node-metric-{}", std::process::id()));
+        metrics.set_node_certificate(path.clone());
+        // Bootstrap has not written it yet.
+        assert_eq!(gauge(&metrics.render(&Store::new())), "NaN");
+
+        let key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
+        let mut params = rcgen::CertificateParams::default();
+        params.subject_alt_names = vec![rcgen::SanType::URI(
+            "spiffe://example.org/cluster/a/node/n1".try_into().unwrap(),
+        )];
+        let now = time::OffsetDateTime::now_utc();
+        params.not_before = now;
+        params.not_after = now + time::Duration::hours(24);
+        std::fs::write(&path, params.self_signed(&key).unwrap().pem()).unwrap();
+
+        let seconds: f64 = gauge(&metrics.render(&Store::new())).parse().unwrap();
+        assert!((86_000.0..=86_400.0).contains(&seconds), "{seconds}");
+        std::fs::remove_file(&path).unwrap();
     }
 
     #[test]

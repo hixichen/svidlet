@@ -1,0 +1,9 @@
+# kind and local development clusters: AppRole, a shared secret, because a dev
+# cluster has neither a node registration CA nor a Vault that can review its
+# ServiceAccount tokens. Never for production. hack/kind-e2e.sh uses this.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - ../base
+components:
+  - ../components/approle

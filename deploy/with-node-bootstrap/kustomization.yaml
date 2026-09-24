@@ -1,0 +1,16 @@
+# svidlet together with svidlet-node-bootstrap
+# (https://github.com/hixichen/svidlet-node-bootstrap): an init container
+# attests the node — by TPM where there is one — and a sidecar keeps its node
+# certificate renewed; svidlet authenticates to Vault with that certificate.
+#
+#   kubectl apply -k deploy/with-node-bootstrap
+#
+# Vault side: AUTH=cert NODE_CA_FILE=<step-ca root> ./deploy/vault-bootstrap.sh.
+# Set STEP_CA_URL and STEP_FINGERPRINT in the svidlet-node-bootstrap ConfigMap.
+# docs/DEPLOY.md has the interface between the two.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - ../base
+components:
+  - ../components/node-bootstrap

@@ -9,15 +9,19 @@
 #
 # Usage: VAULT_ADDR=... VAULT_TOKEN=... ./vault-bootstrap.sh <trust-domain> <cluster>
 #
-# How nodes authenticate is chosen with AUTH, a comma-separated list:
+# How nodes authenticate is chosen with AUTH, a comma-separated list. Each
+# matches one of the deploy/ variants:
 #
-#   AUTH=cert NODE_CA_FILE=registration-ca.pem ./vault-bootstrap.sh td c
-#       Production. Vault trusts the node registration CA (step-ca or the
-#       go-attestation service) and binds the cluster from the node
+#   AUTH=cert NODE_CA_FILE=step-ca-root.pem ./vault-bootstrap.sh td c
+#       deploy/with-node-bootstrap. Vault trusts the node registration CA
+#       (svidlet-node-bootstrap's step-ca) and binds the cluster from the node
 #       certificate's URI SAN, spiffe://<td>/cluster/<c>/node/<n>. Nothing
 #       shared, nothing to rotate by hand.
+#   AUTH=kubernetes K8S_HOST=https://… K8S_CA_FILE=ca.crt ./vault-bootstrap.sh td c
+#       deploy/standalone. Vault reviews the svidlet ServiceAccount's token
+#       against this cluster's API server. One auth mount per cluster.
 #   AUTH=approle ./vault-bootstrap.sh td c                         (the default)
-#       Dev and kind only: a shared bearer secret in a Kubernetes Secret.
+#       deploy/dev: kind and local clusters. A shared bearer secret.
 set -euo pipefail
 
 TRUST_DOMAIN="${1:?usage: $0 <trust-domain> <cluster>}"
@@ -33,11 +37,17 @@ AUTH="${AUTH:-approle}"
 # state and pod-rollout peaks; it exists to bound a plugin bug.
 RATE_LIMIT="${RATE_LIMIT:-200}"
 CERT_MOUNT="${CERT_MOUNT:-cert}"
+K8S_MOUNT="${K8S_MOUNT:-kubernetes-${CLUSTER}}"
 
 # POSIX on purpose: the kind e2e runs this inside the Vault container.
 has_auth() { case ",${AUTH}," in *",$1,"*) return 0 ;; *) return 1 ;; esac; }
 if has_auth cert && [ -z "${NODE_CA_FILE:-}" ]; then
   echo "AUTH includes cert, so NODE_CA_FILE must name the node registration CA (PEM)" >&2
+  exit 2
+fi
+if has_auth kubernetes && { [ -z "${K8S_HOST:-}" ] || [ -z "${K8S_CA_FILE:-}" ]; }; then
+  echo "AUTH includes kubernetes, so K8S_HOST (the API server URL) and K8S_CA_FILE" >&2
+  echo "(its CA certificate, PEM) are required" >&2
   exit 2
 fi
 
@@ -117,12 +127,34 @@ if has_auth cert; then
   # registered into another cluster presents another prefix and is refused, so
   # the policy below is reachable only from this cluster's nodes. Tokens are
   # short and not renewed in place — svidlet logs in again, which re-reads a
-  # node certificate the registration agent has rotated, and a node removed from
+  # node certificate node bootstrap has renewed, and a node removed from
   # the EK inventory loses Vault within the hour even if its CRL entry is late.
   vault write "auth/${CERT_MOUNT}/certs/svidlet-${CLUSTER}" \
     display_name="svidlet-${CLUSTER}" \
     certificate=@"${NODE_CA_FILE}" \
     allowed_uri_sans="spiffe://${TRUST_DOMAIN}/cluster/${CLUSTER}/node/*" \
+    token_policies="svidlet-${CLUSTER}" \
+    token_ttl=1h \
+    token_max_ttl=1h
+fi
+
+if has_auth kubernetes; then
+  echo "==> Kubernetes auth ${K8S_MOUNT}, role svidlet"
+  vault auth list -format=json | grep -q "\"${K8S_MOUNT}/\"" \
+    || vault auth enable -path="${K8S_MOUNT}" kubernetes
+  # disable_local_ca_jwt: review svidlet's token with svidlet's own token, as a
+  # Vault outside the cluster must, rather than with Vault's pod identity when
+  # it happens to run inside one. deploy/standalone grants svidlet
+  # system:auth-delegator for exactly this.
+  vault write "auth/${K8S_MOUNT}/config" \
+    kubernetes_host="${K8S_HOST}" \
+    kubernetes_ca_cert=@"${K8S_CA_FILE}" \
+    disable_local_ca_jwt=true
+  # Bound to the one ServiceAccount the DaemonSet runs as. Short tokens, for
+  # the same reason as cert auth: svidlet logs in again rather than renewing.
+  vault write "auth/${K8S_MOUNT}/role/svidlet" \
+    bound_service_account_names=svidlet \
+    bound_service_account_namespaces=svidlet-system \
     token_policies="svidlet-${CLUSTER}" \
     token_ttl=1h \
     token_max_ttl=1h
@@ -143,6 +175,17 @@ Done. Configure the DaemonSet with:
     --from-literal=VAULT_ADDR=${VAULT_ADDR} \\
     --from-literal=SVIDLET_PKI_ROLE=${ROLE} \\
 SUMMARY
+
+if has_auth kubernetes; then
+  cat <<SUMMARY
+    --from-literal=SVIDLET_VAULT_AUTH=kubernetes \\
+    --from-literal=SVIDLET_VAULT_K8S_MOUNT=${K8S_MOUNT} \\
+    --from-literal=SVIDLET_VAULT_K8S_ROLE=svidlet \\
+    --dry-run=client -o yaml | kubectl apply -f -
+
+and apply deploy/standalone, which grants the token review Vault performs.
+SUMMARY
+fi
 
 if has_auth cert; then
   cat <<SUMMARY

@@ -83,7 +83,7 @@ Everything that varies between clusters is an environment variable, so one image
 | `SVIDLET_VAULT_TIMEOUT` | `10s` | Per-request timeout for Vault calls. |
 | `SVIDLET_PKI_MOUNT` | `pki` | The PKI mount that holds the shared intermediate. |
 | `SVIDLET_PKI_ROLE` | `spiffe-<cluster>` | The per-cluster role. Its `allowed_uri_sans` pins this cluster's SPIFFE prefix. |
-| `SVIDLET_VAULT_AUTH` | `approle` | How the node authenticates to Vault: `cert` \| `kubernetes` \| `approle` \| `token`. **Production is `cert`** — the node certificate registration issued, nothing shared — and the shipped DaemonSet sets it. `kubernetes` is the fallback without a TPM. The code default stays `approle` so a bare `cargo run` against `hack/local-vault.sh` needs nothing extra; AppRole is a shared bearer secret and is for dev and kind clusters only. |
+| `SVIDLET_VAULT_AUTH` | `approle` | How the node authenticates to Vault: `cert` \| `kubernetes` \| `approle` \| `token`. Each `deploy/` variant sets it: `cert` in `with-node-bootstrap` (the node certificate svidlet-node-bootstrap issued, nothing shared), `kubernetes` in `standalone`, `approle` in `dev`. The code default stays `approle` so a bare `cargo run` against `hack/local-vault.sh` needs nothing extra; AppRole is a shared bearer secret and is for dev and kind clusters only. |
 
 Per method:
 
@@ -97,8 +97,8 @@ Per method:
 | `SVIDLET_VAULT_K8S_TOKEN_FILE` | `/var/run/secrets/kubernetes.io/serviceaccount/token` | *(kubernetes)* The projected ServiceAccount token. |
 | `SVIDLET_VAULT_CERT_MOUNT` | `cert` | *(cert)* The TLS certificate auth mount. |
 | `SVIDLET_VAULT_CERT_ROLE` | `svidlet-<cluster>` | *(cert)* The cert role to log in against. Its `allowed_uri_sans` (`spiffe://<td>/cluster/<cluster>/node/*`) is what binds the node to this cluster. |
-| `SVIDLET_NODE_CERT_FILE` | `/etc/svidlet/node/tls.crt` | *(cert)* The node certificate from registration — URI SAN `spiffe://<td>/cluster/<cluster>/node/<node>`, and `CN=<node>`, which Vault's cert method requires. Re-read on every login, so the registration agent renews it without a restart. |
-| `SVIDLET_NODE_KEY_FILE` | `/etc/svidlet/node/tls.key` | *(cert)* Its private key, PEM. The seam a TPM-backed signer replaces. |
+| `SVIDLET_NODE_CERT_FILE` | `/node/node.crt` | *(cert)* The node certificate svidlet-node-bootstrap writes — URI SAN `spiffe://<td>/cluster/<cluster>/node/<node>`, and `CN=<node>`, which Vault's cert method requires. Re-read on every login, so a renewal needs no restart; checked at start-up and reported in `svidlet_node_certificate_expiry_seconds`. [DEPLOY.md](DEPLOY.md) has the full interface. |
+| `SVIDLET_NODE_KEY_FILE` | `/node/node.key` | *(cert)* Its private key, PEM. The seam a TPM-backed signer replaces. |
 | `SVIDLET_VAULT_TOKEN_FILE` | `/etc/svidlet/vault/token` | *(token)* A static token file. Dev convenience, not a production method. |
 
 ## `svidlet-policy` — the policy daemon
@@ -160,6 +160,6 @@ Events are real structured events via `tracing`: fields are named values (`spiff
 ## Where these live in the manifest
 
 - **ConfigMap `svidlet`** — every `SVIDLET_*` and `VAULT_*` variable above, mounted via `envFrom` into both containers.
-- **hostPath `/etc/svidlet/node`** — the node certificate and key the registration agent keeps renewed, mounted `readOnly` **only into the `svidlet` container**. The policy daemon never sees it; that is the two-process split working.
-- **Secret `svidlet-vault-approle`** — dev and kind clusters only: the AppRole secret ID, at `/etc/svidlet/vault`, likewise only in the `svidlet` container. The production manifest ships no such Secret and marks the volume optional.
-- The example values and the GID chain are in [deploy/daemonset.yaml](../deploy/daemonset.yaml); what a workload does with the result is [USAGE.md](USAGE.md).
+- **`emptyDir` `/node`** (memory-backed; `deploy/with-node-bootstrap` only) — the node certificate and key svidlet-node-bootstrap writes and renews, mounted `readOnly` **only into the `svidlet` container**. The policy daemon never sees it; that is the two-process split working.
+- **Secret `svidlet-vault-approle`** (`deploy/dev` only) — the AppRole secret ID, at `/etc/svidlet/vault`, likewise only in the `svidlet` container. No other variant mounts or ships it.
+- The example values and the GID chain are in [deploy/base/svidlet.yaml](../deploy/base/svidlet.yaml); each variant in `deploy/` sets only `SVIDLET_VAULT_AUTH` and what that method needs ([DEPLOY.md](DEPLOY.md)); what a workload does with the result is [USAGE.md](USAGE.md).

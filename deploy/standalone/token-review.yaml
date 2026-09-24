@@ -1,0 +1,18 @@
+# svidlet itself never calls the API server. Vault does: it validates the
+# token svidlet presents with a TokenReview, using that same token as its
+# credential (vault-bootstrap.sh sets disable_local_ca_jwt=true, which is also
+# what a Vault outside the cluster does). This binding lets that review
+# succeed. system:auth-delegator grants TokenReview and SubjectAccessReview,
+# nothing else.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: svidlet-token-review
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: system:auth-delegator
+subjects:
+  - kind: ServiceAccount
+    name: svidlet
+    namespace: svidlet-system
