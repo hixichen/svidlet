@@ -1,7 +1,5 @@
 //! Helpers shared by the integration tests that publish real volumes.
 
-#![allow(dead_code)]
-
 use std::path::{Path, PathBuf};
 
 /// Remove a test directory, unmounting anything svidlet mounted under it first.

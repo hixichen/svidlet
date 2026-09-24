@@ -1,9 +1,10 @@
 //! A read-only OCI distribution client.
 //!
 //! Only what pulling a signed artifact needs: fetch a manifest by tag with an
-//! ETag so an unchanged manifest costs one 304, and fetch a blob by digest.
+//! `ETag` so an unchanged manifest costs one 304, and fetch a blob by digest.
 //! Nothing is ever pushed.
 
+use std::io::Read as _;
 use std::time::Duration;
 
 use serde::Deserialize;
@@ -74,6 +75,7 @@ impl Reference {
     }
 
     /// The same repository, addressed by digest instead of tag.
+    #[must_use]
     pub fn blob_url(&self, digest: &str) -> String {
         format!(
             "{}://{}/v2/{}/blobs/{digest}",
@@ -81,6 +83,7 @@ impl Reference {
         )
     }
 
+    #[must_use]
     pub fn manifest_url(&self) -> String {
         format!(
             "{}://{}/v2/{}/manifests/{}",
@@ -104,6 +107,7 @@ pub struct Descriptor {
 }
 
 /// What a conditional manifest fetch returned.
+#[derive(Debug)]
 pub enum Fetched {
     /// The registry confirmed nothing changed.
     Unchanged,
@@ -113,6 +117,7 @@ pub enum Fetched {
     },
 }
 
+#[derive(Debug)]
 pub struct Registry {
     agent: Agent,
     /// A bearer token for registries that want one, read from a file on every
@@ -123,13 +128,13 @@ pub struct Registry {
 
 impl Registry {
     pub fn new(
-        ca_cert_pem: Option<String>,
+        ca_cert_pem: Option<&str>,
         token_path: Option<std::path::PathBuf>,
         timeout: Duration,
         max_blob_bytes: usize,
     ) -> Result<Registry, Error> {
         let mut tls = TlsConfig::builder();
-        if let Some(pem) = &ca_cert_pem {
+        if let Some(pem) = ca_cert_pem {
             let cert = Certificate::from_pem(pem.as_bytes()).map_err(|e| {
                 Error::Config(format!("the registry CA certificate is not valid PEM: {e}"))
             })?;
@@ -194,7 +199,6 @@ impl Registry {
         // Capped like a blob read: an OCI manifest is a few kilobytes, and a
         // compromised registry or a misbehaving pull-through cache must not be
         // able to stream gigabytes into a process on a 16 MB budget.
-        use std::io::Read as _;
         let mut body = String::new();
         response
             .body_mut()
@@ -236,7 +240,6 @@ impl Registry {
         // Read through a limited reader rather than trusting Content-Length: a
         // registry that lies about the size must not be able to fill the node's
         // memory.
-        use std::io::Read as _;
         let mut body = Vec::new();
         response
             .body_mut()
@@ -385,14 +388,13 @@ mod tests {
 
     #[test]
     fn a_bad_registry_ca_is_a_configuration_error() {
-        let err = match Registry::new(
-            Some("not a certificate".into()),
+        let Err(err) = Registry::new(
+            Some("not a certificate"),
             None,
             Duration::from_secs(1),
             1024,
-        ) {
-            Ok(_) => panic!("a bad CA certificate must not be ignored"),
-            Err(e) => e,
+        ) else {
+            panic!("a bad CA certificate must not be ignored")
         };
         assert!(matches!(err, Error::Config(_)));
     }

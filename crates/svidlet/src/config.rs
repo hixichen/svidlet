@@ -1,16 +1,18 @@
 //! Configuration, entirely from the environment.
 //!
 //! Everything that varies between clusters is an environment variable, so one
-//! image and one manifest differ only by a ConfigMap.
+//! image and one manifest differ only by a `ConfigMap`.
 
 use std::path::PathBuf;
 use std::time::Duration;
 
-use svidlet_issue::{Cloud, IdPolicy, IdTemplate, KubernetesAuth, SubjectSource};
+use svidlet_issue::profile::Cloud;
+use svidlet_issue::vault::KubernetesAuth;
+use svidlet_issue::{IdPolicy, IdTemplate, SubjectSource};
 
 use crate::log::Level;
 
-/// Volume-context keys the kubelet supplies when the CSIDriver sets
+/// Volume-context keys the kubelet supplies when the `CSIDriver` sets
 /// `podInfoOnMount: true`. These — not pod labels or annotations — are the
 /// source of the workload's identity.
 pub mod volume_context {
@@ -39,9 +41,9 @@ pub struct Config {
 
     /// CSI socket, as this process sees it.
     pub csi_socket: PathBuf,
-    /// Registration socket in the kubelet's plugins_registry directory.
+    /// Registration socket in the kubelet's `plugins_registry` directory.
     pub registration_socket: PathBuf,
-    /// CSI socket path as the *kubelet* sees it, reported by GetInfo. Differs
+    /// CSI socket path as the *kubelet* sees it, reported by `GetInfo`. Differs
     /// from `csi_socket` only if the hostPath mount points somewhere else.
     pub advertised_endpoint: String,
     /// Kubelet root, used to rebuild state after a restart.
@@ -84,7 +86,7 @@ pub struct Config {
     pub ca_refresh_interval: Duration,
     /// How often restart recovery re-runs. A volume that could not be adopted
     /// when it first appeared would otherwise never join the renewal list —
-    /// the kubelet does not re-call NodePublishVolume for a mounted volume —
+    /// the kubelet does not re-call `NodePublishVolume` for a mounted volume —
     /// and its certificate would silently expire under a running pod.
     pub readopt_interval: Duration,
 
@@ -95,7 +97,7 @@ pub struct Config {
     /// Group that owns `tls.key`, so a non-root workload can read it at 0640.
     ///
     /// Set this to the workload's `runAsGroup`. It is independent of the
-    /// kubelet's `fsGroup` handling, which depends on the CSIDriver's
+    /// kubelet's `fsGroup` handling, which depends on the `CSIDriver`'s
     /// `fsGroupPolicy` and on driver capabilities svidlet does not advertise —
     /// so relying on `fsGroup` alone would be relying on behaviour this project
     /// has not verified on a real cluster.
@@ -154,7 +156,7 @@ pub struct BundleSettings {
     pub keep_versions: usize,
     /// Refuse a bundle larger than this, unpacked.
     pub max_bytes: usize,
-    /// Every Nth poll fetches the rollout manifest without its ETag. A 304
+    /// Every Nth poll fetches the rollout manifest without its `ETag`. A 304
     /// carries no body, so a stale cache can answer 304 forever and the node
     /// would never see a manifest body to check `sequence` against. The full
     /// fetch is what makes the freshness fields meaningful.
@@ -274,14 +276,17 @@ impl PolicyConfig {
     }
 
     /// Whether anything is configured for this daemon to do.
+    #[must_use]
     pub fn enabled(&self) -> bool {
         self.stream.enabled && (self.stream.endpoint.is_some() || self.bundle.is_some())
     }
 
+    #[must_use]
     pub fn stream_enabled(&self) -> bool {
         self.stream.enabled && self.stream.endpoint.is_some()
     }
 
+    #[must_use]
     pub fn bundle_enabled(&self) -> bool {
         self.stream.enabled && self.bundle.is_some()
     }
@@ -302,7 +307,7 @@ pub struct VaultSettings {
 ///
 /// `Cert` is the production method — the node certificate registration
 /// issued, bound to the cluster by its URI SAN — and what the shipped
-/// DaemonSet selects. AppRole remains the code default so a bare `cargo run`
+/// `DaemonSet` selects. `AppRole` remains the code default so a bare `cargo run`
 /// against a dev Vault needs nothing else, but it is a shared bearer secret
 /// and belongs on dev and kind clusters only. See docs/DESIGN.md and
 /// docs/ROADMAP.md §3.
@@ -333,6 +338,7 @@ pub enum AuthSettings {
 }
 
 impl AuthSettings {
+    #[must_use]
     pub fn method(&self) -> &'static str {
         match self {
             AuthSettings::AppRole { .. } => "approle",
@@ -363,6 +369,10 @@ impl Config {
 
     /// Build a configuration from an arbitrary variable lookup, so the parsing
     /// rules can be tested without mutating the process environment.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one field per variable; splitting it would scatter the defaults"
+    )]
     pub fn from_source(get: &dyn Fn(&str) -> Option<String>) -> Result<Config> {
         let env = Env(get);
 
@@ -417,8 +427,10 @@ impl Config {
             vault: vault_settings(&env, &cluster)?,
             policy_gid: match env.opt("SVIDLET_POLICY_GID") {
                 None => None,
-                Some(v) => Some(v.parse::<u32>().map_err(|_| {
-                    ConfigError(format!("SVIDLET_POLICY_GID must be a group id, got {v:?}"))
+                Some(v) => Some(v.parse::<u32>().map_err(|e| {
+                    ConfigError(format!(
+                        "SVIDLET_POLICY_GID must be a group id, got {v:?}: {e}"
+                    ))
                 })?),
             },
             policy: PolicyGate {
@@ -432,7 +444,8 @@ impl Config {
             cert_ttl: env.duration("SVIDLET_CERT_TTL", Duration::from_secs(21_600))?,
             cert_subject: match env.opt("SVIDLET_CERT_SUBJECT") {
                 None => SubjectSource::default(),
-                Some(v) => SubjectSource::parse(&v)
+                Some(v) => v
+                    .parse::<SubjectSource>()
                     .map_err(|e| ConfigError(format!("SVIDLET_CERT_SUBJECT: {e}")))?,
             },
             cloud_profile: match env.opt("SVIDLET_CLOUD_PROFILE") {
@@ -451,8 +464,10 @@ impl Config {
             key_mode: env.mode("SVIDLET_KEY_MODE", 0o640)?,
             key_gid: match env.opt("SVIDLET_KEY_GID") {
                 None => None,
-                Some(v) => Some(v.parse::<u32>().map_err(|_| {
-                    ConfigError(format!("SVIDLET_KEY_GID must be a group id, got {v:?}"))
+                Some(v) => Some(v.parse::<u32>().map_err(|e| {
+                    ConfigError(format!(
+                        "SVIDLET_KEY_GID must be a group id, got {v:?}: {e}"
+                    ))
                 })?),
             },
             cert_mode: env.mode("SVIDLET_CERT_MODE", 0o644)?,
@@ -656,7 +671,7 @@ impl Env<'_> {
             None => Ok(default),
             Some(v) => v
                 .parse::<usize>()
-                .map_err(|_| ConfigError(format!("{key} must be a whole number, got {v:?}"))),
+                .map_err(|e| ConfigError(format!("{key} must be a whole number, got {v:?}: {e}"))),
         }
     }
 
@@ -665,7 +680,7 @@ impl Env<'_> {
             None => Ok(default),
             Some(v) => v
                 .parse::<f64>()
-                .map_err(|_| ConfigError(format!("{key} must be a number, got {v:?}"))),
+                .map_err(|e| ConfigError(format!("{key} must be a number, got {v:?}: {e}"))),
         }
     }
 
@@ -797,7 +812,7 @@ mod tests {
 
         let mut vars = base();
         vars.insert("NODE_NAME".into(), "  ".into());
-        assert!(load(vars).is_err());
+        load(vars).unwrap_err();
     }
 
     #[test]
@@ -891,7 +906,7 @@ mod tests {
         let mut vars = base();
         vars.remove("SVIDLET_ROLE_ID");
         vars.insert("SVIDLET_VAULT_AUTH".into(), "token".into());
-        assert!(load(vars).is_ok());
+        load(vars).unwrap();
     }
 
     #[test]
@@ -1105,7 +1120,7 @@ mod tests {
             "spiffe://{trust_domain}/ns/{namespace}/sa/{service_account}",
         )])
         .unwrap();
-        assert!(cfg.id_policy().is_ok());
+        cfg.id_policy().unwrap();
     }
 
     #[test]

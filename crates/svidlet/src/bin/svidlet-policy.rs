@@ -1,6 +1,6 @@
 //! `svidlet-policy` — policy distribution, in its own process.
 //!
-//! Runs beside `svidlet` in the same DaemonSet pod and writes into the same CSI
+//! Runs beside `svidlet` in the same `DaemonSet` pod and writes into the same CSI
 //! volumes, but holds none of svidlet's credentials and does not need root.
 //! See ../svidlet-policy/authz-management-plane.md, "Two processes, one volume".
 
@@ -82,21 +82,21 @@ async fn run(cfg: PolicyConfig) -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let policy = PolicyManager::new(cfg.clone());
-    let daemon = Daemon::new(cfg, policy.clone(), bundle.clone())?;
+    let daemon = Daemon::new(cfg, Arc::clone(&policy), bundle.clone())?;
 
     if stream_enabled {
-        tokio::spawn(grpc::watch_loop(policy.clone(), node_name.clone()));
+        tokio::spawn(grpc::watch_loop(Arc::clone(&policy), node_name.clone()));
     }
     if let Some(source) = &bundle {
-        tokio::spawn(oci::poll_loop(source.clone(), policy.clone()));
+        tokio::spawn(oci::poll_loop(Arc::clone(source), Arc::clone(&policy)));
     }
     if !metrics_addr.is_empty() {
-        tokio::spawn(daemon::serve_metrics(metrics_addr, daemon.clone()));
+        tokio::spawn(daemon::serve_metrics(metrics_addr, Arc::clone(&daemon)));
     }
 
     tokio::select! {
-        _ = daemon::run_loop(daemon) => {}
-        _ = shutdown() => info!("shutting down"),
+        () = daemon::run_loop(daemon) => {}
+        () = shutdown() => info!("shutting down"),
     }
     Ok(())
 }

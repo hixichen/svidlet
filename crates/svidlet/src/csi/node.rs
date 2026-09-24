@@ -1,6 +1,6 @@
 //! CSI Node service — where identity is actually decided.
 //!
-//! The namespace and ServiceAccount come from the kubelet's volume context.
+//! The namespace and `ServiceAccount` come from the kubelet's volume context.
 //! Nothing here reads pod labels or annotations, so a principal who can create
 //! a pod still cannot choose which identity that pod receives.
 
@@ -44,7 +44,7 @@ async fn wait_for_policy(target: &std::path::Path, timeout: std::time::Duration)
 /// The distinction matters in `kubectl describe pod`: `InvalidArgument` says
 /// the request was malformed, `PermissionDenied` says it was well formed and
 /// refused, and `Internal` says the fault is ours.
-fn status_for(e: svidlet_issue::Error) -> Status {
+fn status_for(e: &svidlet_issue::Error) -> Status {
     use svidlet_issue::ErrorCode;
     match e.code() {
         ErrorCode::Identity => Status::invalid_argument(e.to_string()),
@@ -53,6 +53,7 @@ fn status_for(e: svidlet_issue::Error) -> Status {
     }
 }
 
+#[derive(Debug)]
 pub struct NodeService {
     publisher: Arc<Publisher>,
 }
@@ -108,7 +109,10 @@ impl NodeService {
             uid: attrs.pod_uid.clone(),
         };
 
-        let spiffe_id = self.publisher.spiffe_id(&attrs).map_err(status_for)?;
+        let spiffe_id = self
+            .publisher
+            .spiffe_id(&attrs)
+            .map_err(|e| status_for(&e))?;
         let common_name = self.publisher.common_name(&attrs);
         Ok((spiffe_id, common_name, pod))
     }
@@ -134,6 +138,10 @@ impl NodeService {
 
 #[tonic::async_trait]
 impl Node for NodeService {
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the publish sequence and its rollback on each failure read best in order"
+    )]
     async fn node_publish_volume(
         &self,
         request: Request<NodePublishVolumeRequest>,
@@ -156,7 +164,7 @@ impl Node for NodeService {
 
         let (spiffe_id, common_name, pod) = self.identity_from(&req.volume_context)?;
         let target = PathBuf::from(&req.target_path);
-        let publisher = self.publisher.clone();
+        let publisher = Arc::clone(&self.publisher);
 
         // The kubelet retries NodePublishVolume until it succeeds, and calls it
         // again on any subsequent mount of the same volume. Publishing twice
@@ -226,7 +234,7 @@ impl Node for NodeService {
                         error = e,
                     );
                 }
-                return Err(status_for(e));
+                return Err(status_for(&e));
             }
         };
 
@@ -336,15 +344,16 @@ impl Node for NodeService {
             })?;
 
         Metrics::inc(&self.publisher.metrics.unpublished);
-        match removed {
-            Some(entry) => info!(
+        if let Some(entry) = removed {
+            info!(
                 "unpublished",
                 spiffe_id = entry.spiffe_id,
                 volume_id = entry.volume_id,
                 target = req.target_path,
-            ),
+            );
+        } else {
             // Idempotent by contract: the kubelet retries until it gets an OK.
-            None => debug!("unpublish of an unknown volume", target = req.target_path),
+            debug!("unpublish of an unknown volume", target = req.target_path);
         }
         Ok(Response::new(NodeUnpublishVolumeResponse {}))
     }

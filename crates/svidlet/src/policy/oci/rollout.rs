@@ -81,7 +81,7 @@ impl Match {
             return true;
         }
         match self.node_hash_percent {
-            Some(percent) => node_bucket(cluster, node) < percent as u32,
+            Some(percent) => node_bucket(cluster, node) < u32::from(percent),
             None => false,
         }
     }
@@ -121,6 +121,7 @@ impl Rollout {
     }
 
     /// The ring this node belongs to, and the bundle it should be running.
+    #[must_use]
     pub fn target(&self, cluster: &str, node: &str) -> Option<&Ring> {
         self.rings
             .iter()
@@ -190,6 +191,7 @@ pub fn check_freshness(rollout: &Rollout, last_sequence: u64, now: i64) -> Resul
 ///
 /// SHA-256 rather than a language hash: the value has to mean the same thing on
 /// every node and across every build, and `DefaultHasher` guarantees neither.
+#[must_use]
 pub fn node_bucket(cluster: &str, node: &str) -> u32 {
     let mut input = Vec::with_capacity(cluster.len() + node.len() + 1);
     input.extend_from_slice(cluster.as_bytes());
@@ -381,8 +383,8 @@ bundle = "{DIGEST_B}"
     fn a_replayed_manifest_is_refused() {
         let rollout = Rollout::parse(b"schema = 1\nsequence = 7\n").unwrap();
         // First sight, and an equal re-fetch, are fine.
-        assert!(check_freshness(&rollout, 0, 1000).is_ok());
-        assert!(check_freshness(&rollout, 7, 1000).is_ok());
+        check_freshness(&rollout, 0, 1000).unwrap();
+        check_freshness(&rollout, 7, 1000).unwrap();
         // Older than what the node has verified: a replay.
         let err = check_freshness(&rollout, 8, 1000).unwrap_err();
         assert!(matches!(err, super::Error::Stale(_)), "{err}");
@@ -392,7 +394,7 @@ bundle = "{DIGEST_B}"
     #[test]
     fn dropping_the_sequence_after_it_was_introduced_is_a_downgrade() {
         let rollout = Rollout::parse(b"schema = 1\n").unwrap();
-        assert!(check_freshness(&rollout, 0, 1000).is_ok());
+        check_freshness(&rollout, 0, 1000).unwrap();
         let err = check_freshness(&rollout, 3, 1000).unwrap_err();
         assert!(matches!(err, super::Error::Stale(_)), "{err}");
         assert!(err.to_string().contains("downgrade"), "{err}");
@@ -401,7 +403,7 @@ bundle = "{DIGEST_B}"
     #[test]
     fn an_expired_manifest_is_refused_and_a_live_one_is_not() {
         let rollout = Rollout::parse(b"schema = 1\nvalid_until = 2000\n").unwrap();
-        assert!(check_freshness(&rollout, 0, 2000).is_ok());
+        check_freshness(&rollout, 0, 2000).unwrap();
         let err = check_freshness(&rollout, 0, 2001).unwrap_err();
         assert!(matches!(err, super::Error::Stale(_)), "{err}");
         assert!(err.to_string().contains("expired"), "{err}");
@@ -425,16 +427,16 @@ bundle = "{DIGEST_B}"
 
     #[test]
     fn nonsense_manifests_are_refused() {
-        assert!(Rollout::parse(b"not toml at all [[[").is_err());
-        assert!(Rollout::parse(&[0xff, 0xfe]).is_err());
+        Rollout::parse(b"not toml at all [[[").unwrap_err();
+        Rollout::parse(&[0xff, 0xfe]).unwrap_err();
         // A percentage above 100 is a typo, not a wider rollout.
         let toml = format!(
             "schema = 1\n\n[[ring]]\nname = \"all\"\nmatch = {{ node_hash_percent = 250 }}\nbundle = \"{DIGEST_A}\"\n"
         );
-        assert!(Rollout::parse(toml.as_bytes()).is_err());
+        Rollout::parse(toml.as_bytes()).unwrap_err();
         // A nameless ring cannot be reported in a metric.
         let toml = format!("schema = 1\n\n[[ring]]\nname = \"\"\nbundle = \"{DIGEST_A}\"\n");
-        assert!(Rollout::parse(toml.as_bytes()).is_err());
+        Rollout::parse(toml.as_bytes()).unwrap_err();
     }
 
     #[test]

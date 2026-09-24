@@ -15,10 +15,8 @@ use rcgen::{
     Issuer as CaIssuer, KeyPair, KeyUsagePurpose,
 };
 
-use svidlet_issue::{
-    AppRoleAuth, ErrorCode, Issuer, SignRequest, SpiffeId, VaultEndpoint, VaultHttp, VaultIssuer,
-    VaultPkiConfig,
-};
+use svidlet_issue::vault::{AppRoleAuth, VaultEndpoint, VaultHttp, VaultIssuer, VaultPkiConfig};
+use svidlet_issue::{ErrorCode, Issuer, SignRequest, SpiffeId};
 
 /// How the stub should answer the next `pki/sign` call.
 #[derive(Clone, Copy, PartialEq)]
@@ -64,10 +62,10 @@ impl Stub {
             addr,
         });
 
-        let serving = stub.clone();
+        let serving = Arc::clone(&stub);
         std::thread::spawn(move || {
             for conn in listener.incoming().flatten() {
-                let stub = serving.clone();
+                let stub = Arc::clone(&serving);
                 std::thread::spawn(move || stub.handle(conn));
             }
         });
@@ -200,7 +198,7 @@ impl Stub {
             .unwrap(),
         );
         VaultIssuer::new(
-            http.clone(),
+            Arc::clone(&http),
             VaultPkiConfig {
                 mount: "pki".into(),
                 role: "spiffe-cluster-a".into(),
@@ -328,7 +326,7 @@ fn a_ca_endpoint_that_does_not_return_pem_is_a_protocol_error() {
     );
     // A mount that the stub does not serve answers 404.
     let issuer = VaultIssuer::new(
-        http.clone(),
+        Arc::clone(&http),
         VaultPkiConfig {
             mount: "nope".into(),
             role: "r".into(),

@@ -18,10 +18,11 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use svidlet_issue::{
-    AppRoleAuth, CertAuth, Cloud, IdPolicy, IdTemplate, Issuer, SignRequest, SpiffeId,
-    StaticTokenAuth, VaultEndpoint, VaultHttp, VaultIssuer, VaultPkiConfig, WorkloadAttributes,
+use svidlet_issue::profile::Cloud;
+use svidlet_issue::vault::{
+    AppRoleAuth, CertAuth, StaticTokenAuth, VaultEndpoint, VaultHttp, VaultIssuer, VaultPkiConfig,
 };
+use svidlet_issue::{IdPolicy, IdTemplate, Issuer, SignRequest, SpiffeId, WorkloadAttributes};
 
 struct Env {
     http: Arc<VaultHttp>,
@@ -84,10 +85,10 @@ fn env() -> Option<Env> {
 impl Env {
     fn approle_issuer(&self) -> VaultIssuer<AppRoleAuth> {
         VaultIssuer::new(
-            self.http.clone(),
+            Arc::clone(&self.http),
             self.pki.clone(),
             AppRoleAuth::new(
-                self.http.clone(),
+                Arc::clone(&self.http),
                 self.approle_mount.clone(),
                 self.role_id.clone(),
                 self.secret_id_path.clone(),
@@ -97,10 +98,10 @@ impl Env {
 
     fn cert_issuer(&self, cert: PathBuf, key: PathBuf) -> VaultIssuer<CertAuth> {
         VaultIssuer::new(
-            self.http.clone(),
+            Arc::clone(&self.http),
             self.pki.clone(),
             CertAuth::new(
-                self.http.clone(),
+                Arc::clone(&self.http),
                 self.cert_mount.clone(),
                 self.cert_role.clone(),
                 cert,
@@ -115,7 +116,7 @@ impl Env {
 
     fn token_issuer(&self) -> VaultIssuer<StaticTokenAuth> {
         VaultIssuer::new(
-            self.http.clone(),
+            Arc::clone(&self.http),
             self.pki.clone(),
             StaticTokenAuth::new(self.token_path.clone()),
         )
@@ -162,7 +163,7 @@ fn vault_signs_the_csr_svidlet_builds() {
     let facts = svidlet_issue::assert_identity(&bundle.cert_chain_pem, &id).unwrap();
     assert_eq!(facts.spiffe_id, id);
     assert!(
-        (3000..=3700).contains(&(bundle.lifetime_secs() as i64)),
+        (3000..=3700).contains(&bundle.lifetime_secs()),
         "lifetime {}s",
         bundle.lifetime_secs()
     );
@@ -358,10 +359,10 @@ fn a_bad_secret_id_is_reported_as_an_auth_failure() {
     std::fs::write(&bogus, "00000000-0000-0000-0000-000000000000").unwrap();
 
     let issuer = VaultIssuer::new(
-        env.http.clone(),
+        Arc::clone(&env.http),
         env.pki.clone(),
         AppRoleAuth::new(
-            env.http.clone(),
+            Arc::clone(&env.http),
             env.approle_mount.clone(),
             env.role_id.clone(),
             bogus.clone(),

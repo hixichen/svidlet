@@ -94,14 +94,16 @@ fn tar(files: &[(&str, &[u8])]) -> Vec<u8> {
 }
 
 fn digest_of(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+    // Computed here rather than with the crate's own helper, so a bug there
+    // cannot make a wrong digest look right.
     let hash = ring::digest::digest(&ring::digest::SHA256, bytes);
-    format!(
-        "sha256:{}",
-        hash.as_ref()
-            .iter()
-            .map(|b| format!("{b:02x}"))
-            .collect::<String>()
-    )
+    hash.as_ref()
+        .iter()
+        .fold(String::from("sha256:"), |mut out, b| {
+            let _ = write!(out, "{b:02x}");
+            out
+        })
 }
 
 /// A bundle as CI would build it: content plus its manifest.
@@ -146,10 +148,10 @@ impl Stub {
             addr: listener.local_addr().unwrap().to_string(),
         });
 
-        let serving = stub.clone();
+        let serving = Arc::clone(&stub);
         std::thread::spawn(move || {
             for conn in listener.incoming().flatten() {
-                let stub = serving.clone();
+                let stub = Arc::clone(&serving);
                 std::thread::spawn(move || stub.handle(conn));
             }
         });
@@ -173,7 +175,7 @@ impl Stub {
 
     /// Point the rollout tag at a signed manifest.
     fn publish_rollout(&self, envelope: Vec<u8>) {
-        let digest = self.publish_blob(envelope.clone());
+        let digest = self.publish_blob(envelope);
         let mut content = self.content.lock().unwrap();
         content.tags.insert("current".into(), digest.into_bytes());
     }
@@ -211,7 +213,8 @@ impl Stub {
             body.len()
         );
         if let Some(etag) = etag {
-            head.push_str(&format!("ETag: {etag}\r\n"));
+            use std::fmt::Write as _;
+            let _ = write!(head, "ETag: {etag}\r\n");
         }
         head.push_str("Connection: close\r\n\r\n");
         let _ = conn.write_all(head.as_bytes());
@@ -243,7 +246,7 @@ impl Stub {
                 "layers": [{
                     "mediaType": "application/vnd.svidlet.rollout.v1+json",
                     "digest": layer_digest,
-                    "size": content.blobs.get(&layer_digest).map(|b| b.len()).unwrap_or(0),
+                    "size": content.blobs.get(&layer_digest).map_or(0, std::vec::Vec::len),
                 }],
             });
             return (200, Some(etag), manifest.to_string().into_bytes());
@@ -596,8 +599,8 @@ fn a_bundle_that_does_not_match_its_signed_digest_is_refused() {
         let mut content = stub.content.lock().unwrap();
         content
             .blobs
-            .insert(digest.clone(), bundle("tampered", "allow := true"));
-    }
+            .insert(digest.clone(), bundle("tampered", "allow := true"))
+    };
     stub.publish_rollout(ci.sign(manifest(&ring("all", "", &digest)).as_bytes()));
 
     let source = source(&stub, &ci, dir.clone(), "prod-eu", "node-1");
@@ -637,7 +640,7 @@ fn an_unreachable_registry_leaves_the_node_serving_what_it_has() {
 
     // And it recovers on its own when the registry comes back.
     stub.set_offline(false);
-    assert!(source.poll().is_ok());
+    source.poll().unwrap();
 
     std::fs::remove_dir_all(&dir).unwrap();
 }
@@ -693,10 +696,9 @@ fn a_node_resumes_its_bundle_after_a_restart_without_the_registry() {
 
     let digest = stub.publish_blob(bundle("v1", "allow := true"));
     stub.publish_rollout(ci.sign(manifest(&ring("all", "", &digest)).as_bytes()));
-    {
-        let source = source(&stub, &ci, dir.clone(), "prod-eu", "node-1");
-        assert!(source.poll().unwrap().is_some());
-    }
+    let first = source(&stub, &ci, dir.clone(), "prod-eu", "node-1");
+    assert!(first.poll().unwrap().is_some());
+    drop(first);
 
     // Restart with the registry down: the node still knows what it is running,
     // so pods are served immediately rather than after the first poll.
@@ -768,9 +770,8 @@ fn a_source_without_a_trusted_key_refuses_to_start() {
     let mut settings = settings(&stub, String::new(), dir.clone());
     settings.public_key = None;
 
-    let err = match BundleSource::new(settings, "prod".into(), "node-1".into()) {
-        Ok(_) => panic!("a source with no key must not start"),
-        Err(e) => e,
+    let Err(err) = BundleSource::new(settings, "prod".into(), "node-1".into()) else {
+        panic!("a source with no key must not start")
     };
     assert!(matches!(err, Error::Config(_)));
     assert!(err.to_string().contains("public key"));

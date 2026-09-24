@@ -97,7 +97,7 @@ fn config(root: &Path) -> PolicyConfig {
 
 fn daemon_for(cfg: PolicyConfig) -> (Arc<Daemon>, Arc<PolicyManager>) {
     let policy = PolicyManager::new(cfg.clone());
-    let daemon = Daemon::new(cfg, policy.clone(), None).unwrap();
+    let daemon = Daemon::new(cfg, Arc::clone(&policy), None).unwrap();
     (daemon, policy)
 }
 
@@ -332,7 +332,7 @@ async fn the_run_loop_converges_a_node_on_its_own() {
     policy.subscribe(API);
     policy.apply_fleet(bundle("r1", &[("authz.rego", "allow")]));
 
-    let running = tokio::spawn(svidlet::policy::daemon::run_loop(daemon.clone()));
+    let running = tokio::spawn(svidlet::policy::daemon::run_loop(Arc::clone(&daemon)));
     let _ = &policy;
     for _ in 0..100 {
         if volume::published_revision(&target).as_deref() == Some("r1") {
@@ -428,8 +428,8 @@ mod stream {
         ) -> Result<Response<Self::WatchStream>, Status> {
             let mut inbound = request.into_inner();
             let (tx, rx) = mpsc::unbounded_channel();
-            let subscribes = self.subscribes.clone();
-            let revision = self.revision.clone();
+            let subscribes = Arc::clone(&self.subscribes);
+            let revision = Arc::clone(&self.revision);
 
             tokio::spawn(async move {
                 while let Some(Ok(message)) = inbound.next().await {
@@ -461,7 +461,7 @@ mod stream {
         let addr = format!("http://{}", listener.local_addr().unwrap());
         let subscribes = Arc::new(AtomicUsize::new(0));
         let backend = Backend {
-            subscribes: subscribes.clone(),
+            subscribes: Arc::clone(&subscribes),
             revision: Arc::new(Mutex::new("git-r1".into())),
         };
         let server = tokio::spawn(async move {
@@ -483,10 +483,10 @@ mod stream {
         // for that identity, the backend answers, and the bundle lands beside
         // the certificate.
         let watcher = tokio::spawn(svidlet::policy::grpc::watch_loop(
-            policy.clone(),
+            Arc::clone(&policy),
             "node-1".into(),
         ));
-        let running = tokio::spawn(svidlet::policy::daemon::run_loop(daemon.clone()));
+        let running = tokio::spawn(svidlet::policy::daemon::run_loop(Arc::clone(&daemon)));
 
         // Watch the path a workload watches, not svidlet's internal one.
         for _ in 0..200 {

@@ -1,6 +1,6 @@
 //! Error type and the stable error-code taxonomy.
 //!
-//! Every failure carries an [`ErrorCode`]. The code is a stable, snake_case
+//! Every failure carries an [`ErrorCode`]. The code is a stable, `snake_case`
 //! string that is safe to use as a Prometheus label value and that operators
 //! can alert on, so a dashboard does not have to match on log text. Codes are
 //! part of the public interface: rename one and you break somebody's alert.
@@ -38,6 +38,7 @@ pub enum ErrorCode {
 
 impl ErrorCode {
     /// The stable string form, used in logs and as a metric label.
+    #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
             ErrorCode::Config => "config",
@@ -70,6 +71,7 @@ impl ErrorCode {
     ];
 
     /// Index into a fixed-size array of per-code counters.
+    #[must_use]
     pub const fn index(self) -> usize {
         self as usize
     }
@@ -96,6 +98,7 @@ pub enum Error {
 }
 
 impl Error {
+    #[must_use]
     pub fn code(&self) -> ErrorCode {
         match self {
             Error::Config(_) => ErrorCode::Config,
@@ -116,14 +119,15 @@ impl Error {
     /// Renewal backs off and retries on these and gives up loudly on the rest:
     /// retrying a malformed request only burns the PKI backend's rate-limit
     /// quota and buries the real cause in a repeated warning.
+    #[must_use]
     pub fn is_retryable(&self) -> bool {
         match self {
-            Error::Transport(_) | Error::Io(_) => true,
+            // An outage or a full disk passes; a rejected token is recoverable
+            // because the caller logs in again first.
+            Error::Transport(_) | Error::Io(_) | Error::Auth(_) => true,
             // 429 and 5xx are transient: Vault answers 503 while sealed or
             // standing by, and 429 when a rate-limit quota is exceeded.
             Error::Backend { status, .. } => *status == 429 || *status >= 500,
-            // A rejected token is recoverable — the caller re-logs in first.
-            Error::Auth(_) => true,
             Error::Config(_)
             | Error::Identity(_)
             | Error::Policy(_)
@@ -135,6 +139,7 @@ impl Error {
 
     /// Whether the failure is the caller's fault rather than ours. Drives the
     /// gRPC status the CSI plugin returns to the kubelet.
+    #[must_use]
     pub fn is_caller_error(&self) -> bool {
         matches!(self, Error::Identity(_) | Error::Policy(_))
     }

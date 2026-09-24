@@ -90,7 +90,7 @@ async fn run_stream(
     // the manager's. Re-derived from scratch on every connection, so a
     // reconnect resubscribes everything without extra bookkeeping.
     let sync = tokio::spawn(sync_subscriptions(
-        manager.clone(),
+        Arc::clone(manager),
         node_name.to_string(),
         tx,
     ));
@@ -337,7 +337,7 @@ mod tests {
     async fn subscription_sync_sends_subscribes_then_unsubscribes() {
         let m = manager();
         let (tx, mut rx) = mpsc::unbounded_channel();
-        let task = tokio::spawn(sync_subscriptions(m.clone(), "node-1".into(), tx));
+        let task = tokio::spawn(sync_subscriptions(Arc::clone(&m), "node-1".into(), tx));
 
         let id = "spiffe://example.org/ns/a/sa/b";
         m.subscribe(id);
@@ -352,7 +352,9 @@ mod tests {
                 assert_eq!(s.spiffe_id, id);
                 assert_eq!(s.known_revision, "");
             }
-            other => panic!("expected a subscribe, got {other:?}"),
+            other @ watch_request::Request::Unsubscribe(_) => {
+                panic!("expected a subscribe, got {other:?}")
+            }
         }
 
         m.unsubscribe(id);
@@ -362,7 +364,9 @@ mod tests {
             .unwrap();
         match second.request.unwrap() {
             watch_request::Request::Unsubscribe(u) => assert_eq!(u.spiffe_id, id),
-            other => panic!("expected an unsubscribe, got {other:?}"),
+            other @ watch_request::Request::Subscribe(_) => {
+                panic!("expected an unsubscribe, got {other:?}")
+            }
         }
 
         task.abort();
@@ -376,7 +380,7 @@ mod tests {
         m.apply(id, PolicyBundle::build("r7".into(), vec![]).unwrap());
 
         let (tx, mut rx) = mpsc::unbounded_channel();
-        let task = tokio::spawn(sync_subscriptions(m.clone(), "node-1".into(), tx));
+        let task = tokio::spawn(sync_subscriptions(Arc::clone(&m), "node-1".into(), tx));
 
         let first = tokio::time::timeout(Duration::from_secs(2), rx.recv())
             .await
@@ -385,7 +389,9 @@ mod tests {
         match first.request.unwrap() {
             // After a reconnect the backend can skip an identical bundle.
             watch_request::Request::Subscribe(s) => assert_eq!(s.known_revision, "r7"),
-            other => panic!("expected a subscribe, got {other:?}"),
+            other @ watch_request::Request::Unsubscribe(_) => {
+                panic!("expected a subscribe, got {other:?}")
+            }
         }
         task.abort();
     }
@@ -413,6 +419,6 @@ mod tests {
     #[tokio::test]
     async fn connecting_to_a_bad_endpoint_is_an_error_not_a_panic() {
         let m = manager();
-        assert!(connect(&m, "not a url").await.is_err());
+        connect(&m, "not a url").await.unwrap_err();
     }
 }

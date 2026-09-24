@@ -18,7 +18,7 @@ pub async fn renewal_loop(publisher: Arc<Publisher>) {
     let interval = publisher.cfg.renew_check_interval;
     loop {
         tokio::time::sleep(interval).await;
-        renew_due(publisher.clone()).await;
+        renew_due(Arc::clone(&publisher)).await;
     }
 }
 
@@ -130,7 +130,7 @@ pub async fn ca_refresh_loop(publisher: Arc<Publisher>) {
     let interval = publisher.cfg.ca_refresh_interval;
     loop {
         tokio::time::sleep(interval).await;
-        refresh_ca_once(publisher.clone()).await;
+        refresh_ca_once(Arc::clone(&publisher)).await;
     }
 }
 
@@ -170,7 +170,7 @@ pub async fn adopt_loop(publisher: Arc<Publisher>) {
     let interval = publisher.cfg.readopt_interval;
     loop {
         tokio::time::sleep(interval).await;
-        let adopting = publisher.clone();
+        let adopting = Arc::clone(&publisher);
         let outcome = tokio::task::spawn_blocking(move || {
             crate::recover::adopt(
                 &adopting.cfg,

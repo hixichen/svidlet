@@ -138,7 +138,7 @@ fn field(header: &[u8], at: usize, len: usize) -> Result<String, Error> {
     let end = slice.iter().position(|b| *b == 0).unwrap_or(len);
     std::str::from_utf8(&slice[..end])
         .map(|s| s.trim().to_string())
-        .map_err(|_| Error::Malformed("bundle header is not valid UTF-8".into()))
+        .map_err(|e| Error::Malformed(format!("bundle header is not valid UTF-8: {e}")))
 }
 
 fn octal(header: &[u8], at: usize, len: usize) -> Result<usize, Error> {
@@ -148,7 +148,7 @@ fn octal(header: &[u8], at: usize, len: usize) -> Result<usize, Error> {
         return Ok(0);
     }
     usize::from_str_radix(text, 8)
-        .map_err(|_| Error::Malformed(format!("bundle header field {text:?} is not octal")))
+        .map_err(|e| Error::Malformed(format!("bundle header field {text:?} is not octal: {e}")))
 }
 
 #[cfg(test)]
@@ -157,6 +157,7 @@ pub mod testkit {
 
     use super::BLOCK;
 
+    #[must_use]
     pub fn build(files: &[(&str, &[u8])]) -> Vec<u8> {
         let mut out = Vec::new();
         for (name, content) in files {
@@ -171,6 +172,7 @@ pub mod testkit {
 
     /// A tar with one entry of an arbitrary type flag and mode, for the cases
     /// a normal archiver will not produce.
+    #[must_use]
     pub fn build_raw(name: &str, content: &[u8], type_flag: u8, mode: u32) -> Vec<u8> {
         let mut out = Vec::new();
         out.extend_from_slice(&header(name, content.len(), type_flag, mode));
@@ -240,7 +242,7 @@ mod tests {
     #[test]
     fn content_of_every_length_survives_block_padding() {
         for size in [0usize, 1, 511, 512, 513, 1024, 2000] {
-            let content: Vec<u8> = (0..size).map(|i| (i % 251) as u8).collect();
+            let content: Vec<u8> = (0..size).map(|i| u8::try_from(i % 251).unwrap()).collect();
             let entries = extract(&build(&[("a", &content), ("b", b"tail")]), LIMIT).unwrap();
             assert_eq!(entries[0].content, content, "size {size}");
             assert_eq!(entries[1].content, b"tail", "size {size}");
@@ -294,7 +296,7 @@ mod tests {
             let err = extract(&build_raw("a", b"x", b'0', mode), LIMIT).unwrap_err();
             assert!(matches!(err, Error::Rejected(_)), "mode {mode:o}");
         }
-        assert!(extract(&build_raw("a", b"x", b'0', 0o644), LIMIT).is_ok());
+        extract(&build_raw("a", b"x", b'0', 0o644), LIMIT).unwrap();
     }
 
     #[test]
@@ -305,7 +307,7 @@ mod tests {
         assert!(matches!(err, Error::Rejected(_)));
         assert!(err.to_string().contains("1000 byte limit"));
 
-        assert!(extract(&tar, 2000).is_ok());
+        extract(&tar, 2000).unwrap();
     }
 
     #[test]

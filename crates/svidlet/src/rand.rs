@@ -1,8 +1,8 @@
-//! A SplitMix64 seeded from the operating system.
+//! A `SplitMix64` seeded from the operating system.
 //!
 //! Renewal jitter needs to be unpredictable enough to spread a fleet, not
 //! cryptographically strong — the certificate keys come from `ring`, not from
-//! here. Keeping this at ~30 lines avoids a dependency in the DaemonSet.
+//! here. Keeping this at ~30 lines avoids a dependency in the `DaemonSet`.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -25,11 +25,15 @@ pub fn seed() {
     }
     .unwrap_or_else(|| {
         use std::time::{SystemTime, UNIX_EPOCH};
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "only the low 64 bits of the clock matter for a seed"
+        )]
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_nanos() as u64)
             .unwrap_or(0);
-        nanos ^ ((std::process::id() as u64) << 32)
+        nanos ^ (u64::from(std::process::id()) << 32)
     });
     STATE.store(seed | 1, Ordering::Relaxed);
 }
@@ -43,17 +47,20 @@ pub fn next_u64() -> u64 {
 }
 
 /// Uniform in `[0, 1)`.
+#[must_use]
 pub fn unit() -> f64 {
     (next_u64() >> 11) as f64 / (1u64 << 53) as f64
 }
 
 /// Uniform in `[low, high]`, inclusive; returns `low` if the range is empty.
+#[must_use]
 pub fn range_i64(low: i64, high: i64) -> i64 {
     if high <= low {
         return low;
     }
-    let span = (high - low) as u64 + 1;
-    low + (next_u64() % span) as i64
+    let span = high.abs_diff(low).saturating_add(1);
+    // The offset is below `span`, so the sum stays within `[low, high]`.
+    low.saturating_add_unsigned(next_u64() % span)
 }
 
 #[cfg(test)]
@@ -61,6 +68,11 @@ mod tests {
     use super::*;
 
     #[test]
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "bucketing samples in [0, 1) into 1000 bins"
+    )]
     fn unit_stays_in_range_and_varies() {
         seed();
         let samples: Vec<f64> = (0..1000).map(|_| unit()).collect();

@@ -41,7 +41,7 @@ release: ## release build of the whole workspace
 	$(RUN) cargo build --release --workspace
 
 .PHONY: test
-test: ## unit + integration tests (270; no cluster, no Vault needed)
+test: ## unit + integration tests (273; no cluster, no Vault needed)
 	$(RUN) cargo test --workspace
 
 .PHONY: test-vault
@@ -67,8 +67,12 @@ fmt-check: ## fail if any source is not rustfmt-clean
 	$(RUN) cargo fmt --all -- --check
 
 .PHONY: clippy
-clippy: ## clippy over the workspace, all targets
-	$(RUN) cargo clippy --workspace --all-targets
+clippy: ## clippy over the workspace, all targets; any warning fails (lint set: Cargo.toml)
+	$(RUN) cargo clippy --workspace --all-targets -- -D warnings
+
+.PHONY: msrv
+msrv: ## build everything on the minimum supported Rust (rust-version in Cargo.toml)
+	$(RUN) cargo +$$(sed -n 's/^rust-version = "\(.*\)"/\1/p' Cargo.toml) build --workspace --all-targets
 
 # ---------------------------------------------------------------- measurement
 

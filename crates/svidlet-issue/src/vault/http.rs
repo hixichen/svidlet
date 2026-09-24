@@ -37,6 +37,11 @@ impl std::fmt::Debug for VaultHttp {
 }
 
 impl VaultHttp {
+    /// Build a client for one Vault cluster.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Config`] when `endpoint.ca_cert_pem` is not a PEM certificate.
     pub fn new(endpoint: VaultEndpoint) -> Result<VaultHttp> {
         VaultHttp::build(endpoint, None)
     }
@@ -48,6 +53,11 @@ impl VaultHttp {
     /// is what the next login presents. A PEM that does not parse is an auth
     /// error, not a configuration one: the likeliest cause is a renewer caught
     /// mid-write, and the next attempt will read a whole file.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Auth`] when the chain holds no certificate or the key does not
+    /// parse; [`Error::Config`] when the endpoint's own CA does not.
     pub fn with_client_cert(&self, cert_chain_pem: &str, key_pem: &str) -> Result<VaultHttp> {
         let mut chain = Vec::new();
         for item in ureq::tls::parse_pem(cert_chain_pem.as_bytes()) {
@@ -96,6 +106,7 @@ impl VaultHttp {
         })
     }
 
+    #[must_use]
     pub fn url(&self, path: &str) -> String {
         format!(
             "{}/v1/{}",
@@ -105,6 +116,12 @@ impl VaultHttp {
     }
 
     /// POST JSON and decode a JSON answer.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Transport`] when Vault cannot be reached, [`Error::Backend`]
+    /// for a non-2xx answer (with Vault's error text), and
+    /// [`Error::Protocol`] when the answer is not the expected JSON.
     pub fn post_json<T: serde::de::DeserializeOwned>(
         &self,
         path: &str,
@@ -141,6 +158,11 @@ impl VaultHttp {
     }
 
     /// GET a plain-text body. Vault's `ca_chain` endpoint returns PEM, not JSON.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Transport`] when Vault cannot be reached, and
+    /// [`Error::Backend`] for a non-2xx answer.
     pub fn get_text(&self, path: &str) -> Result<String> {
         let url = self.url(path);
         let mut req = self.agent.get(&url);

@@ -3,7 +3,7 @@
 //! The SPIFFE URI SAN is the identity; the Subject carries no authority. It is
 //! still worth filling, because some relying parties insist on one: AWS IAM
 //! Roles Anywhere refuses a certificate with an empty Subject and copies its
-//! Common Name into the session's `sourceIdentity`, which is what CloudTrail
+//! Common Name into the session's `sourceIdentity`, which is what `CloudTrail`
 //! then shows. A pod name there is a useful breadcrumb; an empty Subject there
 //! is a failed `CreateSession`.
 //!
@@ -26,7 +26,7 @@ pub enum SubjectSource {
     /// No Subject at all. What svidlet did before cloud federation; AWS IAM
     /// Roles Anywhere will not accept such a certificate.
     None,
-    /// `CN=<pod name>` — distinct per pod, so CloudTrail can tell replicas
+    /// `CN=<pod name>` — distinct per pod, so `CloudTrail` can tell replicas
     /// apart. The default.
     #[default]
     PodName,
@@ -35,8 +35,10 @@ pub enum SubjectSource {
     ServiceAccount,
 }
 
-impl SubjectSource {
-    pub fn parse(text: &str) -> Result<SubjectSource> {
+impl std::str::FromStr for SubjectSource {
+    type Err = Error;
+
+    fn from_str(text: &str) -> Result<SubjectSource> {
         match text {
             "none" => Ok(SubjectSource::None),
             "pod_name" => Ok(SubjectSource::PodName),
@@ -46,7 +48,16 @@ impl SubjectSource {
             ))),
         }
     }
+}
 
+impl std::fmt::Display for SubjectSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl SubjectSource {
+    #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
             SubjectSource::None => "none",
@@ -61,6 +72,7 @@ impl SubjectSource {
     /// An attribute that is missing or would not survive as a CN yields no
     /// Subject rather than a failed issuance: the certificate is still a valid
     /// SVID for mTLS, and the cloud-profile check reports the gap.
+    #[must_use]
     pub fn common_name(self, attrs: &WorkloadAttributes) -> Option<String> {
         match self {
             SubjectSource::None => None,
@@ -73,7 +85,7 @@ impl SubjectSource {
 /// Make a Common Name from a workload attribute.
 ///
 /// Accepts only the characters AWS allows in a `sourceIdentity`
-/// (`[A-Za-z0-9_+=,.@-]`), which covers every valid pod and ServiceAccount
+/// (`[A-Za-z0-9_+=,.@-]`), which covers every valid pod and `ServiceAccount`
 /// name, and truncates to [`MAX_COMMON_NAME_LEN`] bytes. A pod name can be up
 /// to 253 characters; the first 64 still identify a Deployment's pods, since
 /// the random suffix is what gets cut only when the name is already very long.
@@ -86,6 +98,7 @@ pub fn common_name(raw: &str) -> Option<String> {
 }
 
 /// `[\w+=,.@-]`, the character class AWS documents for `sourceIdentity`.
+#[must_use]
 pub fn is_source_identity_byte(b: u8) -> bool {
     b.is_ascii_alphanumeric() || matches!(b, b'_' | b'+' | b'=' | b',' | b'.' | b'@' | b'-')
 }
@@ -128,9 +141,9 @@ mod tests {
             SubjectSource::PodName,
             SubjectSource::ServiceAccount,
         ] {
-            assert_eq!(SubjectSource::parse(s.as_str()).unwrap(), s);
+            assert_eq!(s.to_string().parse::<SubjectSource>().unwrap(), s);
         }
-        let err = SubjectSource::parse("namespace").unwrap_err();
+        let err = "namespace".parse::<SubjectSource>().unwrap_err();
         assert_eq!(err.code(), crate::error::ErrorCode::Config);
     }
 

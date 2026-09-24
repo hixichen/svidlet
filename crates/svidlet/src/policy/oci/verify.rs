@@ -47,7 +47,10 @@ pub struct PublicKey {
 
 impl std::fmt::Debug for PublicKey {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("PublicKey").field("id", &self.id).finish()
+        // The key bytes are public but unreadable in a log; the id names them.
+        f.debug_struct("PublicKey")
+            .field("id", &self.id)
+            .finish_non_exhaustive()
     }
 }
 
@@ -55,7 +58,7 @@ impl PublicKey {
     /// Accept a key as base64, hex, or a PEM block.
     ///
     /// An Ed25519 public key is 32 bytes; a PEM `PUBLIC KEY` wraps it in
-    /// SubjectPublicKeyInfo, whose last 32 bytes are the key itself.
+    /// `SubjectPublicKeyInfo`, whose last 32 bytes are the key itself.
     pub fn parse(text: &str) -> Result<PublicKey, Error> {
         let text = text.trim();
         let bytes = if text.contains("-----BEGIN") {
@@ -102,7 +105,8 @@ impl PublicKey {
     pub fn verify(&self, payload: &[u8], signature: &[u8]) -> Result<(), Error> {
         UnparsedPublicKey::new(&ED25519, &self.raw)
             .verify(payload, signature)
-            .map_err(|_| {
+            // ring's error is deliberately opaque: it says only "no".
+            .map_err(|ring::error::Unspecified| {
                 Error::Signature(format!(
                     "the signature does not verify against trusted key {}",
                     self.id
@@ -142,12 +146,15 @@ pub fn open(envelope_json: &[u8], key: &PublicKey) -> Result<Vec<u8>, Error> {
 }
 
 /// `sha256:<hex>` over `bytes`, in the form OCI uses.
+#[must_use]
 pub fn sha256_digest(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
     let hash = digest::digest(&digest::SHA256, bytes);
     let mut out = String::with_capacity(7 + 64);
     out.push_str("sha256:");
     for byte in hash.as_ref() {
-        out.push_str(&format!("{byte:02x}"));
+        // Writing to a String cannot fail.
+        let _ = write!(out, "{byte:02x}");
     }
     out
 }
@@ -179,6 +186,7 @@ pub mod testkit {
     use ring::rand::SystemRandom;
     use ring::signature::{Ed25519KeyPair, KeyPair};
 
+    #[derive(Debug)]
     pub struct Signer {
         pair: Ed25519KeyPair,
     }
@@ -190,6 +198,7 @@ pub mod testkit {
     }
 
     impl Signer {
+        #[must_use]
         pub fn new() -> Signer {
             let rng = SystemRandom::new();
             let pkcs8 = Ed25519KeyPair::generate_pkcs8(&rng).unwrap();
@@ -198,20 +207,26 @@ pub mod testkit {
             }
         }
 
+        #[must_use]
         pub fn public_key_base64(&self) -> String {
             base64::engine::general_purpose::STANDARD.encode(self.pair.public_key().as_ref())
         }
 
+        #[must_use]
         pub fn public_key_hex(&self) -> String {
+            use std::fmt::Write as _;
             self.pair
                 .public_key()
                 .as_ref()
                 .iter()
-                .map(|b| format!("{b:02x}"))
-                .collect()
+                .fold(String::new(), |mut out, b| {
+                    let _ = write!(out, "{b:02x}");
+                    out
+                })
         }
 
         /// Build the envelope CI would push.
+        #[must_use]
         pub fn envelope(&self, payload: &[u8]) -> Vec<u8> {
             let b64 = base64::engine::general_purpose::STANDARD;
             serde_json::json!({
@@ -329,7 +344,7 @@ mod tests {
             sha256_digest(b""),
             "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
         );
-        assert!(check_digest(b"", &sha256_digest(b"")).is_ok());
+        check_digest(b"", &sha256_digest(b"")).unwrap();
 
         let err = check_digest(b"tampered", &sha256_digest(b"original")).unwrap_err();
         assert!(matches!(err, Error::Signature(_)));

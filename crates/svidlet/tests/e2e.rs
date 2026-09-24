@@ -1,12 +1,13 @@
 //! End-to-end test of the node plugin against a real signing CA.
 //!
 //! Everything below the gRPC method is the production path: the same
-//! `NodeService`, `Publisher`, `Store` and volume writer the DaemonSet runs.
+//! `NodeService`, `Publisher`, `Store` and volume writer the `DaemonSet` runs.
 //! Only the PKI backend is local — a `TestCa` that parses the CSR svidlet
 //! produced and signs it the way Vault would.
 
 mod common;
 
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -220,7 +221,10 @@ fn config_with_gids(
         policy_gid,
         cert_ttl: std::time::Duration::from_secs(3600),
         cert_subject: svidlet_issue::SubjectSource::PodName,
-        cloud_profile: vec![svidlet_issue::Cloud::Aws, svidlet_issue::Cloud::Gcp],
+        cloud_profile: vec![
+            svidlet_issue::profile::Cloud::Aws,
+            svidlet_issue::profile::Cloud::Gcp,
+        ],
         renew_fraction: (0.5, 0.7),
         renew_check_interval: std::time::Duration::from_secs(30),
         startup_spread: std::time::Duration::from_secs(300),
@@ -263,13 +267,13 @@ fn fixture_with(
     let publisher = Arc::new(Publisher::new(
         Arc::new(cfg),
         id_policy,
-        ca.clone(),
-        store.clone(),
+        Arc::<TestCa>::clone(&ca),
+        Arc::clone(&store),
         Arc::new(Metrics::default()),
     ));
     publisher.prime_ca().unwrap();
     Fixture {
-        node: NodeService::new(publisher.clone()),
+        node: NodeService::new(Arc::clone(&publisher)),
         publisher,
         ca,
         store,
@@ -289,13 +293,13 @@ fn farm_fixture(name: &str, lifetime_secs: i64) -> Fixture {
     let publisher = Arc::new(Publisher::new(
         Arc::new(cfg),
         id_policy,
-        ca.clone(),
-        store.clone(),
+        Arc::<TestCa>::clone(&ca),
+        Arc::clone(&store),
         Arc::new(Metrics::default()),
     ));
     publisher.prime_ca().unwrap();
     Fixture {
-        node: NodeService::new(publisher.clone()),
+        node: NodeService::new(Arc::clone(&publisher)),
         publisher,
         ca,
         store,
@@ -304,7 +308,7 @@ fn farm_fixture(name: &str, lifetime_secs: i64) -> Fixture {
 }
 
 /// A publish request shaped the way the kubelet sends one for an inline
-/// ephemeral volume when the CSIDriver sets `podInfoOnMount: true`.
+/// ephemeral volume when the `CSIDriver` sets `podInfoOnMount: true`.
 fn publish_request(
     target: &Path,
     namespace: &str,
@@ -375,7 +379,6 @@ async fn publish_issues_a_certificate_for_the_kubelet_supplied_identity() {
     assert_eq!(ca, fx.ca.ca_pem);
 
     // The private key is not world readable; the certificate and CA are.
-    use std::os::unix::fs::PermissionsExt;
     let mode = |name: &str| {
         std::fs::metadata(target.join("..data").join(name))
             .unwrap()
@@ -631,7 +634,7 @@ async fn recovery_spreads_certificates_that_are_already_due() {
         "an overdue certificate renewed immediately"
     );
     assert!(
-        entry.renew_at <= now + fx.publisher.cfg.startup_spread.as_secs() as i64,
+        entry.renew_at <= now + i64::try_from(fx.publisher.cfg.startup_spread.as_secs()).unwrap(),
         "renewal pushed beyond the startup spread window"
     );
 
@@ -651,10 +654,10 @@ async fn a_changed_trust_bundle_reaches_running_pods() {
     // The trust domain adds a root: ca.crt must change without re-issuing.
     let rotated = Arc::new(TestCa::new(3600));
     let publisher = Arc::new(Publisher::new(
-        fx.publisher.cfg.clone(),
-        fx.publisher.policy.clone(),
-        rotated.clone(),
-        fx.store.clone(),
+        Arc::clone(&fx.publisher.cfg),
+        Arc::clone(&fx.publisher.policy),
+        Arc::<TestCa>::clone(&rotated),
+        Arc::clone(&fx.store),
         Arc::new(Metrics::default()),
     ));
     assert_eq!(publisher.refresh_ca().unwrap(), 1);
@@ -1014,7 +1017,7 @@ async fn a_certificate_renewal_never_disturbs_the_policy_chain() {
     for _ in 0..3 {
         svidlet::renew::renew_one(&fx.publisher, &entry);
     }
-    svidlet::renew::refresh_ca_once(fx.publisher.clone()).await;
+    svidlet::renew::refresh_ca_once(Arc::clone(&fx.publisher)).await;
 
     assert_eq!(
         std::fs::read_to_string(target.join("policy/authz.rego")).unwrap(),

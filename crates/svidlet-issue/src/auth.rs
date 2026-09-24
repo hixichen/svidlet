@@ -3,7 +3,7 @@
 //! Obtaining a credential and using it to sign are separate concerns, and they
 //! change for different reasons: a new PKI vendor replaces [`Issuer`], a new way
 //! of proving who the node is replaces [`TokenSource`]. Keeping them apart is
-//! what lets Vault AppRole be swapped for Vault Kubernetes auth, for cloud IAM,
+//! what lets Vault `AppRole` be swapped for Vault Kubernetes auth, for cloud IAM,
 //! or for whatever a future backend wants, without touching issuance.
 //!
 //! [`TokenCache`] holds the part every bearer-token backend needs anyway —
@@ -22,7 +22,10 @@ use crate::error::{Error, Result};
 const REFRESH_MARGIN: Duration = Duration::from_secs(60);
 
 /// A bearer credential and what the backend said about its lifetime.
-#[derive(Debug, Clone)]
+///
+/// `Debug` redacts the credential itself, so a token can be logged by
+/// accident without being leaked by accident.
+#[derive(Clone)]
 pub struct Token {
     pub value: String,
     /// Seconds the token is valid for. Zero means "no expiry advertised",
@@ -30,6 +33,16 @@ pub struct Token {
     pub lease_secs: u64,
     /// Whether the backend will extend this token in place.
     pub renewable: bool,
+}
+
+impl std::fmt::Debug for Token {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Token")
+            .field("value", &"<redacted>")
+            .field("lease_secs", &self.lease_secs)
+            .field("renewable", &self.renewable)
+            .finish()
+    }
 }
 
 impl Token {
@@ -61,12 +74,23 @@ pub trait TokenSource: Send + Sync {
     /// Implementations should re-read whatever material they authenticate with
     /// on every call rather than caching it, so rotating a mounted secret takes
     /// effect without restarting the process.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Auth`] when the credential material is missing or the backend
+    /// rejects it; [`Error::Transport`] or [`Error::Backend`] when the backend
+    /// cannot be reached or fails.
     fn login(&self) -> Result<Token>;
 
     /// Extend the current credential in place.
     ///
     /// The default gives up, which makes the cache log in again — correct for
     /// any method whose credentials cannot be extended.
+    ///
+    /// # Errors
+    ///
+    /// Any error makes the cache discard the token and log in again; the
+    /// default implementation always returns [`Error::Auth`].
     fn renew(&self, _token: &str) -> Result<Token> {
         Err(Error::Auth(
             "this authentication method cannot renew; logging in again".into(),
@@ -87,6 +111,15 @@ pub struct TokenCache<S: TokenSource> {
     state: Mutex<Option<Held>>,
 }
 
+impl<S: TokenSource + std::fmt::Debug> std::fmt::Debug for TokenCache<S> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // The held token is deliberately absent: it is a live credential.
+        f.debug_struct("TokenCache")
+            .field("source", &self.source)
+            .finish_non_exhaustive()
+    }
+}
+
 struct Held {
     token: Token,
     refresh_at: Instant,
@@ -105,6 +138,15 @@ impl<S: TokenSource> TokenCache<S> {
     }
 
     /// Return a usable credential, renewing or re-logging in as needed.
+    ///
+    /// # Errors
+    ///
+    /// Whatever [`TokenSource::login`] returns when a fresh login is needed and
+    /// fails. A failed renewal is not an error: it falls through to a login.
+    ///
+    /// # Panics
+    ///
+    /// If another thread panicked while holding the cache's lock.
     pub fn token(&self) -> Result<String> {
         let mut guard = self.state.lock().expect("token cache poisoned");
 
@@ -144,6 +186,10 @@ impl<S: TokenSource> TokenCache<S> {
     /// Called when the backend rejects a token that the cache still believed
     /// was good — the other half of surviving a credential rotation without a
     /// restart.
+    ///
+    /// # Panics
+    ///
+    /// If another thread panicked while holding the cache's lock.
     pub fn invalidate(&self) {
         *self.state.lock().expect("token cache poisoned") = None;
     }
@@ -230,7 +276,7 @@ mod tests {
         assert_eq!(cache.token().unwrap(), "token-0");
         // Force the deadline into the past.
         cache.state.lock().unwrap().as_mut().unwrap().refresh_at =
-            Instant::now() - Duration::from_secs(1);
+            Instant::now().checked_sub(Duration::from_secs(1)).unwrap();
 
         assert_eq!(cache.token().unwrap(), "renewed-0");
         assert_eq!(cache.source().logins.load(Ordering::SeqCst), 1);
@@ -247,7 +293,7 @@ mod tests {
         });
         assert_eq!(cache.token().unwrap(), "token-0");
         cache.state.lock().unwrap().as_mut().unwrap().refresh_at =
-            Instant::now() - Duration::from_secs(1);
+            Instant::now().checked_sub(Duration::from_secs(1)).unwrap();
 
         assert_eq!(cache.token().unwrap(), "token-1");
         assert_eq!(cache.source().logins.load(Ordering::SeqCst), 2);
@@ -262,7 +308,7 @@ mod tests {
         });
         assert_eq!(cache.token().unwrap(), "token-0");
         cache.state.lock().unwrap().as_mut().unwrap().refresh_at =
-            Instant::now() - Duration::from_secs(1);
+            Instant::now().checked_sub(Duration::from_secs(1)).unwrap();
 
         assert_eq!(cache.token().unwrap(), "token-1");
         assert_eq!(cache.source().renewals.load(Ordering::SeqCst), 0);
@@ -302,7 +348,7 @@ mod tests {
             }
         }
         let source = NoRenew;
-        assert!(source.renew("x").is_err());
+        source.renew("x").unwrap_err();
         assert_eq!(source.name(), "no-renew");
 
         let cache = TokenCache::new(NoRenew);
@@ -320,6 +366,31 @@ mod tests {
         assert!(in_secs(refresh_deadline(1)) < 2);
         // No advertised expiry: re-check daily rather than never.
         assert_eq!(in_secs(refresh_deadline(0)), 86_400);
+    }
+
+    #[test]
+    fn debug_output_never_contains_the_credential() {
+        #[derive(Debug)]
+        struct Fixed;
+        impl TokenSource for Fixed {
+            fn login(&self) -> Result<Token> {
+                Ok(Token::permanent("hvs.CAESIJ-not-a-real-token"))
+            }
+            fn name(&self) -> &'static str {
+                "fixed"
+            }
+        }
+
+        let secret = "hvs.CAESIJ-not-a-real-token";
+        let rendered = format!("{:?}", Token::new(secret, 3600, true));
+        assert!(rendered.contains("Token"));
+        assert!(rendered.contains("3600"));
+        assert!(!rendered.contains(secret), "{rendered}");
+
+        let cache = TokenCache::new(Fixed);
+        assert_eq!(cache.token().unwrap(), secret);
+        let rendered = format!("{cache:?}");
+        assert!(!rendered.contains(secret), "{rendered}");
     }
 
     #[test]

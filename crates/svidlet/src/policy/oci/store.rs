@@ -53,6 +53,7 @@ pub struct State {
     pub last_sequence: u64,
 }
 
+#[derive(Debug)]
 pub struct Store {
     root: PathBuf,
     keep: usize,
@@ -60,6 +61,7 @@ pub struct Store {
 
 impl Store {
     /// `keep` is how many superseded versions stay on disk for rollback.
+    #[must_use]
     pub fn new(root: PathBuf, keep: usize) -> Store {
         Store {
             root,
@@ -67,6 +69,7 @@ impl Store {
         }
     }
 
+    #[must_use]
     pub fn root(&self) -> &Path {
         &self.root
     }
@@ -89,6 +92,7 @@ impl Store {
         })
     }
 
+    #[must_use]
     pub fn has(&self, digest: &str) -> bool {
         self.version_dir(digest).is_dir()
     }
@@ -170,6 +174,7 @@ impl Store {
     }
 
     /// Delete superseded versions, keeping `current` and the most recent few.
+    #[must_use]
     pub fn prune(&self, keep_digests: &[&str]) -> usize {
         let keep: Vec<String> = keep_digests
             .iter()
@@ -194,6 +199,7 @@ impl Store {
         removed
     }
 
+    #[must_use]
     pub fn load_state(&self) -> State {
         fs::read_to_string(self.root.join(STATE))
             .ok()
@@ -235,7 +241,7 @@ fn collect(root: &Path, dir: &Path, out: &mut Vec<PolicyDocument>) -> Result<(),
         }
         let name = path
             .strip_prefix(root)
-            .map_err(|_| Error::Io("bundle file escaped its directory".into()))?
+            .map_err(|e| Error::Io(format!("bundle file escaped its directory: {e}")))?
             .to_string_lossy()
             .replace(std::path::MAIN_SEPARATOR, "/");
         let content = fs::read(&path)
@@ -387,7 +393,7 @@ mod tests {
         fs::create_dir_all(store.versions_dir().join(".staging-sha256-dddd")).unwrap();
         store.write_version(A, &entries(&[("f", "x")])).unwrap();
 
-        store.prune(&[A]);
+        let _ = store.prune(&[A]);
         assert!(!store.versions_dir().join(".staging-sha256-dddd").exists());
         assert!(store.has(A));
 

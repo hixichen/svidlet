@@ -71,15 +71,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let elapsed = started.elapsed();
 
     latencies.sort_unstable();
-    let at =
-        |q: f64| latencies[((latencies.len() as f64 - 1.0) * q) as usize].as_secs_f64() * 1000.0;
+    // Nearest-rank percentile: the index is `q` of the way through the sorted
+    // samples, computed in integers so no float-to-index cast is needed.
+    let at = |per_mille: usize| {
+        latencies[(latencies.len() - 1) * per_mille / 1000].as_secs_f64() * 1000.0
+    };
     println!(
         "published={count} in {:.1}s ({:.0}/s)  p50={:.1}ms p90={:.1}ms p99={:.1}ms",
         elapsed.as_secs_f64(),
         count as f64 / elapsed.as_secs_f64(),
-        at(0.50),
-        at(0.90),
-        at(0.99),
+        at(500),
+        at(900),
+        at(990),
     );
 
     if unpublish {

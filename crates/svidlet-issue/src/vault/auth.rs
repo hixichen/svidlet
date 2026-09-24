@@ -8,7 +8,7 @@
 //! [`KubernetesAuth`] is the fallback where there is no registration service —
 //! no shared secret either, but Vault must be able to validate the token.
 //!
-//! **AppRole is for development and kind clusters.** It is a bearer secret
+//! **`AppRole` is for development and kind clusters.** It is a bearer secret
 //! sitting in a Kubernetes Secret: whoever can read that Secret in the plugin's
 //! namespace can mint any identity in the cluster, from anywhere, until the
 //! secret ID is rotated. It proves possession of a secret, not that the caller
@@ -67,7 +67,7 @@ fn renew_self(http: &VaultHttp, token: &str) -> Result<Token> {
 /// Read a credential from a mounted file, trimming whitespace.
 ///
 /// Re-read on every login rather than cached, which is what makes rotating the
-/// mounted Secret take effect without restarting the DaemonSet.
+/// mounted Secret take effect without restarting the `DaemonSet`.
 fn read_file(path: &PathBuf, what: &str) -> Result<String> {
     let raw = std::fs::read_to_string(path)
         .map_err(|e| Error::Auth(format!("cannot read {what} from {}: {e}", path.display())))?;
@@ -83,8 +83,9 @@ fn read_file(path: &PathBuf, what: &str) -> Result<String> {
 
 // ------------------------------------------------------------------- approle
 
-/// One AppRole per cluster: the role ID ships in the DaemonSet's config, the
+/// One `AppRole` per cluster: the role ID ships in the `DaemonSet`'s config, the
 /// secret ID is a mounted Kubernetes Secret rotated on a fixed cadence.
+#[derive(Debug)]
 pub struct AppRoleAuth {
     http: Arc<VaultHttp>,
     mount: String,
@@ -138,11 +139,12 @@ impl TokenSource for AppRoleAuth {
 // ---------------------------------------------------------------- kubernetes
 
 /// Vault's Kubernetes auth method: present the plugin's own projected
-/// ServiceAccount token and let Vault verify it.
+/// `ServiceAccount` token and let Vault verify it.
 ///
-/// Stronger than AppRole — there is no shared secret to leak or rotate — but it
+/// Stronger than `AppRole` — there is no shared secret to leak or rotate — but it
 /// requires Vault to be able to validate the token, either by reaching the
 /// cluster's API server or through an aggregated JWKS endpoint.
+#[derive(Debug)]
 pub struct KubernetesAuth {
     http: Arc<VaultHttp>,
     mount: String,
@@ -216,6 +218,7 @@ impl TokenSource for KubernetesAuth {
 /// TPM-backed signer replaces, so the key never leaves the chip; until then a
 /// file-held key already removes the shared secret, and the node certificate's
 /// one-day lifetime bounds what a copied key is worth.
+#[derive(Debug)]
 pub struct CertAuth {
     http: Arc<VaultHttp>,
     mount: String,
@@ -269,11 +272,13 @@ impl TokenSource for CertAuth {
 
 /// A token read from a file. Intended for local development against a dev-mode
 /// Vault, and as an escape hatch where a token is injected by something else.
+#[derive(Debug)]
 pub struct StaticTokenAuth {
     path: PathBuf,
 }
 
 impl StaticTokenAuth {
+    #[must_use]
     pub fn new(path: PathBuf) -> StaticTokenAuth {
         StaticTokenAuth { path }
     }
@@ -321,7 +326,7 @@ mod tests {
     fn method_names_are_stable_label_values() {
         let h = http();
         assert_eq!(
-            AppRoleAuth::new(h.clone(), "approle", "r", "/dev/null".into()).name(),
+            AppRoleAuth::new(Arc::clone(&h), "approle", "r", "/dev/null".into()).name(),
             "approle"
         );
         assert_eq!(

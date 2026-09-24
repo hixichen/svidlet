@@ -5,6 +5,10 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
+rust-version.workspace = true
 
 [dependencies]
 rcgen.workspace = true
@@ -17,3 +21,6 @@ x509-parser.workspace = true
 [dev-dependencies]
 rcgen = { workspace = true, features = ["x509-parser"] }
 time = "0.3"
+
+[lints]
+workspace = true

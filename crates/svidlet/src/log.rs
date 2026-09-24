@@ -12,7 +12,7 @@
 //!
 //! The level comes from `SVIDLET_LOG_LEVEL` (error | warn | info | debug),
 //! exactly as `Config` validates it. One level for the whole process — a
-//! DaemonSet does not need per-crate filtering. The subscriber is the minimal
+//! `DaemonSet` does not need per-crate filtering. The subscriber is the minimal
 //! build (fmt + registry only, no JSON/EnvFilter features): the memory
 //! budget buys the fields, not the format options.
 
@@ -27,6 +27,7 @@ pub enum Level {
 }
 
 impl Level {
+    #[must_use]
     pub fn parse(s: &str) -> Option<Level> {
         match s.trim().to_ascii_lowercase().as_str() {
             "error" => Some(Level::Error),
@@ -67,11 +68,13 @@ pub fn init(level: Level) {
 
 /// Seconds since the Unix epoch. Also the clock the renewal schedule uses:
 /// certificate deadlines are wall-clock, so a monotonic clock is wrong here.
+#[must_use]
 pub fn unix_now() -> i64 {
     use std::time::{SystemTime, UNIX_EPOCH};
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
+        .ok()
+        .and_then(|d| i64::try_from(d.as_secs()).ok())
         .unwrap_or(0)
 }
 

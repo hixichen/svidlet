@@ -9,8 +9,9 @@ use rcgen::{CertificateParams, DistinguishedName, DnType, KeyPair, SanType};
 use crate::error::{Error, Result};
 use crate::template::SpiffeId;
 
-/// A freshly generated P-256 key together with the CSR that requests a
-/// certificate for one SPIFFE ID.
+/// A freshly generated P-256 key and the CSR requesting one SPIFFE ID.
+///
+/// `Debug` shows the CSR, which is public, and redacts the private key.
 pub struct KeyAndCsr {
     /// PKCS#8 PEM. Written to `tls.key`.
     pub key_pem: String,
@@ -18,13 +19,26 @@ pub struct KeyAndCsr {
     pub csr_pem: String,
 }
 
-/// Generate a P-256 key and a CSR whose only subject alternative name is the
-/// workload's SPIFFE URI.
+impl std::fmt::Debug for KeyAndCsr {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("KeyAndCsr")
+            .field("key_pem", &"<redacted>")
+            .field("csr_pem", &self.csr_pem)
+            .finish()
+    }
+}
+
+/// Generate a P-256 key and a CSR whose only SAN is the SPIFFE URI.
 ///
 /// The SPIFFE ID is the whole identity. `common_name`, when given, is the
 /// Subject's only attribute — a label for relying parties that insist on a
 /// non-empty Subject (see [`crate::subject`]), never a SAN. Without one the
 /// Subject is empty, and a Vault role must then set `require_cn=false`.
+///
+/// # Errors
+///
+/// [`Error::Crypto`] when key generation or CSR encoding fails, or the
+/// SPIFFE ID or common name cannot be encoded in a certificate.
 pub fn generate(spiffe_id: &SpiffeId, common_name: Option<&str>) -> Result<KeyAndCsr> {
     let san = Ia5String::try_from(spiffe_id.as_str())
         .map_err(|e| Error::Crypto(format!("SPIFFE ID is not a valid IA5 string: {e}")))?;
@@ -111,6 +125,18 @@ mod tests {
             .unwrap();
         assert_eq!(sans.general_names.len(), 1);
         assert!(matches!(sans.general_names[0], GeneralName::URI(_)));
+    }
+
+    #[test]
+    fn debug_output_never_contains_the_private_key() {
+        let id = SpiffeId::parse("spiffe://example.org/ns/a/sa/b").unwrap();
+        let out = generate(&id, None).unwrap();
+        let rendered = format!("{out:?}");
+        assert!(rendered.contains("BEGIN CERTIFICATE REQUEST"));
+        assert!(!rendered.contains("PRIVATE KEY"), "{rendered}");
+        // The base64 body of the key, not just its header, must be absent.
+        let body = out.key_pem.lines().nth(1).unwrap();
+        assert!(!rendered.contains(body));
     }
 
     #[test]

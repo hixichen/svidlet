@@ -40,7 +40,7 @@ pub struct Volume {
     pub spiffe_id: SpiffeId,
 }
 
-#[derive(Default)]
+#[derive(Debug, Default)]
 pub struct DaemonMetrics {
     pub scans: AtomicU64,
     pub volumes_written: AtomicU64,
@@ -49,6 +49,7 @@ pub struct DaemonMetrics {
 }
 
 /// What the daemon currently believes about this node's volumes.
+#[derive(Debug)]
 pub struct Daemon {
     cfg: PolicyConfig,
     id_policy: IdPolicy,
@@ -113,14 +114,11 @@ impl Daemon {
         let mut unreadable = 0u64;
 
         for target in recover::discover_exposed(&self.cfg.volumes_dir) {
-            let chain = match volume::read_cert_chain(&target) {
-                Ok(chain) => chain,
-                // Normal and transient: svidlet may be mid-publish, or the pod
-                // may be going away. Not worth a warning on every scan.
-                Err(_) => {
-                    unreadable += 1;
-                    continue;
-                }
+            // Unreadable is normal and transient: svidlet may be mid-publish,
+            // or the pod may be going away. Not worth a warning on every scan.
+            let Ok(chain) = volume::read_cert_chain(&target) else {
+                unreadable += 1;
+                continue;
             };
             let facts = match svidlet_issue::inspect(&chain) {
                 Ok(facts) => facts,
@@ -161,8 +159,14 @@ impl Daemon {
             .store(unreadable, Ordering::Relaxed);
 
         let mut volumes = self.volumes.lock().expect("volume map poisoned");
-        let before: Vec<String> = volumes.values().map(|id| id.to_string()).collect();
-        let after: Vec<String> = found.values().map(|id| id.to_string()).collect();
+        let before: Vec<String> = volumes
+            .values()
+            .map(std::string::ToString::to_string)
+            .collect();
+        let after: Vec<String> = found
+            .values()
+            .map(std::string::ToString::to_string)
+            .collect();
         *volumes = found;
         drop(volumes);
 
@@ -228,7 +232,7 @@ impl Daemon {
 pub async fn run_loop(daemon: Arc<Daemon>) {
     let interval = daemon.cfg.scan_interval;
     loop {
-        let scanning = daemon.clone();
+        let scanning = Arc::clone(&daemon);
         let outcome = tokio::task::spawn_blocking(move || {
             let (appeared, gone) = scanning.scan();
             // Applying in the same blocking task keeps file writes off the
@@ -259,6 +263,10 @@ pub async fn run_loop(daemon: Arc<Daemon>) {
 
 /// Prometheus text for the daemon. Separate from svidlet's endpoint, because
 /// they are separate processes with separate failure modes.
+#[expect(
+    clippy::too_many_lines,
+    reason = "one exposition block per metric family, in the order they are served"
+)]
 pub fn render(daemon: &Daemon) -> String {
     use crate::policy::oci::Error as BundleError;
     use std::fmt::Write as _;
@@ -346,7 +354,7 @@ pub fn render(daemon: &Daemon) -> String {
         "gauge",
         "",
         if daemon.policy.stream_enabled() {
-            p.connected.load(Ordering::Relaxed) as u8 as f64
+            f64::from(u8::from(p.connected.load(Ordering::Relaxed)))
         } else {
             f64::NAN
         },
@@ -389,8 +397,7 @@ pub fn render(daemon: &Daemon) -> String {
             .bundle
             .as_ref()
             .and_then(|b| b.age_seconds())
-            .map(|s| s as f64)
-            .unwrap_or(f64::NAN),
+            .map_or(f64::NAN, |s| s as f64),
     );
 
     let bundle_metrics = daemon.bundle.as_ref().map(|b| &b.metrics);
@@ -400,7 +407,7 @@ pub fn render(daemon: &Daemon) -> String {
     );
     let _ = writeln!(out, "# TYPE svidlet_bundle_rejected_total counter");
     for reason in BundleError::REASONS {
-        let value = bundle_metrics.map(|m| m.rejected(reason)).unwrap_or(0);
+        let value = bundle_metrics.map_or(0, |m| m.rejected(reason));
         let _ = writeln!(
             out,
             "svidlet_bundle_rejected_total{{reason=\"{reason}\"}} {value}"
@@ -410,30 +417,22 @@ pub fn render(daemon: &Daemon) -> String {
         (
             "svidlet_bundle_swap_total",
             "Times this node swapped to a different bundle.",
-            bundle_metrics
-                .map(|m| m.swaps.load(Ordering::Relaxed))
-                .unwrap_or(0),
+            bundle_metrics.map_or(0, |m| m.swaps.load(Ordering::Relaxed)),
         ),
         (
             "svidlet_bundle_poll_total",
             "Rollout manifest polls attempted.",
-            bundle_metrics
-                .map(|m| m.polls.load(Ordering::Relaxed))
-                .unwrap_or(0),
+            bundle_metrics.map_or(0, |m| m.polls.load(Ordering::Relaxed)),
         ),
         (
             "svidlet_rollout_manifest_invalid_total",
             "Rollout manifests refused as unsigned, mis-signed or unparsable.",
-            bundle_metrics
-                .map(|m| m.manifest_invalid.load(Ordering::Relaxed))
-                .unwrap_or(0),
+            bundle_metrics.map_or(0, |m| m.manifest_invalid.load(Ordering::Relaxed)),
         ),
         (
             "svidlet_registry_fetch_errors_total",
             "Failed registry requests.",
-            bundle_metrics
-                .map(|m| m.fetch_errors.load(Ordering::Relaxed))
-                .unwrap_or(0),
+            bundle_metrics.map_or(0, |m| m.fetch_errors.load(Ordering::Relaxed)),
         ),
     ] {
         simple(&mut out, name, help, "counter", "", value as f64);
@@ -447,8 +446,7 @@ pub fn render(daemon: &Daemon) -> String {
         daemon
             .bundle
             .as_ref()
-            .map(|b| b.bucket() as f64)
-            .unwrap_or(f64::NAN),
+            .map_or(f64::NAN, |b| f64::from(b.bucket())),
     );
     out
 }
@@ -487,7 +485,7 @@ pub async fn serve_metrics(addr: String, daemon: Arc<Daemon>) {
         let Ok((mut socket, _)) = listener.accept().await else {
             continue;
         };
-        let daemon = daemon.clone();
+        let daemon = Arc::clone(&daemon);
         tokio::spawn(async move {
             let mut buf = [0u8; 1024];
             let n = socket.read(&mut buf).await.unwrap_or(0);

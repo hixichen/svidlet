@@ -32,7 +32,7 @@ pub struct SignRequest<'a> {
 
 /// A PKI backend that signs CSRs for workload identities.
 ///
-/// HashiCorp Vault PKI is the first implementation. step-ca, cert-manager
+/// `HashiCorp` Vault PKI is the first implementation. step-ca, cert-manager
 /// `CertificateRequest` and cloud-managed CAs slot in here without the CSI
 /// plugin knowing; so does a `PodCertificateRequest` signer on Kubernetes 1.35+.
 ///
@@ -46,9 +46,21 @@ pub trait Issuer: Send + Sync {
     /// Implementations must also verify the returned certificate actually
     /// carries the requested identity before handing it back, so a
     /// misconfigured backend is caught on the node.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Auth`] when the backend refuses the node's credential,
+    /// [`Error::Backend`] when it refuses the request (an identity outside its
+    /// prefix, say), [`Error::Transport`] when it cannot be reached, and
+    /// [`Error::Certificate`] when it signed something other than was asked.
     fn sign(&self, request: &SignRequest<'_>) -> Result<IssuedBundle>;
 
     /// Current trust bundle (CA chain) for the trust domain.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Transport`] or [`Error::Backend`] when the backend cannot
+    /// answer, and [`Error::Protocol`] when the answer is not a PEM chain.
     fn ca_chain(&self) -> Result<String>;
 
     /// Short name for logs and metric labels, e.g. `vault`.

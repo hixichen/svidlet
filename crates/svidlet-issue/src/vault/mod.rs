@@ -1,12 +1,12 @@
-//! HashiCorp Vault PKI backend.
+//! `HashiCorp` Vault PKI backend.
 //!
 //! The plugin logs in once through whichever [`TokenSource`] is configured and
 //! keeps a periodic, renewable token; it does not log in per certificate.
 //!
 //! [`TokenSource`]: crate::auth::TokenSource
 
-pub mod auth;
-pub mod http;
+mod auth;
+mod http;
 
 use std::sync::Arc;
 
@@ -17,7 +17,9 @@ use crate::bundle::{assert_identity, IssuedBundle};
 use crate::error::{Error, Result};
 use crate::issuer::{Issuer, SignRequest};
 
+#[doc(inline)]
 pub use auth::{AppRoleAuth, CertAuth, KubernetesAuth, StaticTokenAuth};
+#[doc(inline)]
 pub use http::{VaultEndpoint, VaultHttp};
 
 /// Where and how to sign.
@@ -30,6 +32,7 @@ pub struct VaultPkiConfig {
     pub role: String,
 }
 
+#[derive(Debug)]
 pub struct VaultIssuer<S: TokenSource> {
     http: Arc<VaultHttp>,
     pki: VaultPkiConfig,
@@ -197,7 +200,7 @@ mod tests {
     fn data(certificate: &str, chain: &[&str], issuing: &str) -> SignData {
         SignData {
             certificate: certificate.into(),
-            ca_chain: chain.iter().map(|s| s.to_string()).collect(),
+            ca_chain: chain.iter().map(std::string::ToString::to_string).collect(),
             issuing_ca: issuing.into(),
         }
     }

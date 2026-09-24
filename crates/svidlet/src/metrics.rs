@@ -14,7 +14,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use svidlet_issue::{Cloud, ErrorCode, Rule};
+use svidlet_issue::profile::{Cloud, Rule};
+use svidlet_issue::ErrorCode;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
@@ -28,7 +29,7 @@ use crate::{debug, error, info};
 const LATENCY_BUCKETS: [f64; 9] = [0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 5.0];
 
 /// A counter split by [`ErrorCode`], with every series pre-declared.
-#[derive(Default)]
+#[derive(Debug, Default)]
 struct FailureCounter([AtomicU64; ErrorCode::ALL.len()]);
 
 impl FailureCounter {
@@ -42,7 +43,7 @@ impl FailureCounter {
 }
 
 /// A fixed-bucket histogram. Cheap enough to update on every issuance.
-#[derive(Default)]
+#[derive(Debug, Default)]
 struct Histogram {
     buckets: [AtomicU64; LATENCY_BUCKETS.len()],
     count: AtomicU64,
@@ -61,7 +62,11 @@ impl Histogram {
         }
         self.count.fetch_add(1, Ordering::Relaxed);
         self.sum_micros
-            .fetch_add(elapsed.as_micros() as u64, Ordering::Relaxed);
+            // Saturate rather than wrap: 2^64 µs is half a million years.
+            .fetch_add(
+                u64::try_from(elapsed.as_micros()).unwrap_or(u64::MAX),
+                Ordering::Relaxed,
+            );
     }
 
     fn render(&self, out: &mut String, name: &str, help: &str, reason: &str) {
@@ -89,7 +94,7 @@ impl Histogram {
     }
 }
 
-#[derive(Default)]
+#[derive(Debug, Default)]
 pub struct Metrics {
     issued_publish: AtomicU64,
     issued_renew: AtomicU64,
@@ -152,6 +157,10 @@ impl Metrics {
         self.latency_renew.observe(elapsed);
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one exposition block per metric family, in the order they are served"
+    )]
     pub fn render(&self, store: &Store) -> String {
         let mut out = String::with_capacity(4096);
 
@@ -290,8 +299,7 @@ impl Metrics {
             "",
             store
                 .earliest_expiry()
-                .map(|at| (at - now) as f64)
-                .unwrap_or(f64::NAN),
+                .map_or(f64::NAN, |at| (at - now) as f64),
         );
         simple(
             &mut out,
@@ -365,8 +373,8 @@ pub async fn serve(addr: String, metrics: Arc<Metrics>, store: Arc<Store>) {
                 continue;
             }
         };
-        let metrics = metrics.clone();
-        let store = store.clone();
+        let metrics = Arc::clone(&metrics);
+        let store = Arc::clone(&store);
         tokio::spawn(async move {
             // Read just enough to see the request line; a scrape has no body,
             // and anything oversized is ignored rather than buffered.
@@ -492,6 +500,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::float_cmp,
+        reason = "bucket counts are small integers, which f64 represents exactly"
+    )]
     fn the_latency_histogram_is_cumulative_and_consistent() {
         let metrics = Metrics::default();
         metrics.observe_publish(Duration::from_millis(20));

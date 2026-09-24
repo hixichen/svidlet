@@ -8,7 +8,7 @@
 //!
 //! Nothing is re-issued. This is a correctness requirement, not a tuning knob:
 //! a plugin upgrade that re-signed every certificate on the node would turn a
-//! rolling DaemonSet update into a fleet-wide signing storm.
+//! rolling `DaemonSet` update into a fleet-wide signing storm.
 
 use std::path::{Path, PathBuf};
 
@@ -100,10 +100,14 @@ pub fn discover(kubelet_root: &Path, driver_name: &str) -> Vec<Discovered> {
 /// issued are left alone and retried on the next pass: the kubelet does not
 /// re-call `NodePublishVolume` for a volume that is still mounted, so a volume
 /// that is never adopted keeps running until its certificate expires under it.
+#[expect(
+    clippy::too_many_lines,
+    reason = "each skip reason is logged where it is decided, which is the point"
+)]
 pub fn adopt(cfg: &Config, policy: &IdPolicy, store: &Store, metrics: &Metrics) -> usize {
     let now = crate::log::unix_now();
     let mut adopted = 0;
-    let mut skipped = 0;
+    let mut skipped: u64 = 0;
 
     for found in discover(&cfg.kubelet_root, &cfg.driver_name) {
         // A re-adoption pass must not reset the renewal state of a volume the
@@ -158,7 +162,8 @@ pub fn adopt(cfg: &Config, policy: &IdPolicy, store: &Store, metrics: &Metrics) 
         // Certificates already past their renewal point would otherwise all
         // renew in the first tick after a rolling upgrade. Spread them.
         if renew_at <= now {
-            renew_at = now + rand::range_i64(0, cfg.startup_spread.as_secs() as i64);
+            let spread = i64::try_from(cfg.startup_spread.as_secs()).unwrap_or(i64::MAX);
+            renew_at = now + rand::range_i64(0, spread);
         }
 
         let attrs = policy
@@ -204,7 +209,7 @@ pub fn adopt(cfg: &Config, policy: &IdPolicy, store: &Store, metrics: &Metrics) 
 
     metrics
         .adoption_skipped
-        .fetch_add(skipped as u64, std::sync::atomic::Ordering::Relaxed);
+        .fetch_add(skipped, std::sync::atomic::Ordering::Relaxed);
     metrics
         .recovered
         .fetch_add(adopted as u64, std::sync::atomic::Ordering::Relaxed);
@@ -229,6 +234,7 @@ pub fn adopt(cfg: &Config, policy: &IdPolicy, store: &Store, metrics: &Metrics) 
 /// The daemon's whole view of the node: one entry per published volume, each
 /// a bind mount of the volume's tmpfs. Anything that is not readable is
 /// reported by the caller rather than failing the walk.
+#[must_use]
 pub fn discover_exposed(volumes_dir: &Path) -> Vec<PathBuf> {
     let mut found = Vec::new();
     let Ok(entries) = std::fs::read_dir(volumes_dir) else {

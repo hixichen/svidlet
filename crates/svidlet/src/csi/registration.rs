@@ -12,6 +12,7 @@ use super::proto::registration::{
 };
 use crate::{error, info};
 
+#[derive(Debug)]
 pub struct RegistrationService {
     driver_name: String,
     /// The CSI socket path as the kubelet sees it on the host.
@@ -19,6 +20,7 @@ pub struct RegistrationService {
 }
 
 impl RegistrationService {
+    #[must_use]
     pub fn new(driver_name: String, endpoint: String) -> Self {
         RegistrationService {
             driver_name,
@@ -98,13 +100,13 @@ mod tests {
     #[tokio::test]
     async fn registration_status_is_accepted_either_way() {
         for (registered, error) in [(true, ""), (false, "driver name mismatch")] {
-            assert!(service()
+            service()
                 .notify_registration_status(Request::new(RegistrationStatus {
                     plugin_registered: registered,
                     error: error.into(),
                 }))
                 .await
-                .is_ok());
+                .unwrap();
         }
     }
 }

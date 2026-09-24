@@ -11,7 +11,7 @@
 //!   `PodCertificateRequest` signer all fit behind it.
 //! - [`TokenSource`] is how a node proves who it is to that engine. Vault cert
 //!   auth with the node's registration certificate, Vault Kubernetes auth,
-//!   AppRole (for development) and a static token ship here.
+//!   `AppRole` (for development) and a static token ship here.
 //! - [`IdPolicy`] is the shape of the identity itself, so the SPIFFE ID layout
 //!   is an operator's decision rather than a constant in the code.
 //!
@@ -24,25 +24,27 @@
 // outright rather than leaving it to review.
 #![forbid(unsafe_code)]
 
-pub mod auth;
-pub mod bundle;
-pub mod error;
-pub mod issuer;
-pub mod key;
+mod auth;
+mod bundle;
+mod error;
+mod issuer;
+mod key;
 pub mod profile;
-pub mod subject;
-pub mod template;
+mod subject;
+mod template;
 pub mod vault;
 
+#[doc(inline)]
 pub use auth::{Token, TokenCache, TokenSource};
+#[doc(inline)]
 pub use bundle::{assert_identity, inspect, CertFacts, IssuedBundle};
+#[doc(inline)]
 pub use error::{Error, ErrorCode, Result};
+#[doc(inline)]
 pub use issuer::{Issuer, SignRequest};
+#[doc(inline)]
 pub use key::{generate, KeyAndCsr};
-pub use profile::{Cloud, Finding, Rule};
-pub use subject::SubjectSource;
+#[doc(inline)]
+pub use subject::{common_name, SubjectSource, MAX_COMMON_NAME_LEN};
+#[doc(inline)]
 pub use template::{Field, IdPolicy, IdTemplate, SpiffeId, WorkloadAttributes};
-pub use vault::{
-    AppRoleAuth, CertAuth, KubernetesAuth, StaticTokenAuth, VaultEndpoint, VaultHttp, VaultIssuer,
-    VaultPkiConfig,
-};

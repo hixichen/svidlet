@@ -2,7 +2,7 @@
 //!
 //! See ../svidlet-policy/authz-management-plane.md. The shape of one poll:
 //!
-//! 1. fetch the rollout manifest by tag, with an ETag so an unchanged one is a 304;
+//! 1. fetch the rollout manifest by tag, with an `ETag` so an unchanged one is a 304;
 //! 2. verify its Ed25519 signature against the fleet's public key;
 //! 3. work out this node's ring and the digest it should be running;
 //! 4. pull that bundle by digest and check the bytes against it;
@@ -61,6 +61,7 @@ pub enum Error {
 
 impl Error {
     /// The stable metric label.
+    #[must_use]
     pub fn reason(&self) -> &'static str {
         match self {
             Error::Config(_) => "config",
@@ -101,7 +102,7 @@ impl fmt::Display for Error {
 
 impl std::error::Error for Error {}
 
-#[derive(Default)]
+#[derive(Debug, Default)]
 pub struct BundleMetrics {
     pub polls: AtomicU64,
     pub swaps: AtomicU64,
@@ -129,8 +130,7 @@ impl BundleMetrics {
         Error::REASONS
             .iter()
             .position(|r| *r == reason)
-            .map(|i| self.rejected[i].load(Ordering::Relaxed))
-            .unwrap_or(0)
+            .map_or(0, |i| self.rejected[i].load(Ordering::Relaxed))
     }
 }
 
@@ -144,6 +144,7 @@ pub struct Current {
 }
 
 /// The pull-based policy source.
+#[derive(Debug)]
 pub struct BundleSource {
     settings: BundleSettings,
     cluster: String,
@@ -202,7 +203,7 @@ impl BundleSource {
             None => None,
         };
         let registry = Registry::new(
-            ca_cert_pem,
+            ca_cert_pem.as_deref(),
             settings.token_path.clone(),
             settings.timeout,
             settings.max_bytes,
@@ -358,7 +359,9 @@ impl BundleSource {
         );
 
         // Already unpacked? A rollback to the previous version needs no network.
-        if !self.store.has(&ring.bundle) {
+        if self.store.has(&ring.bundle) {
+            debug!("bundle already on disk", digest = ring.bundle);
+        } else {
             let blob = self.registry.blob(&self.bundle_ref, &ring.bundle)?;
             // This is the link in the chain that makes the manifest's signature
             // cover the bundle: the signed manifest named this digest, and
@@ -367,8 +370,6 @@ impl BundleSource {
             let entries = tarball::extract(&blob, self.settings.max_bytes)?;
             validate(&entries)?;
             self.store.write_version(&ring.bundle, &entries)?;
-        } else {
-            debug!("bundle already on disk", digest = ring.bundle);
         }
 
         self.store.set_current(&ring.bundle)?;
@@ -381,7 +382,8 @@ impl BundleSource {
             .into_iter()
             .filter(|d| !d.is_empty())
             .collect();
-        self.store.prune(&keep);
+        let removed = self.store.prune(&keep);
+        debug!("pruned superseded bundle versions", removed = removed);
 
         // Applied. Only now is a 304 on this ETag a truthful "nothing to do".
         self.remember_etag(new_etag);
@@ -396,13 +398,13 @@ impl BundleSource {
         Ok(Some(bundle))
     }
 
-    /// The ETag to send, if sending one is safe.
+    /// The `ETag` to send, if sending one is safe.
     ///
-    /// Only safe while the bundle that ETag went with is actually unpacked on
+    /// Only safe while the bundle that `ETag` went with is actually unpacked on
     /// this node. Otherwise a 304 says "nothing changed" about a bundle we
     /// never applied, and the node stalls on no policy at all until the
     /// upstream manifest happens to move — with `bundle_age_seconds` staying
-    /// green throughout, because a 304 is a successful poll. Sending no ETag
+    /// green throughout, because a 304 is a successful poll. Sending no `ETag`
     /// costs one manifest download and always makes progress.
     fn current_etag(&self) -> Option<String> {
         let state = self.state.lock().expect("bundle state poisoned");
@@ -412,7 +414,7 @@ impl BundleSource {
         Some(state.manifest_etag.clone()).filter(|e| !e.is_empty())
     }
 
-    /// Remember the manifest ETag, now that the bundle it names is in place.
+    /// Remember the manifest `ETag`, now that the bundle it names is in place.
     fn remember_etag(&self, etag: Option<String>) {
         let Some(etag) = etag else { return };
         let mut state = self.state.lock().expect("bundle state poisoned");
@@ -439,7 +441,7 @@ impl BundleSource {
         let now = unix_now();
         self.metrics
             .last_success
-            .store(now as u64, Ordering::Relaxed);
+            .store(u64::try_from(now).unwrap_or(0), Ordering::Relaxed);
         let mut state = self.state.lock().expect("bundle state poisoned");
         state.last_success = now;
         state.last_error.clear();
@@ -486,6 +488,11 @@ impl BundleSource {
 /// benefit the design does not specify. What is checked is the rest — that the
 /// bundle declares a schema this build understands.
 fn validate(entries: &[tarball::Entry]) -> Result<(), Error> {
+    #[derive(serde::Deserialize)]
+    struct BundleManifest {
+        schema: u32,
+    }
+
     let Some(manifest) = entries.iter().find(|e| e.path == "bundle.toml") else {
         // Not fatal by itself, but worth being strict about: a bundle with no
         // manifest is almost always a packaging mistake, and accepting it means
@@ -494,11 +501,6 @@ fn validate(entries: &[tarball::Entry]) -> Result<(), Error> {
             "bundle has no bundle.toml at its root".into(),
         ));
     };
-
-    #[derive(serde::Deserialize)]
-    struct BundleManifest {
-        schema: u32,
-    }
 
     let text = std::str::from_utf8(&manifest.content)
         .map_err(|e| Error::Malformed(format!("bundle.toml is not UTF-8: {e}")))?;
@@ -532,7 +534,7 @@ pub async fn poll_loop(source: Arc<BundleSource>, policy: Arc<PolicyManager>) {
         let interval = jittered(source.settings.poll_interval, source.settings.poll_jitter);
         tokio::time::sleep(interval).await;
 
-        let polling = source.clone();
+        let polling = Arc::clone(&source);
         let outcome = tokio::task::spawn_blocking(move || polling.poll()).await;
 
         match outcome {
@@ -618,7 +620,7 @@ mod tests {
 
     #[test]
     fn a_bundle_must_declare_a_schema_this_build_understands() {
-        assert!(validate(&[entry("bundle.toml", "schema = 1\nenforce = true\n")]).is_ok());
+        validate(&[entry("bundle.toml", "schema = 1\nenforce = true\n")]).unwrap();
 
         let err = validate(&[entry("rules/a.rego", "x")]).unwrap_err();
         assert!(matches!(err, Error::Rejected(_)));

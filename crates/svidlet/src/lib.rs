@@ -1,7 +1,7 @@
 //! Svidlet — a lightweight SPIFFE X.509 issuer for Kubernetes.
 //!
 //! One process per node, registered with the kubelet as a CSI node plugin.
-//! When a pod starts, the kubelet says which namespace and ServiceAccount it
+//! When a pod starts, the kubelet says which namespace and `ServiceAccount` it
 //! belongs to; svidlet generates a P-256 key on the node, has a PKI backend
 //! sign a certificate for
 //! `spiffe://<trust-domain>/cluster/<cluster>/ns/<namespace>/sa/<serviceaccount>`,
@@ -13,12 +13,19 @@
 //!
 //! See docs/DESIGN.md.
 
-// Unsafe code is denied crate-wide. The only exception is the pair of mount
-// syscalls in `volume`, which are `#[allow]`ed individually with a SAFETY note
-// each: a tmpfs cannot be mounted without libc FFI, and shelling out to
-// mount(8) would trade two audited lines for a process spawn and a PATH
+// Unsafe code is denied crate-wide. The only exceptions are the mount, unmount
+// and chown syscalls in `volume`, each `#[expect]`ed individually with a SAFETY
+// note: a tmpfs cannot be mounted without libc FFI, and shelling out to
+// mount(8) would trade a few audited lines for a process spawn and a PATH
 // dependency. Anything else that needs `unsafe` is a compile error.
 #![deny(unsafe_code)]
+#![expect(
+    clippy::missing_errors_doc,
+    clippy::missing_panics_doc,
+    reason = "this library target shares code between svidlet's two binaries and its \
+              integration tests; it is not a published API. svidlet-issue, which is \
+              one, documents errors and panics on every public item"
+)]
 
 pub mod config;
 pub mod csi;

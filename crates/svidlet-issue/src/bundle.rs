@@ -20,8 +20,11 @@ pub struct IssuedBundle {
 
 impl IssuedBundle {
     /// Certificate lifetime in seconds, as issued.
+    #[must_use]
     pub fn lifetime_secs(&self) -> u64 {
-        (self.not_after - self.not_before).max(0) as u64
+        // A backend with a skewed clock can hand back not_after < not_before;
+        // that is a zero lifetime, not a huge unsigned one.
+        u64::try_from(self.not_after - self.not_before).unwrap_or(0)
     }
 }
 
@@ -44,6 +47,11 @@ pub struct CertFacts {
 /// Read the SPIFFE ID and validity window out of a PEM certificate chain.
 ///
 /// Only the first certificate in the chain — the leaf — is inspected.
+///
+/// # Errors
+///
+/// [`Error::Certificate`] when the input is not a PEM certificate, has no
+/// SPIFFE URI SAN, or carries an ID that is not a valid SPIFFE ID.
 pub fn inspect(cert_chain_pem: &str) -> Result<CertFacts> {
     let (_, pem) = parse_x509_pem(cert_chain_pem.as_bytes())
         .map_err(|e| Error::Certificate(format!("not a PEM certificate: {e}")))?;
@@ -81,6 +89,11 @@ pub fn inspect(cert_chain_pem: &str) -> Result<CertFacts> {
 }
 
 /// Confirm the backend signed the identity that was asked for.
+///
+/// # Errors
+///
+/// [`Error::Certificate`] when the chain cannot be inspected, or names a
+/// different SPIFFE ID than `expected`.
 pub fn assert_identity(cert_chain_pem: &str, expected: &SpiffeId) -> Result<CertFacts> {
     let facts = inspect(cert_chain_pem)?;
     if facts.spiffe_id != *expected {

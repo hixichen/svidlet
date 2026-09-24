@@ -60,6 +60,7 @@ impl Field {
         Field::NodeName,
     ];
 
+    #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
             Field::TrustDomain => "trust_domain",
@@ -138,6 +139,11 @@ impl SpiffeId {
     /// Accept an existing ID string, checking the invariants the SPIFFE
     /// specification requires. Used on the recovery path, where the ID comes
     /// from a certificate rather than from a template.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Identity`] when `raw` is not a `spiffe://` URI, is too long,
+    /// or has an invalid trust domain or path.
     pub fn parse(raw: &str) -> Result<SpiffeId> {
         let rest = raw
             .strip_prefix("spiffe://")
@@ -165,6 +171,7 @@ impl SpiffeId {
         Ok(SpiffeId(raw.to_string()))
     }
 
+    #[must_use]
     pub fn as_str(&self) -> &str {
         &self.0
     }
@@ -197,6 +204,13 @@ impl IdTemplate {
     pub const DEFAULT: &'static str =
         "spiffe://{trust_domain}/cluster/{cluster}/ns/{namespace}/sa/{service_account}";
 
+    /// Compile a template such as [`IdTemplate::DEFAULT`].
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Config`] for an unknown or unterminated placeholder, adjacent
+    /// placeholders that could not be taken apart again, or a template that
+    /// cannot produce a valid SPIFFE ID.
     pub fn compile(raw: &str) -> Result<IdTemplate> {
         let parts = split(raw)?;
         let mut fields = Vec::new();
@@ -281,6 +295,12 @@ impl IdTemplate {
         attrs
     }
 
+    /// Substitute a workload's attributes into the template.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Identity`] when a substituted attribute is empty or contains
+    /// characters outside `[A-Za-z0-9._-]`, or the result is not a valid ID.
     pub fn render(&self, attrs: &WorkloadAttributes) -> Result<SpiffeId> {
         let mut out = String::with_capacity(self.raw.len() + 32);
         for part in &self.parts {
@@ -321,6 +341,11 @@ impl IdPolicy {
     /// ends: an unanchored `ns/kube-system` would otherwise match anywhere in
     /// the ID, which is the opposite of what someone writing a restriction
     /// expects.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Config`] when the template does not compile or the pattern is
+    /// not a valid regular expression.
     pub fn new(template: &str, pattern: Option<&str>) -> Result<IdPolicy> {
         let template = IdTemplate::compile(template)?;
         let (pattern, pattern_src) = match pattern {
@@ -351,6 +376,11 @@ impl IdPolicy {
     }
 
     /// Build an ID and check it against the operator's pattern.
+    ///
+    /// # Errors
+    ///
+    /// As [`IdTemplate::render`], plus [`Error::Policy`] when the pattern
+    /// refuses the rendered ID.
     pub fn render(&self, attrs: &WorkloadAttributes) -> Result<SpiffeId> {
         let id = self.template.render(attrs)?;
         self.check(id.as_str())?;
@@ -358,6 +388,10 @@ impl IdPolicy {
     }
 
     /// Check an ID that already exists — one read back from a certificate.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Policy`] when the operator's pattern refuses `id`.
     pub fn check(&self, id: &str) -> Result<()> {
         if let Some(pattern) = &self.pattern {
             if !pattern.is_match(id) {
@@ -619,7 +653,7 @@ mod tests {
             // is allowed by the charset and stopped by SPIFFE ID parsing only
             // if it produces an empty segment, so assert on the charset cases.
             if bad == ".." {
-                assert!(t.render(&a).is_ok());
+                t.render(&a).unwrap();
                 continue;
             }
             assert_eq!(
@@ -679,17 +713,17 @@ mod tests {
 
     #[test]
     fn spiffe_id_parse_enforces_the_specification() {
-        assert!(SpiffeId::parse("spiffe://example.org/a").is_ok());
-        assert!(SpiffeId::parse("spiffe://example.org").is_ok());
+        SpiffeId::parse("spiffe://example.org/a").unwrap();
+        SpiffeId::parse("spiffe://example.org").unwrap();
         assert_eq!(
             SpiffeId::parse("http://example.org/a").unwrap_err().code(),
             ErrorCode::Identity
         );
-        assert!(SpiffeId::parse("spiffe:///a").is_err());
-        assert!(SpiffeId::parse("spiffe://example.org/a//b").is_err());
+        SpiffeId::parse("spiffe:///a").unwrap_err();
+        SpiffeId::parse("spiffe://example.org/a//b").unwrap_err();
 
         let long = format!("spiffe://example.org/{}", "x".repeat(MAX_ID_LEN));
-        assert!(SpiffeId::parse(&long).is_err());
+        SpiffeId::parse(&long).unwrap_err();
 
         let id = SpiffeId::parse("spiffe://example.org/a").unwrap();
         assert_eq!(id.to_string(), "spiffe://example.org/a");
@@ -704,7 +738,7 @@ mod tests {
         )
         .unwrap();
 
-        assert!(policy.render(&attrs()).is_ok());
+        policy.render(&attrs()).unwrap();
         assert_eq!(
             policy.pattern().unwrap(),
             r"spiffe://example\.org/cluster/a/ns/(payments|billing)/sa/[a-z0-9-]+"
@@ -717,9 +751,9 @@ mod tests {
         assert!(err.to_string().contains("does not match spiffe_id_pattern"));
 
         // check() gates IDs read back from disk too.
-        assert!(policy
+        policy
             .check("spiffe://example.org/cluster/a/ns/payments/sa/api")
-            .is_ok());
+            .unwrap();
         assert!(policy
             .check("spiffe://example.org/cluster/a/ns/kube-system/sa/api")
             .is_err());
@@ -736,9 +770,9 @@ mod tests {
 
         // Explicit anchors are not doubled.
         let policy = IdPolicy::new(IdTemplate::DEFAULT, Some("^spiffe://.*/sa/api$")).unwrap();
-        assert!(policy
+        policy
             .check("spiffe://example.org/cluster/a/ns/payments/sa/api")
-            .is_ok());
+            .unwrap();
     }
 
     #[test]
@@ -752,7 +786,7 @@ mod tests {
     fn policy_without_a_pattern_accepts_whatever_the_template_builds() {
         let policy = IdPolicy::new(IdTemplate::DEFAULT, None).unwrap();
         assert!(policy.pattern().is_none());
-        assert!(policy.check("anything at all").is_ok());
+        policy.check("anything at all").unwrap();
         assert_eq!(
             policy.render(&attrs()).unwrap().as_str(),
             "spiffe://example.org/cluster/a/ns/payments/sa/api"

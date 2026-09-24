@@ -39,7 +39,6 @@ use x509_parser::oid_registry::{
     OID_PKCS1_RSASSAPSS, OID_PKCS1_SHA256WITHRSA, OID_PKCS1_SHA384WITHRSA, OID_PKCS1_SHA512WITHRSA,
     OID_SIG_ECDSA_WITH_SHA256, OID_SIG_ECDSA_WITH_SHA384, OID_SIG_ECDSA_WITH_SHA512,
 };
-use x509_parser::pem::Pem;
 use x509_parser::prelude::*;
 
 use crate::error::{Error, Result};
@@ -65,10 +64,12 @@ impl Cloud {
     pub const ALL: [Cloud; 2] = [Cloud::Aws, Cloud::Gcp];
 
     /// Position in [`Cloud::ALL`], for fixed-size metric tables.
+    #[must_use]
     pub const fn index(self) -> usize {
         self as usize
     }
 
+    #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
             Cloud::Aws => "aws",
@@ -76,7 +77,27 @@ impl Cloud {
         }
     }
 
-    pub fn parse(text: &str) -> Result<Cloud> {
+    /// Parse a comma-separated list such as `aws,gcp`. Empty means none.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Config`] naming the first entry that is not a known cloud.
+    pub fn parse_list(text: &str) -> Result<Vec<Cloud>> {
+        let mut out = Vec::new();
+        for part in text.split(',').map(str::trim).filter(|p| !p.is_empty()) {
+            let cloud: Cloud = part.parse()?;
+            if !out.contains(&cloud) {
+                out.push(cloud);
+            }
+        }
+        Ok(out)
+    }
+}
+
+impl std::str::FromStr for Cloud {
+    type Err = Error;
+
+    fn from_str(text: &str) -> Result<Cloud> {
         match text {
             "aws" => Ok(Cloud::Aws),
             "gcp" => Ok(Cloud::Gcp),
@@ -85,17 +106,11 @@ impl Cloud {
             ))),
         }
     }
+}
 
-    /// Parse a comma-separated list such as `aws,gcp`. Empty means none.
-    pub fn parse_list(text: &str) -> Result<Vec<Cloud>> {
-        let mut out = Vec::new();
-        for part in text.split(',').map(str::trim).filter(|p| !p.is_empty()) {
-            let cloud = Cloud::parse(part)?;
-            if !out.contains(&cloud) {
-                out.push(cloud);
-            }
-        }
-        Ok(out)
+impl std::fmt::Display for Cloud {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
     }
 }
 
@@ -134,10 +149,12 @@ impl Rule {
     ];
 
     /// Position in [`Rule::ALL`], for fixed-size metric tables.
+    #[must_use]
     pub const fn index(self) -> usize {
         self as usize
     }
 
+    #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
             Rule::Subject => "subject",
@@ -156,6 +173,7 @@ impl Rule {
     }
 
     /// Whether `cloud` enforces this rule.
+    #[must_use]
     pub fn applies_to(self, cloud: Cloud) -> bool {
         match self {
             Rule::Subject | Rule::CommonName => cloud == Cloud::Aws,
@@ -194,7 +212,10 @@ impl std::fmt::Display for Finding {
 /// its certificate can tell — trust anchors and IAM conditions are the
 /// relying party's configuration, not the certificate's.
 ///
-/// Errors only when the chain cannot be parsed at all.
+/// # Errors
+///
+/// [`Error::Certificate`] only when the chain cannot be parsed at all; every
+/// rule a parsable chain breaks is a [`Finding`], not an error.
 pub fn check(chain_pem: &str, clouds: &[Cloud]) -> Result<Vec<Finding>> {
     if clouds.is_empty() {
         return Ok(Vec::new());
@@ -290,8 +311,7 @@ fn check_sans(leaf: &X509Certificate<'_>, broken: &mut Vec<(Rule, String)>) {
         [only] if only.starts_with("spiffe://") => {
             let path = only["spiffe://".len()..]
                 .split_once('/')
-                .map(|(_, p)| p)
-                .unwrap_or("");
+                .map_or("", |(_, p)| p);
             let mapped = path.strip_prefix("cluster/").unwrap_or(path);
             if mapped.len() > GCP_MAX_SUBJECT_LEN {
                 broken.push((
@@ -464,6 +484,10 @@ mod tests {
         params
     }
 
+    #[expect(
+        clippy::needless_pass_by_value,
+        reason = "every call site builds the params inline"
+    )]
     fn sign(params: CertificateParams, by: &Ca) -> String {
         let key = KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
         params.signed_by(&key, &by.issuer).unwrap().pem()
@@ -667,10 +691,10 @@ mod tests {
             Cloud::parse_list(" aws, gcp ,aws").unwrap(),
             vec![Cloud::Aws, Cloud::Gcp]
         );
-        assert!(Cloud::parse_list("azure").is_err());
+        Cloud::parse_list("azure").unwrap_err();
         for (i, c) in Cloud::ALL.into_iter().enumerate() {
             assert_eq!(c.index(), i);
-            assert_eq!(Cloud::parse(c.as_str()).unwrap(), c);
+            assert_eq!(c.to_string().parse::<Cloud>().unwrap(), c);
         }
     }
 

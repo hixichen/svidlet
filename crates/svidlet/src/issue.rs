@@ -30,6 +30,18 @@ pub struct Publisher {
     ca: Mutex<String>,
 }
 
+impl std::fmt::Debug for Publisher {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // The issuer is a trait object; its names are what identify it.
+        f.debug_struct("Publisher")
+            .field("issuer", &self.issuer.name())
+            .field("auth", &self.issuer.auth_name())
+            .field("policy", &self.policy)
+            .field("volumes", &self.store.len())
+            .finish_non_exhaustive()
+    }
+}
+
 impl Publisher {
     pub fn new(
         cfg: Arc<Config>,
@@ -149,8 +161,8 @@ impl Publisher {
             if *cached == fetched {
                 return Ok(0);
             }
-            *cached = fetched.clone();
-        }
+            cached.clone_from(&fetched);
+        };
         info!(
             "trust bundle changed; rewriting ca.crt",
             volumes = self.store.len()

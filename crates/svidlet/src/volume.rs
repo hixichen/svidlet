@@ -40,10 +40,22 @@ const POLICY_LINK: &str = "..policy-data";
 const POLICY_VERSION_PREFIX: &str = "..policy.";
 
 /// The certificate and its key. One atomic swap.
+///
+/// `Debug` redacts the private key; the certificate and bundle are public.
 pub struct Identity {
     pub key_pem: String,
     pub cert_chain_pem: String,
     pub ca_pem: String,
+}
+
+impl std::fmt::Debug for Identity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Identity")
+            .field("key_pem", &"<redacted>")
+            .field("cert_chain_pem", &self.cert_chain_pem)
+            .field("ca_pem", &self.ca_pem)
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -73,7 +85,7 @@ pub fn ensure_tmpfs(target: &Path, size: &str, policy_gid: Option<u32>) -> io::R
 
 /// Publish the certificate chain. Atomic, and independent of the policy chain.
 pub fn publish_identity(target: &Path, identity: &Identity, modes: Modes) -> io::Result<()> {
-    let version = next_version(target, VERSION_PREFIX)?;
+    let version = next_version(target, VERSION_PREFIX);
     let dir = target.join(format!("{VERSION_PREFIX}{version}"));
     fs::create_dir(&dir)?;
     fs::set_permissions(&dir, fs::Permissions::from_mode(0o755))?;
@@ -109,7 +121,7 @@ pub fn publish_identity(target: &Path, identity: &Identity, modes: Modes) -> io:
 /// Writes the whole directory afresh each time, so a document removed upstream
 /// really disappears rather than lingering from the previous revision.
 pub fn publish_policy(target: &Path, bundle: &PolicyBundle, mode: u32) -> io::Result<()> {
-    let version = next_version(target, POLICY_VERSION_PREFIX)?;
+    let version = next_version(target, POLICY_VERSION_PREFIX);
     let dir = target.join(format!("{POLICY_VERSION_PREFIX}{version}"));
     fs::create_dir(&dir)?;
     fs::set_permissions(&dir, fs::Permissions::from_mode(0o755))?;
@@ -145,6 +157,7 @@ pub fn publish_policy(target: &Path, bundle: &PolicyBundle, mode: u32) -> io::Re
 
 /// The revision currently published, if any. Lets the policy daemon skip a
 /// volume that is already up to date without rewriting it.
+#[must_use]
 pub fn published_revision(target: &Path) -> Option<String> {
     fs::read_to_string(target.join(POLICY_LINK).join(REVISION_FILE))
         .ok()
@@ -206,6 +219,7 @@ pub fn read_cert_chain(target: &Path) -> io::Result<String> {
 /// The name a volume gets in the exposure farm: its volume ID reduced to one
 /// safe path segment. Derived from the volume ID rather than the target path
 /// because both the publish path and restart recovery know the ID.
+#[must_use]
 pub fn farm_name(volume_id: &str) -> String {
     let mut name: String = volume_id
         .chars()
@@ -254,7 +268,10 @@ pub fn unexpose(farm_root: &Path, name: &str) -> io::Result<()> {
 }
 
 #[cfg(target_os = "linux")]
-#[allow(unsafe_code)]
+#[expect(
+    unsafe_code,
+    reason = "libc::mount with MS_BIND; there is no safe std API for mounts"
+)]
 fn expose_at(point: &Path, target: &Path) -> io::Result<()> {
     if point.exists() && is_mount_point(point)? {
         return Ok(());
@@ -368,7 +385,10 @@ fn write_file(path: &Path, contents: &[u8], mode: u32) -> io::Result<()> {
 
 /// Give a file to a group, so a non-root workload can read a 0640 key.
 #[cfg(target_os = "linux")]
-#[allow(unsafe_code)]
+#[expect(
+    unsafe_code,
+    reason = "libc::chown on a NUL-terminated path; std::os::unix::fs::chown would need a uid too"
+)]
 fn chgrp(path: &Path, gid: u32) -> io::Result<()> {
     let path_c = cstring(path.as_os_str().as_encoded_bytes())?;
     // SAFETY: path_c is a NUL-terminated string that outlives the call; -1 for
@@ -392,7 +412,7 @@ fn fsync_dir(path: &Path) -> io::Result<()> {
 
 /// Version numbers only ever increase, so a reader that already opened the old
 /// directory keeps reading a consistent set until it reopens.
-fn next_version(target: &Path, prefix: &str) -> io::Result<u64> {
+fn next_version(target: &Path, prefix: &str) -> u64 {
     let mut highest = 0;
     if let Ok(entries) = fs::read_dir(target) {
         for entry in entries.flatten() {
@@ -401,7 +421,7 @@ fn next_version(target: &Path, prefix: &str) -> io::Result<u64> {
             }
         }
     }
-    Ok(highest + 1)
+    highest + 1
 }
 
 fn version_of(name: &str, prefix: &str) -> Option<u64> {
@@ -486,7 +506,10 @@ fn same_device_as_parent(path: &Path) -> io::Result<bool> {
 }
 
 #[cfg(target_os = "linux")]
-#[allow(unsafe_code)]
+#[expect(
+    unsafe_code,
+    reason = "libc::mount of a tmpfs; there is no safe std API for mounts"
+)]
 fn mount_tmpfs(target: &Path, size: &str, policy_gid: Option<u32>) -> io::Result<()> {
     use std::ffi::CString;
 
@@ -508,7 +531,7 @@ fn mount_tmpfs(target: &Path, size: &str, policy_gid: Option<u32>) -> io::Result
             target_c.as_ptr(),
             fstype.as_ptr(),
             flags,
-            options.as_ptr() as *const libc::c_void,
+            options.as_ptr().cast::<libc::c_void>(),
         )
     };
     if rc != 0 {
@@ -518,7 +541,10 @@ fn mount_tmpfs(target: &Path, size: &str, policy_gid: Option<u32>) -> io::Result
 }
 
 #[cfg(target_os = "linux")]
-#[allow(unsafe_code)]
+#[expect(
+    unsafe_code,
+    reason = "libc::umount2 with MNT_DETACH; there is no safe std API for unmounts"
+)]
 fn unmount(target: &Path) -> io::Result<()> {
     let target_c = cstring(target.as_os_str().as_encoded_bytes())?;
     // MNT_DETACH so a workload still holding the mount does not block cleanup.
@@ -748,7 +774,7 @@ mod tests {
         // can be assumed.
         let dir = scratch("either-order");
         publish_policy(&dir, &bundle("r1", &[("a", "1")]), 0o644).unwrap();
-        assert!(read_identity(&dir).is_err());
+        read_identity(&dir).unwrap_err();
         assert_eq!(published_revision(&dir).as_deref(), Some("r1"));
 
         publish_identity(&dir, &identity("1"), MODES).unwrap();
@@ -812,6 +838,13 @@ mod tests {
             assert!(!name.starts_with('.'), "{id:?} -> {name:?}");
             assert_ne!(name, "..");
         }
+    }
+
+    #[test]
+    fn debug_output_never_contains_the_private_key() {
+        let rendered = format!("{:?}", identity("secret-material"));
+        assert!(rendered.contains("CERT-secret-material"));
+        assert!(!rendered.contains("KEY-secret-material"), "{rendered}");
     }
 
     #[cfg(target_os = "linux")]

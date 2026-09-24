@@ -6,10 +6,11 @@ use std::sync::Arc;
 use tokio_stream::wrappers::UnixListenerStream;
 use tonic::transport::Server;
 
-use svidlet_issue::{
-    AppRoleAuth, CertAuth, Issuer, KubernetesAuth, StaticTokenAuth, VaultEndpoint, VaultHttp,
-    VaultIssuer, VaultPkiConfig,
+use svidlet_issue::vault::{
+    AppRoleAuth, CertAuth, KubernetesAuth, StaticTokenAuth, VaultEndpoint, VaultHttp, VaultIssuer,
+    VaultPkiConfig,
 };
+use svidlet_issue::Issuer;
 
 use crate::config::AuthSettings;
 
@@ -70,11 +71,11 @@ pub async fn run(cfg: Config) -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let publisher = Arc::new(Publisher::new(
-        cfg.clone(),
-        policy.clone(),
-        issuer.clone(),
-        store.clone(),
-        metrics.clone(),
+        Arc::clone(&cfg),
+        Arc::clone(&policy),
+        Arc::clone(&issuer),
+        Arc::clone(&store),
+        Arc::clone(&metrics),
     ));
 
     // Prime the trust bundle before serving, but do not make it fatal: the
@@ -82,7 +83,7 @@ pub async fn run(cfg: Config) -> Result<(), Box<dyn std::error::Error>> {
     // refusing to start during a Vault outage would take down a node that could
     // still be serving already-valid certificates.
     {
-        let primer = publisher.clone();
+        let primer = Arc::clone(&publisher);
         match tokio::task::spawn_blocking(move || primer.prime_ca()).await? {
             Ok(()) => info!("trust bundle loaded", backend = issuer.name()),
             Err(e) => warn!(
@@ -96,7 +97,7 @@ pub async fn run(cfg: Config) -> Result<(), Box<dyn std::error::Error>> {
     // re-runs the same adoption periodically: a volume that cannot be adopted
     // the first time is never re-published by the kubelet, so without the
     // loop its certificate would expire under a running pod.
-    let adopting = publisher.clone();
+    let adopting = Arc::clone(&publisher);
     tokio::task::spawn_blocking(move || {
         recover::adopt(
             &adopting.cfg,
@@ -107,21 +108,21 @@ pub async fn run(cfg: Config) -> Result<(), Box<dyn std::error::Error>> {
     })
     .await?;
 
-    tokio::spawn(renew::renewal_loop(publisher.clone()));
-    tokio::spawn(renew::ca_refresh_loop(publisher.clone()));
-    tokio::spawn(renew::reaper_loop(publisher.clone()));
-    tokio::spawn(renew::adopt_loop(publisher.clone()));
+    tokio::spawn(renew::renewal_loop(Arc::clone(&publisher)));
+    tokio::spawn(renew::ca_refresh_loop(Arc::clone(&publisher)));
+    tokio::spawn(renew::reaper_loop(Arc::clone(&publisher)));
+    tokio::spawn(renew::adopt_loop(Arc::clone(&publisher)));
 
     if !cfg.metrics_addr.is_empty() {
         tokio::spawn(metrics::serve(
             cfg.metrics_addr.clone(),
-            metrics.clone(),
-            store.clone(),
+            Arc::clone(&metrics),
+            Arc::clone(&store),
         ));
     }
 
-    let csi = serve_csi(cfg.clone(), publisher.clone())?;
-    let registration = serve_registration(cfg.clone())?;
+    let csi = serve_csi(&cfg, Arc::clone(&publisher))?;
+    let registration = serve_registration(&cfg)?;
 
     // Either server exiting means the plugin can no longer do its job; let the
     // process die so the kubelet sees the sockets close and the DaemonSet
@@ -129,13 +130,13 @@ pub async fn run(cfg: Config) -> Result<(), Box<dyn std::error::Error>> {
     tokio::select! {
         r = csi => { r??; }
         r = registration => { r??; }
-        _ = shutdown() => info!("shutting down"),
+        () = shutdown() => info!("shutting down"),
     }
     Ok(())
 }
 
 fn serve_csi(
-    cfg: Arc<Config>,
+    cfg: &Config,
     publisher: Arc<Publisher>,
 ) -> Result<tokio::task::JoinHandle<Result<(), tonic::transport::Error>>, Box<dyn std::error::Error>>
 {
@@ -155,7 +156,7 @@ fn serve_csi(
 }
 
 fn serve_registration(
-    cfg: Arc<Config>,
+    cfg: &Config,
 ) -> Result<tokio::task::JoinHandle<Result<(), tonic::transport::Error>>, Box<dyn std::error::Error>>
 {
     let listener = bind(&cfg.registration_socket)?;
@@ -241,7 +242,7 @@ pub fn build_issuer(cfg: &Config) -> Result<Arc<dyn Issuer>, Box<dyn std::error:
             role_id,
             secret_id_path,
         } => Arc::new(VaultIssuer::new(
-            http.clone(),
+            Arc::clone(&http),
             pki,
             AppRoleAuth::new(http, mount.clone(), role_id.clone(), secret_id_path.clone()),
         )),
@@ -250,7 +251,7 @@ pub fn build_issuer(cfg: &Config) -> Result<Arc<dyn Issuer>, Box<dyn std::error:
             role,
             token_path,
         } => Arc::new(VaultIssuer::new(
-            http.clone(),
+            Arc::clone(&http),
             pki,
             KubernetesAuth::new(http, mount.clone(), role.clone(), token_path.clone()),
         )),
@@ -260,7 +261,7 @@ pub fn build_issuer(cfg: &Config) -> Result<Arc<dyn Issuer>, Box<dyn std::error:
             cert_path,
             key_path,
         } => Arc::new(VaultIssuer::new(
-            http.clone(),
+            Arc::clone(&http),
             pki,
             CertAuth::new(
                 http,
@@ -280,13 +281,13 @@ pub fn build_issuer(cfg: &Config) -> Result<Arc<dyn Issuer>, Box<dyn std::error:
 
 async fn shutdown() {
     use tokio::signal::unix::{signal, SignalKind};
-    let mut term = match signal(SignalKind::terminate()) {
-        Ok(s) => s,
-        Err(_) => return std::future::pending().await,
+    // Without a signal handler there is nothing to wait for; the servers run
+    // until the kubelet kills the pod.
+    let Ok(mut term) = signal(SignalKind::terminate()) else {
+        return std::future::pending().await;
     };
-    let mut int = match signal(SignalKind::interrupt()) {
-        Ok(s) => s,
-        Err(_) => return std::future::pending().await,
+    let Ok(mut int) = signal(SignalKind::interrupt()) else {
+        return std::future::pending().await;
     };
     tokio::select! {
         _ = term.recv() => {}
@@ -417,6 +418,6 @@ mod tests {
 
     #[tokio::test]
     async fn binding_somewhere_impossible_is_an_error_not_a_panic() {
-        assert!(bind(Path::new("/proc/nonexistent/csi.sock")).is_err());
+        bind(Path::new("/proc/nonexistent/csi.sock")).unwrap_err();
     }
 }

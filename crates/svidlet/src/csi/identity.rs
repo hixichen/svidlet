@@ -8,11 +8,13 @@ use super::proto::csi::{
     GetPluginInfoResponse, ProbeRequest, ProbeResponse,
 };
 
+#[derive(Debug)]
 pub struct IdentityService {
     driver_name: String,
 }
 
 impl IdentityService {
+    #[must_use]
     pub fn new(driver_name: String) -> Self {
         IdentityService { driver_name }
     }
@@ -27,7 +29,7 @@ impl Identity for IdentityService {
         Ok(Response::new(GetPluginInfoResponse {
             name: self.driver_name.clone(),
             vendor_version: env!("CARGO_PKG_VERSION").to_string(),
-            manifest: Default::default(),
+            manifest: std::collections::HashMap::default(),
         }))
     }
 
@@ -90,6 +92,6 @@ mod tests {
         // Readiness must not depend on the PKI backend, or a Vault outage
         // would stop the kubelet calling a plugin whose certificates are fine.
         let svc = IdentityService::new("csi.svidlet.io".into());
-        assert!(svc.probe(Request::new(ProbeRequest {})).await.is_ok());
+        svc.probe(Request::new(ProbeRequest {})).await.unwrap();
     }
 }

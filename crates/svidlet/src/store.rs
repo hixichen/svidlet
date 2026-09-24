@@ -9,7 +9,7 @@ use svidlet_issue::SpiffeId;
 use crate::rand;
 
 /// Which pod a volume belongs to. Carried for logs and metrics only — the
-/// identity itself is namespace and ServiceAccount.
+/// identity itself is namespace and `ServiceAccount`.
 #[derive(Debug, Clone)]
 pub struct PodRef {
     pub name: String,
@@ -36,6 +36,7 @@ pub struct Entry {
 }
 
 impl Entry {
+    #[must_use]
     pub fn is_due(&self, now: i64) -> bool {
         now >= self.renew_at
     }
@@ -47,6 +48,11 @@ impl Entry {
 /// Each round of renewals widens the spread by the width of this window, so a
 /// fleet issued in one rollout converges to a uniform load after about five
 /// lifetimes. Narrowing the window slows that convergence proportionally.
+#[must_use]
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "the product is at most the lifetime, an i64 to begin with; truncating to a whole second is intended"
+)]
 pub fn jittered_renew_at(not_before: i64, not_after: i64, fraction: (f64, f64)) -> i64 {
     let lifetime = (not_after - not_before).max(1) as f64;
     let (min, max) = fraction;
@@ -54,12 +60,13 @@ pub fn jittered_renew_at(not_before: i64, not_after: i64, fraction: (f64, f64)) 
     not_before + (lifetime * point) as i64
 }
 
-#[derive(Default)]
+#[derive(Debug, Default)]
 pub struct Store {
     inner: Mutex<HashMap<PathBuf, Entry>>,
 }
 
 impl Store {
+    #[must_use]
     pub fn new() -> Self {
         Store::default()
     }
@@ -149,6 +156,7 @@ impl Store {
 
 /// 30 s, 60 s, 120 s … capped at 10 min, then ±25 % jitter so retries after an
 /// outage do not arrive as one wave.
+#[must_use]
 pub fn backoff_secs(failures: u32) -> i64 {
     const BASE: i64 = 30;
     const CAP: i64 = 600;
