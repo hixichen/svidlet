@@ -227,7 +227,7 @@ Each entry is `name=audience`, or a bare audience that is itself a valid file na
 export AZURE_FEDERATED_TOKEN_FILE=/var/run/svid/jwt/azure
 ```
 
-Declaring an audience is a request, not a grant: the issuer's grants say which SPIFFE IDs may have which audiences, and a pod asking for one it is not granted does not start (`PermissionDenied`). Tokens need the node to run with node bootstrap and `SVIDLET_TOKEN_ISSUER` set ([DEPLOY.md](DEPLOY.md#token-issuer)).
+Declaring an audience is a request, not a grant: the issuer's grants say which SPIFFE IDs may have which audiences, and a pod asking for one it is not granted does not start (`PermissionDenied`). Tokens need the node to run with node bootstrap and `SVIDLET_TOKEN_ISSUER` set ([DEPLOY.md](DEPLOY.md#token-issuer-the-interface)).
 
 ### Prove your own identity, to yourself
 

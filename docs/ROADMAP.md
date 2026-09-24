@@ -2,7 +2,7 @@
 
 **Workload identity for rented GPU fleets — node attestation, X.509 pod identity, and cloud federation without a per-cluster control plane.**
 
-Status: Phase 0 and svidlet's side of Phase 1 landed; Phase 3 built end to end, not yet deployed · Scope: \~100 clusters, \~120k nodes, 1–2.4M pods · Owner: platform identity
+Status: Phase 0 and svidlet's side of Phases 1 and 3 landed; not yet deployed · Scope: \~100 clusters, \~120k nodes, 1–2.4M pods · Owner: platform identity
 
 **Depends on:** [DESIGN.md](DESIGN.md) (what svidlet is today) · [DEPLOY.md](DEPLOY.md) (deploying it, alone or with node bootstrap) · [USAGE.md](USAGE.md) (what a workload does with the certificate) · [config.md](config.md)
 
@@ -30,8 +30,8 @@ What is in this repository now, against the phases in §8. Items that live outsi
 | 1 | Hand-off from svidlet-node-bootstrap | **Done on svidlet's side** ([DEPLOY.md](DEPLOY.md)): the `node-bootstrap` kustomize component runs the bootstrap init container and renew sidecar in svidlet's pod over a memory-backed `/node`; svidlet reads `/node/node.crt` and `node.key` by default, checks at start-up that the certificate names this node and cluster and carries a CN, and exports `svidlet_node_certificate_expiry_seconds`. |
 | 1 | EK inventory, step-ca, enrolment and renewal containers, soak | In [svidlet-node-bootstrap](https://github.com/hixichen/svidlet-node-bootstrap). `hack/local-vault.sh` and the kind e2e stand a Vault PKI mount in for step-ca, so cert auth is testable without a TPM. |
 | 2 | Cloud federation rollout | Not started (cloud-side). |
-| 3 | Token issuer service | **Built** (`crates/svidlet-token-issuer`, [DEPLOY.md](DEPLOY.md#token-issuer)): gRPC over mutual TLS with node certificates only; verifies the pod chain against the Vault CA, same cluster as the node, a proof of possession of the pod key, and a per-identity grant; ES256 pool with RFC 7638 `kid`s, publish-only keys for rollover, JWKS and OIDC discovery served or written for static hosting; `exp` capped at the pod certificate's `notAfter`; denials counted by reason. Keys load from PKCS#8 files, not Transit/KMS. §5 records where the build departs from the original design. |
-| 3 | svidlet: `audiences` attribute, `jwt/<name>` publication, refresh | **Built** (`SVIDLET_TOKEN_ISSUER`). Minted after the certificate at publish and re-minted with every renewal, all-or-nothing, in the same `..data` swap; restart recovers audiences from the published tokens. A refused audience fails the mount with `PermissionDenied`; an unreachable issuer with `Unavailable`, so the kubelet retries. Metrics `svidlet_tokens_minted_total`, `svidlet_token_failures_total{code}`, `svidlet_earliest_token_expiry_seconds`. |
+| 3 | Token issuer service | In [svidlet-token-issuer](https://github.com/hixichen/svidlet-token-issuer). This repository fixes the interface — `crates/svidlet-token` and [DEPLOY.md](DEPLOY.md#token-issuer-the-interface): gRPC `Mint` over mutual TLS with the node certificate, a proof of possession of the pod key, status codes and what each means to svidlet — and what the issuer must check: pod chain to the Vault CA, same cluster as the node, the proof, a per-identity grant, `exp` ≤ the pod certificate's `notAfter`. §5 records where this departs from the original design. |
+| 3 | svidlet: `audiences` attribute, `jwt/<name>` publication, refresh | **Built** (`SVIDLET_TOKEN_ISSUER`), tested against a stand-in issuer that enforces the interface. Minted after the certificate at publish and re-minted with every renewal, all-or-nothing, in the same `..data` swap; restart recovers audiences from the published tokens. A refused audience fails the mount with `PermissionDenied`; an unreachable issuer with `Unavailable`, so the kubelet retries. Metrics `svidlet_tokens_minted_total`, `svidlet_token_failures_total{code}`, `svidlet_earliest_token_expiry_seconds`. |
 | 3 | `iss` registered with a relying party; rotation rehearsed | Not started. |
 | 4 | Hardening | Not started. |
 | — | CI | **Added**: fmt, clippy `-D warnings`, the test suite (privileged container), MSRV build, `deploy/` validated with kubeconform, and the live-Vault tests. |
@@ -203,7 +203,7 @@ mTLS with the NODE cert, unary Mint calls        for each request (pod chain, au
 - **JWT TTL 6h**, refresh at 50–70% with jitter. Runway ≈ 3h of issuer outage before any pod lacks a fresh token; fail-stale applies.
 - **Issuer server SVID** comes from the same Vault CA; nodes verify it with the `ca.crt` they already hold.
 
-**As built, and why it differs:**
+**The interface as fixed, and why it differs** (svidlet and `crates/svidlet-token` implement the caller; [svidlet-token-issuer](https://github.com/hixichen/svidlet-token-issuer) the rest):
 
 - **Unary calls, not a stream.** Each mint is a unary RPC on a connection svidlet keeps open and rebuilds only when the node certificate or CA changes. The handshake amortisation is the same; a unary call needs no in-band correlation, retries per token, and maps refusals onto gRPC status codes svidlet already classifies.
 - **Proof of possession.** A pod certificate is public — it is sent in every TLS handshake the pod makes — so the chain alone proves nothing about the caller. Each request carries a signature by the pod's key over the node ID, pod ID, audience and time. A node can only exchange certificates whose keys it holds, which for an honest fleet means pods it issued for, and the issuer's log then attributes every token to the node that issued its certificate — the join the placement auditor needs.
@@ -214,7 +214,7 @@ mTLS with the NODE cert, unary Mint calls        for each request (pod chain, au
 
 ### 5.3 Keys and JWKS
 
-- **Pool of K = 2–4 ES256 keys**, generated in Vault Transit/KMS, loaded into replica memory at start (as built: PKCS#8 files from a Secret, marked `sign = true` or publish-only); KMS/Vault touched only at rotation. Weekly rotation with one overlapping generation ⇒ **4–8 `kid`s** in the JWKS, changing weekly — under any cloud limit and independent of pod or replica churn.
+- **Pool of K = 2–4 ES256 keys**, generated in Vault Transit/KMS, loaded into replica memory at start  KMS/Vault touched only at rotation. Weekly rotation with one overlapping generation ⇒ **4–8 `kid`s** in the JWKS, changing weekly — under any cloud limit and independent of pod or replica churn.
 - One `iss` per security boundary you would revoke wholesale (typically prod / non-prod), not per cluster. Cloud federation is registered once per `iss`.
 - Algorithm agility is the actual PQ plan: when relying parties accept ML-DSA, add an ML-DSA `kid`, later retire ES256. Only the issuer changes.
 - Optional hardening: run issuer replicas in a TEE (Nitro Enclave / SEV-SNP / TDX) with the pool key sealed to the image measurement. This yields the "compromised issuer host cannot mint" property that motivates split-key schemes, with plain ES256 and attestation on \~10 machines we own rather than 120k we rent.
@@ -288,7 +288,7 @@ With cert auth the issuing node is in the audit log without any extra configurat
 **Phase 3 — Stage 2 token issuer (+16 → +28 weeks)**
 
 - Issuer service: mTLS, node-cert-authenticated persistent streams, pod-cert verification, cluster-prefix and audience allowlist enforcement, ES256 pool keys, JWKS publisher, OIDC discovery.
-- svidlet: `audiences` volume attribute, `jwt/<aud>` publication with atomic swap, refresh loop, metrics (`svidlet_jwt_age_seconds`, issuer stream connected). *(✅ issuer and svidlet side both built and tested end to end in-process — see Progress; not yet deployed.)*
+- svidlet: `audiences` volume attribute, `jwt/<aud>` publication with atomic swap, refresh loop, metrics (`svidlet_jwt_age_seconds`, issuer stream connected). *(✅ svidlet's side built and tested against a stand-in issuer; the issuer is [svidlet-token-issuer](https://github.com/hixichen/svidlet-token-issuer).)*
 - Register `iss` with Azure and first OIDC-only SaaS; rotation runbook rehearsed (target: \<15 min pool rotation end-to-end).
 - Optional: TEE deployment of issuer replicas.
 
@@ -310,17 +310,17 @@ Once identities flow, the operational risk moves to the *bindings*: which SPIFFE
 
 ## 10. Gaps found in review
 
-What the plan above did not cover, found while building Phases 0–3. The first four were design gaps in Stage 2 and are closed in the build (§5.2, "As built"); the rest are open and belong to the phase named.
+What the plan above did not cover, found while building Phases 0–3. The first four were design gaps in Stage 2 and are closed in the interface (§5.2); the rest are open and belong to the phase named.
 
 | # | Gap | State |
 | --- | --- | --- |
 | 1 | The issuer accepted a pod certificate without proof the caller holds its key | **Closed**: proof of possession. |
-| 2 | Audience allowlist per cluster: any workload could get any audience its cluster had | **Closed**: grants per SPIFFE ID prefix. |
-| 3 | A JWT could outlive the certificate it was derived from | **Closed**: `exp` ≤ `notAfter`. |
+| 2 | Audience allowlist per cluster: any workload could get any audience its cluster had | **Closed** in the interface: the issuer grants per SPIFFE ID prefix. |
+| 3 | A JWT could outlive the certificate it was derived from | **Closed** in the interface: the issuer caps `exp` at `notAfter`, and svidlet re-mints with every renewal. |
 | 4 | Two refresh clocks (certificate, token) that drift | **Closed**: re-mint on renewal. |
-| 5 | **Public discovery.** Azure, GCP and SaaS verifiers fetch `https://<iss>/.well-known/openid-configuration` and the JWKS from the internet; the issuer runs in private networks | Open, Phase 3. `svidlet-token-issuer discovery` writes both files for static hosting (bucket + CDN); `public_listen` serves them for a load balancer. Decide which, per `iss`. |
-| 6 | **Key rollover vs JWKS caching.** Verifiers cache the JWKS for hours; a key that signs before they have fetched it causes a fleet-wide outage for that audience | Open, Phase 3. The build supports publish-before-sign (`sign = false`); the runbook must wait out the longest verifier cache, so the "\<15 min rotation" target applies to *removing* a compromised key, not to introducing one. |
-| 7 | **Issuer configuration is read at start.** Keys, grants, CAs and the serving certificate change only by rolling restart; the serving certificate is issued by hand (30 days) | Open, Phase 4: reload on change. Better still, let the issuer take its certificate from svidlet like any pod and have svidlet verify the issuer by SPIFFE ID rather than DNS name. |
+| 5 | **Public discovery.** Azure, GCP and SaaS verifiers fetch `https://<iss>/.well-known/openid-configuration` and the JWKS from the internet; the issuer runs in private networks | Open, Phase 3 (svidlet-token-issuer): static hosting (bucket + CDN) or a load balancer in front of the issuer. Decide which, per `iss`. |
+| 6 | **Key rollover vs JWKS caching.** Verifiers cache the JWKS for hours; a key that signs before they have fetched it causes a fleet-wide outage for that audience | Open, Phase 3 (svidlet-token-issuer). Publish before signing; the runbook must wait out the longest verifier cache, so the "\<15 min rotation" target applies to *removing* a compromised key, not to introducing one. |
+| 7 | **The issuer's serving certificate is issued by hand** — from the Vault role `TOKEN_ISSUER_DNS` creates, because svidlet verifies the issuer by DNS name | Open, Phase 4, svidlet side: verify the issuer by SPIFFE ID instead, so it can take its certificate from svidlet like any pod and rotate with no ceremony. |
 | 8 | **No node deny list.** A node found misbehaving keeps its registration certificate for up to 24 h, and nothing at Vault or the issuer refuses it sooner | Open, Phase 4. Both need the same hook — Vault cert-auth `allowed_common_names` or an entity disable, and an issuer deny list — fed by the placement auditor. |
 | 9 | **Vault audit volume** at full scope: ~110 signs/s plus ~50 logins/s at ~7 KB per entry is **~70–100 GB/day** into the placement auditor's pipeline | Open, Phase 0 sizing. Ship to a log pipeline, not local disk; the auditor needs only the node CN, serial and `uri_sans`. |
 | 10 | **Rate limits are per path, not per client.** One noisy node can exhaust its cluster's `pki/sign` quota and delay every other node's pods | Open (§11 Q6). A per-node limit belongs at the placement auditor or the issuer, which know the node. |

@@ -5,7 +5,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             std::env::set_var("PROTOC", protoc);
         }
     }
-    // Both ends: svidlet is the client, svidlet-token-issuer the server.
+    // Both ends: svidlet is the client; the server is generated for the
+    // svidlet-token-issuer project and for svidlet's tests, which stand one in.
     tonic_prost_build::configure()
         .build_client(true)
         .build_server(true)

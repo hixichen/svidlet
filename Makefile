@@ -44,7 +44,7 @@ release: ## release build of the whole workspace
 	$(RUN) cargo build --release --workspace
 
 .PHONY: test
-test: ## unit + integration tests (337; no cluster, no Vault needed; run as root)
+test: ## unit + integration tests (306; no cluster, no Vault needed; run as root)
 	$(RUN) cargo test --workspace
 
 .PHONY: test-vault
@@ -123,7 +123,7 @@ deploy: ## apply deploy/$(VARIANT) to the current kubectl context (VARIANT=with-
 
 .PHONY: manifests
 manifests: ## render every deploy/ variant and validate it against the Kubernetes 1.31 schemas (needs kubectl, kubeconform)
-	@for v in standalone with-node-bootstrap with-tokens dev token-issuer; do \
+	@for v in standalone with-node-bootstrap with-tokens dev; do \
 		printf '%-22s' "$$v"; \
 		kubectl kustomize deploy/$$v | kubeconform -strict -kubernetes-version 1.31.0 -summary -; \
 	done

@@ -5,17 +5,19 @@
 //! a small central issuer from the workload's X.509-SVID. svidlet asks on the
 //! pod's behalf and writes the token into the pod's volume beside `tls.crt`.
 //!
-//! This crate is what both ends share, and nothing else, so the node side
-//! links none of the issuer's key handling or chain verification:
+//! The issuer is its own project,
+//! [svidlet-token-issuer](https://github.com/hixichen/svidlet-token-issuer);
+//! svidlet is a caller. This crate is the interface between them, and
+//! nothing else — an issuer written in Rust can depend on it, and one written
+//! in anything else implements `proto/token.proto` and the rules below:
 //!
 //! - [`proto`]: the gRPC API, client and server.
 //! - [`pop`]: the proof that the caller holds the pod's private key, not just
-//!   a copy of its (public) certificate.
+//!   a copy of its (public) certificate — how svidlet signs it, and how an
+//!   issuer must verify it.
 //! - [`Audience`] and [`parse_audiences`]: what a pod may put in its volume's
 //!   `audiences` attribute, and the file each token is written to.
 //! - [`Claims`]: the token's payload, for reading an issued token back.
-//!
-//! The issuer itself is `svidlet-token-issuer`.
 
 #![forbid(unsafe_code)]
 

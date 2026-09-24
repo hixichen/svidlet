@@ -1,5 +1,6 @@
 # deploy/with-node-bootstrap plus JWT-SVIDs: svidlet asks the token issuer
-# (deploy/token-issuer, deployed once for the trust domain) for a token per
+# (https://github.com/hixichen/svidlet-token-issuer, deployed once for the trust
+# domain) for a token per
 # audience a volume declares. See docs/USAGE.md, "JWT-SVIDs".
 #
 #   kubectl apply -k deploy/with-tokens

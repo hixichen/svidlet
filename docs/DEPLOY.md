@@ -24,7 +24,7 @@ certificate svidlet issues are the same.
 ```sh
 kubectl apply -k deploy/standalone            # or: make deploy
 kubectl apply -k deploy/with-node-bootstrap   # or: make deploy VARIANT=with-node-bootstrap
-kubectl apply -k deploy/with-tokens           # with-node-bootstrap, plus JWT-SVIDs (see Token issuer)
+kubectl apply -k deploy/with-tokens           # with-node-bootstrap, plus JWT-SVIDs from svidlet-token-issuer
 ```
 
 `deploy/base` holds everything the variants share and is not deployable by itself.
@@ -100,52 +100,65 @@ the component follows them.
 - svidlet-node-bootstrap never talks to Vault's PKI or sees a workload key.
 - `svidlet-policy` never sees `/node`.
 
-## Token issuer
+## Token issuer: the interface
 
-JWT-SVIDs ([USAGE.md](USAGE.md) §3) come from a central issuer, `svidlet-token-issuer`, deployed
-once per trust domain — or once per `iss`, if production and non-production are to be revoked
-separately ([ROADMAP.md](ROADMAP.md) §5). svidlet calls it on the pod's behalf, authenticating with
-the node certificate, so tokens need `with-node-bootstrap`; `deploy/with-tokens` is that variant
-with `SVIDLET_TOKEN_ISSUER` set.
+JWT-SVIDs ([USAGE.md](USAGE.md) §3) come from a central issuer,
+[svidlet-token-issuer](https://github.com/hixichen/svidlet-token-issuer) — its own project,
+deployed once per trust domain or once per `iss` ([ROADMAP.md](ROADMAP.md) §5). svidlet is a
+caller: it asks on the pod's behalf, authenticating with the node certificate, so tokens need
+`with-node-bootstrap`. `deploy/with-tokens` is that variant with `SVIDLET_TOKEN_ISSUER` set.
 
-The issuer checks, for every token: the caller's certificate chains to the node registration CA
-and names a node; the pod's chains to the Vault CA and is in the same cluster; the request is
-signed by the pod's key, for this node, within two minutes; and a grant allows this SPIFFE ID
-this audience. `svidlet_token_denied_total{reason}` counts which check refused.
+What follows is the whole contract. The `svidlet-token` crate is its reference implementation —
+`proto/token.proto`, the proof in `pop`, the claims in `Claims` — and svidlet's
+`tests/tokens.rs` runs svidlet against a stand-in issuer that enforces it.
 
-```sh
-# The serving certificate, from a Vault role that allows exactly this DNS name.
-TOKEN_ISSUER_DNS=svidlet-token-issuer.svidlet-system.svc \
-  AUTH=cert NODE_CA_FILE=step-ca-root.pem ./deploy/vault-bootstrap.sh example.org cluster-a
-# … then the two commands it prints, which create svidlet-token-issuer-tls.
+### What svidlet sends
 
-# A signing key (P-256, PKCS#8). Generate it where it will be kept — KMS, an HSM export, or:
-openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-256 -out current.pem
-kubectl -n svidlet-system create secret generic svidlet-token-issuer-keys --from-file=current.pem
+- **Transport:** gRPC `svidlet.token.v1.TokenIssuer/Mint` over HTTP/2 and TLS, to
+  `SVIDLET_TOKEN_ISSUER`. One connection per node, kept open; one unary call per token. It is
+  rebuilt when the node certificate or the CA changes.
+- **Client certificate:** the node certificate, `/node/node.crt` — URI SAN
+  `spiffe://<td>/cluster/<cluster>/node/<node>`, from the node registration CA.
+- **Server verification:** the issuer's certificate must chain to the pod trust bundle (`ca.crt`,
+  so a certificate from the Vault PKI mount works with no configuration) or to
+  `SVIDLET_TOKEN_ISSUER_CACERT`, and name the URL's host as a DNS SAN.
+  `TOKEN_ISSUER_DNS=<host> ./deploy/vault-bootstrap.sh …` creates a Vault role that issues exactly
+  that.
+- **Request:** the pod's chain as published (`tls.crt`, leaf first), one audience, and a proof: an
+  ECDSA P-256 / SHA-256 signature, ASN.1 DER, by the pod's key over the UTF-8 bytes
+  `svidlet-token-proof-v1\n<node ID>\n<pod ID>\n<audience>\n<unix seconds>`, with the time
+  in `proof_time`. Each call signs afresh.
+- **When:** at `NodePublishVolume`, after the certificate is issued and before the volume is
+  published; then after every certificate renewal. All of a volume's audiences succeed or none
+  are published.
 
-# Who may call, and whose certificates count.
-vault read -field=ca_chain pki/cert/ca_chain > pod-ca.pem
-kubectl -n svidlet-system create configmap svidlet-token-issuer-cas \
-  --from-file=node-ca.pem=step-ca-root.pem --from-file=pod-ca.pem
+### What svidlet expects back
 
-# Edit deploy/token-issuer/config.toml — the issuer URL and the grants — then:
-kubectl apply -k deploy/token-issuer
-```
+- **A compact JWS** whose payload has `sub` = the pod's SPIFFE ID and `aud` = the requested
+  audience, as a single string. svidlet checks both and refuses anything else; it never checks the
+  signature — relying parties do. It also reads `iss`, `iat`, `nbf`, `exp` and `jti` (all
+  required), and schedules from `exp`, which should not be later than the pod certificate's
+  `notAfter`.
+- **Refusals as gRPC status codes**, which svidlet treats the way it treats the same refusal from
+  Vault:
 
-**Discovery.** Verifiers — Azure, GCP, SaaS — fetch `<issuer>/.well-known/openid-configuration`
-and the JWKS it names from the internet, while the issuer usually is not on it. Either route
-the `public` port (plain HTTP, nothing secret) through a TLS-terminating load balancer at the
-issuer URL, or publish static copies:
+  | Status | svidlet error code | Pod start | After a renewal |
+  |---|---|---|---|
+  | `PERMISSION_DENIED` — the pod may not have this audience | `policy` | fails with `PermissionDenied`: the pod's error | old tokens kept, retried with backoff |
+  | `UNAUTHENTICATED` — the node or its proof was refused, including a stale proof | `auth` | fails with `Unavailable`; the kubelet retries | same |
+  | `INVALID_ARGUMENT`, `FAILED_PRECONDITION`, `UNIMPLEMENTED` — a bug on one side | `protocol` | fails with `Unavailable` | same |
+  | anything else, or no answer within `SVIDLET_TOKEN_TIMEOUT` | `transport` | fails with `Unavailable` | same |
 
-```sh
-svidlet-token-issuer discovery config.toml ./site   # writes site/.well-known/{openid-configuration,jwks.json}
-```
+  The code is the label on `svidlet_token_failures_total{code}`.
 
-**Key rotation** is three restarts: add the next key with `sign = false` and wait out the
-verifiers' JWKS cache (hours, not minutes); flip the new key to `sign = true` and the old one to
-`sign = false`; remove the old key once `token_ttl_secs` has passed. A static discovery copy must
-be republished at each step. Grants, CAs and the serving certificate are likewise read at start:
-change them with a rolling restart.
+### What the issuer must check
+
+svidlet's side is only safe if the issuer checks, for every token: the client certificate chains
+to the node registration CA and names a node; the pod chain verifies to the Vault CA and is
+currently valid; the pod's cluster is the node's; the proof verifies under the pod certificate's
+key, names the node *from the TLS certificate*, and is fresh (svidlet assumes ±120 s,
+`pop::WINDOW_SECS`); and a grant allows this SPIFFE ID this audience, nothing by default. How
+grants, keys, discovery and rotation work is the issuer's business.
 
 ## Standalone
 

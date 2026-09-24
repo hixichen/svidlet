@@ -38,7 +38,7 @@ rcgen = { workspace = true, features = ["x509-parser"] }
 ring.workspace = true
 serde_json.workspace = true
 svidlet-issue.workspace = true
-svidlet-token-issuer.workspace = true
+x509-parser.workspace = true
 time = "0.3"
 
 [lints]

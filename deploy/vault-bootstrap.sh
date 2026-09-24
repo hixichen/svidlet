@@ -25,7 +25,7 @@
 #
 # TOKEN_ISSUER_DNS=svidlet-token-issuer.svidlet-system.svc also creates the
 # role that issues the Stage 2 token issuer's serving certificate
-# (deploy/token-issuer): that DNS name only, server auth only, so nodes verify
+# (svidlet-token-issuer, deployed separately): that DNS name only, server auth only, so nodes verify
 # the issuer with the ca.crt they already hold.
 set -euo pipefail
 

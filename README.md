@@ -106,15 +106,16 @@ hand-off from [svidlet-node-bootstrap](https://github.com/hixichen/svidlet-node-
 (node certificate identity check, expiry metric, renewal without restart),
 customisable SPIFFE IDs, a Subject CN for cloud federation, on-node checks against
 AWS and GCP certificate rules, renewal with jitter, restart recovery, trust-bundle
-refresh, policy bundle streaming, JWT-SVIDs from a central token issuer (the issuer
-itself is in this repository), and Prometheus metrics. Policy is distributed
+refresh, policy bundle streaming, JWT-SVIDs requested from a central token issuer
+([svidlet-token-issuer](https://github.com/hixichen/svidlet-token-issuer), a separate
+project), and Prometheus metrics. Policy is distributed
 either way: streamed per identity over gRPC, or pulled as signed OCI bundles with a
 staged ring rollout.
 
 Policy distribution runs in a second process so that a compromise of the policy path
 cannot mint identities — see [Policy](#policy).
 
-337 tests, plus ten integration tests that run against a real Vault
+306 tests, plus ten integration tests that run against a real Vault
 (`./hack/local-vault.sh`) — among them that what the documented role signs passes
 both clouds' rules, and that a node certificate from another cluster cannot log in.
 
@@ -339,7 +340,7 @@ SVIDLET_POLICY_ENABLED=false cargo run -p svidlet     # no policy backend needed
 never drift. The gate a change must pass is `make ci`.
 
 ```sh
-cargo test                  # 337 tests, no cluster and no Vault needed (runs as root:
+cargo test                  # 306 tests, no cluster and no Vault needed (runs as root:
                             # volumes are bind-mounted and chowned as on a node)
 ./hack/coverage.sh          # coverage report; fails under 80%
 ./hack/bench-memory.sh      # resident memory under load
@@ -655,8 +656,8 @@ measurements above say that compromise cost far less than feared — it is the d
 between comfortably inside a 16 MB budget and comfortably inside a tighter one, not
 between fitting and not fitting.
 
-Unsafe code is denied crate-wide. `svidlet-issue`, `svidlet-token` and
-`svidlet-token-issuer` are `#![forbid(unsafe_code)]`; the
+Unsafe code is denied crate-wide. `svidlet-issue` and `svidlet-token` are
+`#![forbid(unsafe_code)]`; the
 plugin has exactly two `unsafe` blocks, both `libc` FFI for `mount`/`umount2`, each
 `#[allow]`ed individually with a SAFETY note. A tmpfs cannot be mounted without them,
 and shelling out to `mount(8)` would trade two audited lines for a process spawn.
@@ -682,7 +683,7 @@ crates/
     tests/rollout.rs      Bundle rollout against a stub registry: promote, roll back,
                           freeze, bad signature, offline, restart
     tests/policy_daemon.rs    The daemon against volumes svidlet published
-    tests/tokens.rs       Audiences → jwt/ files against a real in-process issuer
+    tests/tokens.rs       Audiences → jwt/ files, against a stand-in issuer that enforces the interface
     src/bin/svidlet-bench.rs  A load generator that stands in for the kubelet
   svidlet-issue/          Issuance library
     src/template.rs       SPIFFE ID templates and the operator's ID pattern
@@ -692,21 +693,14 @@ crates/
     src/auth.rs           The authentication seam, and the token cache every backend needs
     src/error.rs          The stable error-code taxonomy
     src/vault/            Vault PKI: HTTP, four auth methods, the issuer
-  svidlet-token/          The token protocol both ends share
+  svidlet-token/          The interface to svidlet-token-issuer (a separate project)
     proto/token.proto     TokenIssuer.Mint
     src/audience.rs       The `audiences` volume attribute
-    src/pop.rs            Proof of possession of the pod key
-  svidlet-token-issuer/   The Stage 2 JWT-SVID issuer (a central Deployment)
-    src/mint.rs           Every check between a request and a signed token
-    src/grants.rs         Which SPIFFE ID prefixes may ask for which audiences
-    src/keys.rs           The ES256 key pool, kids, JWKS
-    src/server.rs         gRPC over mutual TLS; discovery, JWKS and metrics over HTTP
-    tests/grpc.rs         The issuer over its real transport
+    src/pop.rs            Proof of possession of the pod key: how it is signed and checked
 deploy/base/              CSIDriver, DaemonSet, Service — shared by every variant
 deploy/standalone/        svidlet alone, Vault Kubernetes auth
 deploy/with-node-bootstrap/  svidlet with svidlet-node-bootstrap, Vault cert auth
-deploy/with-tokens/       The same, plus JWT-SVIDs from the token issuer
-deploy/token-issuer/      The token issuer's Deployment and example configuration
+deploy/with-tokens/       The same, plus JWT-SVIDs from svidlet-token-issuer
 deploy/dev/               kind and local clusters, AppRole
 deploy/components/        node-bootstrap, tokens and approle, as kustomize components
 deploy/vault-bootstrap.sh The Vault side of each variant
@@ -718,7 +712,8 @@ hack/coverage.sh          Coverage report with an 80% floor
 .github/workflows/ci.yml  make ci, MSRV, manifests and the live-Vault tests
 docs/DESIGN.md            Design document
 docs/ROADMAP.md           Node attestation, cloud federation, the JWT issuer — and progress
-docs/DEPLOY.md            Choosing a variant; the interface with svidlet-node-bootstrap
+docs/DEPLOY.md            Choosing a variant; the interfaces with svidlet-node-bootstrap
+                          and svidlet-token-issuer
 docs/config.md            Configuration reference: every environment variable, by process
 ../svidlet-policy/authz-management-plane.md   Authorization management (svidlet-policy repo):
                           two processes, exposure farm,

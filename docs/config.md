@@ -112,7 +112,7 @@ Unset, svidlet never contacts an issuer, and a volume that declares `audiences` 
 | `SVIDLET_TOKEN_ISSUER_CACERT` | *(the trust bundle)* | PEM file with the CA that signed the issuer's serving certificate. By default the pod trust bundle (`ca.crt`) is used, since the issuer's certificate comes from the same Vault CA. |
 | `SVIDLET_TOKEN_TIMEOUT` | `10s` | Connect and per-request timeout. |
 
-The client certificate is the node certificate (`SVIDLET_NODE_CERT_FILE` / `SVIDLET_NODE_KEY_FILE`), re-read on every mint, and the connection is rebuilt when it or the CA changes. The issuer's own configuration is a TOML file, documented in [deploy/token-issuer/config.toml](../deploy/token-issuer/config.toml).
+The client certificate is the node certificate (`SVIDLET_NODE_CERT_FILE` / `SVIDLET_NODE_KEY_FILE`), re-read on every mint, and the connection is rebuilt when it or the CA changes. The issuer is a separate project, [svidlet-token-issuer](https://github.com/hixichen/svidlet-token-issuer); what svidlet sends it and expects back is in [DEPLOY.md](DEPLOY.md#token-issuer-the-interface).
 
 ## `svidlet-policy` — the policy daemon
 

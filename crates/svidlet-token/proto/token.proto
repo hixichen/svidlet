@@ -11,10 +11,13 @@ package svidlet.token.v1;
 service TokenIssuer {
   // Mint one JWT-SVID. The subject is the pod certificate's SPIFFE ID; the
   // pod's cluster must be the calling node's, and a grant must allow the
-  // audience for that ID. Errors are gRPC statuses:
-  //   UNAUTHENTICATED     the caller presented no usable node certificate
-  //   INVALID_ARGUMENT    the chain or proof is malformed, or the proof is stale
+  // audience for that ID. Errors are gRPC statuses, which svidlet acts on:
+  //   UNAUTHENTICATED     no usable node certificate, or a proof that does not
+  //                       verify or is stale (svidlet retries)
+  //   INVALID_ARGUMENT    a malformed chain or request (svidlet does not retry)
   //   PERMISSION_DENIED   another cluster's pod, or no grant for the audience
+  //                       (the pod fails to start: its error, not the node's)
+  // Anything else is treated as the issuer being unavailable, and retried.
   rpc Mint(MintRequest) returns (MintResponse);
 }
 

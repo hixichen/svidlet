@@ -4,7 +4,6 @@ members = [
     "crates/svidlet",
     "crates/svidlet-issue",
     "crates/svidlet-token",
-    "crates/svidlet-token-issuer",
 ]
 
 [workspace.package]
@@ -20,7 +19,6 @@ rust-version = "1.88"
 [workspace.dependencies]
 svidlet-issue = { path = "crates/svidlet-issue", version = "0.0.1" }
 svidlet-token = { path = "crates/svidlet-token", version = "0.0.1" }
-svidlet-token-issuer = { path = "crates/svidlet-token-issuer", version = "0.0.1" }
 base64 = "0.23"
 basic-toml = "0.1"
 libc = "0.2"
