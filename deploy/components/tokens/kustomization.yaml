@@ -1,0 +1,12 @@
+# Points svidlet at the Stage 2 token issuer (deploy/token-issuer), so a
+# volume with an `audiences` attribute also gets jwt/<name> files. Needs
+# certificate auth — the issuer authenticates nodes by their node certificate —
+# so it goes on top of deploy/with-node-bootstrap:
+#
+#   components:
+#     - ../components/node-bootstrap
+#     - ../components/tokens
+apiVersion: kustomize.config.k8s.io/v1alpha1
+kind: Component
+patches:
+  - path: config.yaml

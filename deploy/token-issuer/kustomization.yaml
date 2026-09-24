@@ -1,0 +1,23 @@
+# The Stage 2 token issuer: one Deployment per trust domain (or per cluster),
+# not a node component. svidlet calls it over mutual TLS with the node
+# certificate, so it pairs with deploy/with-node-bootstrap plus
+# deploy/components/tokens.
+#
+#   kubectl apply -k deploy/token-issuer
+#
+# Before applying, create in svidlet-system (docs/DEPLOY.md, "Token issuer"):
+#   svidlet-token-issuer-tls   kubernetes.io/tls; from the Vault token-issuer
+#                              role (TOKEN_ISSUER_DNS=... vault-bootstrap.sh)
+#   svidlet-token-issuer-keys  the signing keys, PKCS#8 PEM, P-256
+#   svidlet-token-issuer-cas   node-ca.pem (step-ca root) and pod-ca.pem (the
+#                              Vault PKI chain)
+# and set the grants and issuer URL in config.toml.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: svidlet-system
+resources:
+  - issuer.yaml
+configMapGenerator:
+  - name: svidlet-token-issuer
+    files:
+      - config.toml

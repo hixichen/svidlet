@@ -22,6 +22,11 @@
 #       against this cluster's API server. One auth mount per cluster.
 #   AUTH=approle ./vault-bootstrap.sh td c                         (the default)
 #       deploy/dev: kind and local clusters. A shared bearer secret.
+#
+# TOKEN_ISSUER_DNS=svidlet-token-issuer.svidlet-system.svc also creates the
+# role that issues the Stage 2 token issuer's serving certificate
+# (deploy/token-issuer): that DNS name only, server auth only, so nodes verify
+# the issuer with the ca.crt they already hold.
 set -euo pipefail
 
 TRUST_DOMAIN="${1:?usage: $0 <trust-domain> <cluster>}"
@@ -65,6 +70,15 @@ if ! vault secrets list -format=json | grep -q "\"${PKI_MOUNT}/\""; then
     ttl=87600h > /dev/null
 fi
 
+# Audit devices HMAC every request value by default, which would leave the
+# placement auditor unable to read which identity was issued. The requested
+# SPIFFE ID and CN are not secret; the CSR and the issued key material stay
+# hashed (the certificate itself is public too, but large).
+vault secrets tune \
+  -audit-non-hmac-request-keys=uri_sans \
+  -audit-non-hmac-request-keys=common_name \
+  "${PKI_MOUNT}"
+
 echo "==> PKI role ${ROLE}"
 # allowed_uri_sans is the whole enforcement story: Vault, not the node, decides
 # that a certificate requested by cluster ${CLUSTER} carries a ${CLUSTER} path.
@@ -95,6 +109,25 @@ vault write "${PKI_MOUNT}/roles/${ROLE}" \
   no_store=true \
   max_ttl="${MAX_TTL}" \
   ttl=6h
+
+if [ -n "${TOKEN_ISSUER_DNS:-}" ]; then
+  echo "==> PKI role token-issuer (${TOKEN_ISSUER_DNS})"
+  # Shared by the trust domain, like the mount. No URI SANs: this certificate
+  # names a service, never a workload, and cannot be used as a client.
+  vault write "${PKI_MOUNT}/roles/token-issuer" \
+    allowed_domains="${TOKEN_ISSUER_DNS}" \
+    allow_bare_domains=true \
+    allow_subdomains=false \
+    allow_glob_domains=false \
+    allow_ip_sans=false \
+    allowed_uri_sans="" \
+    server_flag=true \
+    client_flag=false \
+    key_type=ec \
+    key_bits=256 \
+    max_ttl=720h \
+    ttl=720h
+fi
 
 echo "==> Policy svidlet-${CLUSTER}"
 vault policy write "svidlet-${CLUSTER}" - <<POLICY
@@ -194,9 +227,10 @@ if has_auth cert; then
     --from-literal=SVIDLET_VAULT_CERT_ROLE=svidlet-${CLUSTER} \\
     --dry-run=client -o yaml | kubectl apply -f -
 
-Each node needs its registration certificate at /etc/svidlet/node/tls.crt and
-its key at /etc/svidlet/node/tls.key (SVIDLET_NODE_CERT_FILE / _KEY_FILE),
-with URI SAN spiffe://${TRUST_DOMAIN}/cluster/${CLUSTER}/node/<node-name>.
+Each node needs its registration certificate at /node/node.crt and its key at
+/node/node.key (SVIDLET_NODE_CERT_FILE / _KEY_FILE), with URI SAN
+spiffe://${TRUST_DOMAIN}/cluster/${CLUSTER}/node/<node-name> and a non-empty
+Subject CN. deploy/with-node-bootstrap puts them there.
 SUMMARY
 fi
 
@@ -215,5 +249,19 @@ if has_auth approle; then
 Rotate the secret ID on a fixed cadence by repeating the second command;
 svidlet re-reads the file on its next login and needs no restart. AppRole is
 for dev and kind clusters: in production, use AUTH=cert.
+SUMMARY
+fi
+
+if [ -n "${TOKEN_ISSUER_DNS:-}" ]; then
+  cat <<SUMMARY
+
+Issue the token issuer's serving certificate (30 days; re-issue and restart
+the Deployment before it expires):
+
+  vault write -format=json ${PKI_MOUNT}/issue/token-issuer \\
+    common_name=${TOKEN_ISSUER_DNS} > issuer.json
+  kubectl -n svidlet-system create secret tls svidlet-token-issuer-tls \\
+    --cert=<(jq -r '.data.certificate, .data.ca_chain[]' issuer.json) \\
+    --key=<(jq -r .data.private_key issuer.json)
 SUMMARY
 fi

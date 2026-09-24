@@ -15,6 +15,7 @@ Everything that varies between clusters is an environment variable, so one image
 - **Validation happens at start-up.** A bad template, pattern, duration, or mode fails fast with the variable's name in the error. Two cross-variable rules are also enforced at start-up:
   - `SVIDLET_POLICY_GID` must not equal `SVIDLET_KEY_GID` — the policy daemon would be able to read every `tls.key` on the node.
   - `SVIDLET_POLICY_REQUIRED` requires `SVIDLET_POLICY_GID` — without it no bundle could ever be written and every pod start would fail.
+  - `SVIDLET_TOKEN_ISSUER` requires `SVIDLET_VAULT_AUTH=cert` — the issuer authenticates the node by its node certificate.
 - The **gID chain** must line up across manifest and workload: `SVIDLET_KEY_GID` = the workload's `runAsGroup`; `SVIDLET_POLICY_GID` = the `svidlet-policy` container's `runAsGroup`. See [USAGE.md](USAGE.md) §2.
 
 ---
@@ -100,6 +101,18 @@ Per method:
 | `SVIDLET_NODE_CERT_FILE` | `/node/node.crt` | *(cert)* The node certificate svidlet-node-bootstrap writes — URI SAN `spiffe://<td>/cluster/<cluster>/node/<node>`, and `CN=<node>`, which Vault's cert method requires. Re-read on every login, so a renewal needs no restart; checked at start-up and reported in `svidlet_node_certificate_expiry_seconds`. [DEPLOY.md](DEPLOY.md) has the full interface. |
 | `SVIDLET_NODE_KEY_FILE` | `/node/node.key` | *(cert)* Its private key, PEM. The seam a TPM-backed signer replaces. |
 | `SVIDLET_VAULT_TOKEN_FILE` | `/etc/svidlet/vault/token` | *(token)* A static token file. Dev convenience, not a production method. |
+
+### JWT-SVIDs — the token issuer
+
+Unset, svidlet never contacts an issuer, and a volume that declares `audiences` fails to mount with `FailedPrecondition`. Set, each such volume gets `jwt/<name>` beside its certificate, minted at publish and re-minted with every renewal ([USAGE.md](USAGE.md) §3, "JWT-SVIDs").
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `SVIDLET_TOKEN_ISSUER` | *(none)* | The issuer's gRPC endpoint, `https://…`. Requires cert auth. |
+| `SVIDLET_TOKEN_ISSUER_CACERT` | *(the trust bundle)* | PEM file with the CA that signed the issuer's serving certificate. By default the pod trust bundle (`ca.crt`) is used, since the issuer's certificate comes from the same Vault CA. |
+| `SVIDLET_TOKEN_TIMEOUT` | `10s` | Connect and per-request timeout. |
+
+The client certificate is the node certificate (`SVIDLET_NODE_CERT_FILE` / `SVIDLET_NODE_KEY_FILE`), re-read on every mint, and the connection is rebuilt when it or the CA changes. The issuer's own configuration is a TOML file, documented in [deploy/token-issuer/config.toml](../deploy/token-issuer/config.toml).
 
 ## `svidlet-policy` — the policy daemon
 

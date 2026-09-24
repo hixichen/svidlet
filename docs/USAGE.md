@@ -13,6 +13,8 @@ What a workload can do with the files in its volume — all of it, in one list.
   tls.crt          leaf certificate, then any intermediates
   tls.key          PKCS#8 P-256 private key, mode 0640
   ca.crt           trust bundle for the whole trust domain
+  jwt/<name>       a JWT-SVID per declared audience, same mode as tls.key
+                   (only if the volume declares audiences — §3, "JWT-SVIDs")
   policy/          authorization rules        (only if a policy source is configured)
   policy.revision  upstream revision of those rules
 ```
@@ -201,7 +203,31 @@ Whether a given certificate would pass either cloud is something svidlet can tel
 
 ### Azure — keep two credentials, each doing what it is good at
 
-Azure has no first-party certificate federation that accepts an arbitrary CA. The supported path is federated identity credentials with OIDC: use the cluster's projected ServiceAccount token for Azure, and keep the svidlet certificate for service-to-service mTLS. Do not contort the design to upload six-hourly certificates to an app registration. The planned central token issuer ([ROADMAP.md](ROADMAP.md), Stage 2) turns the certificate into a JWT-SVID for exactly these OIDC-only relying parties.
+Azure has no first-party certificate federation that accepts an arbitrary CA. The supported path is federated identity credentials with OIDC: use the cluster's projected ServiceAccount token for Azure, and keep the svidlet certificate for service-to-service mTLS. Do not contort the design to upload six-hourly certificates to an app registration. Where the node runs the token issuer, a JWT-SVID with `aud=api://AzureADTokenExchange` replaces the ServiceAccount token — see the next section.
+
+### JWT-SVIDs — for relying parties that only speak OIDC
+
+Declare the audiences in the volume, the way a projected ServiceAccount token does:
+
+```yaml
+volumes:
+  - name: svid
+    csi:
+      driver: csi.svidlet.io
+      readOnly: true
+      volumeAttributes:
+        audiences: "azure=api://AzureADTokenExchange,snowflake"
+```
+
+Each entry is `name=audience`, or a bare audience that is itself a valid file name; at most eight. The pod then holds `jwt/azure` and `jwt/snowflake`: compact ES256 JWTs with `sub` = your SPIFFE ID, `aud` = the audience, `iss` = the trust domain's token issuer, and `exp` no later than your certificate's. They are swapped together with the certificate at every renewal, so the rules of §2 apply unchanged — read the file when you need the token, never once at start-up.
+
+```sh
+# Azure: a federated identity credential with issuer = the token issuer's URL,
+# subject = your SPIFFE ID, audience = api://AzureADTokenExchange. Then:
+export AZURE_FEDERATED_TOKEN_FILE=/var/run/svid/jwt/azure
+```
+
+Declaring an audience is a request, not a grant: the issuer's grants say which SPIFFE IDs may have which audiences, and a pod asking for one it is not granted does not start (`PermissionDenied`). Tokens need the node to run with node bootstrap and `SVIDLET_TOKEN_ISSUER` set ([DEPLOY.md](DEPLOY.md#token-issuer)).
 
 ### Prove your own identity, to yourself
 
@@ -223,7 +249,7 @@ openssl s_client -connect billing:8443 -CAfile /var/run/svid/ca.crt \
 
 Just as important, and each of these has bitten someone:
 
-- **Sign things.** The key is a TLS authentication key (`digitalSignature` in a TLS handshake), not a code-signing key. No artifact signing, no commit signing, no JWT SVIDs signed by the node — JWTs, when they come, are minted by a central issuer ([ROADMAP.md](ROADMAP.md), Stage 2), never with this key.
+- **Sign things.** The key is a TLS authentication key (`digitalSignature` in a TLS handshake), not a code-signing key. No artifact signing, no commit signing, no JWT-SVIDs signed by the node — JWTs are minted by the central token issuer (§3), never with this key. The key only proves to the issuer that the request is yours.
 - **Issue certificates.** The leaf is not a CA, and nothing in the volume will make it one.
 - **Act as a bearer secret.** Pasting the PEM into a header or a cookie is a misuse: any receiver would have to treat it as a long-lived password, which is exactly what the 6 h rotation exists to avoid.
 - **Prove what you run.** The cert proves *who* runs — namespace and ServiceAccount per the kubelet. Whether that workload should exist is admission control's half of the chain, still future work ([DESIGN.md](DESIGN.md)).
@@ -253,6 +279,7 @@ No revocation, deliberately; short lifetimes replace it. So the answer depends o
 | Symptom | Where to look |
 |---|---|
 | Pod stuck `ContainerCreating` | `kubectl describe pod` — the mount error is svidlet's. `InvalidArgument`: volume context missing a field (check `podInfoOnMount`); `PermissionDenied`: `SVIDLET_SPIFFE_ID_PATTERN` refused the identity; `Unavailable`: `SVIDLET_POLICY_REQUIRED` is set and no policy arrived. |
+| Pod stuck, `PermissionDenied` naming an audience | No grant at the token issuer for this SPIFFE ID and audience. `FailedPrecondition`: the node has no `SVIDLET_TOKEN_ISSUER`. `Unavailable`: the issuer is unreachable; the kubelet retries. |
 | `permission denied` reading `tls.key` | `SVIDLET_KEY_GID` does not match the workload's `runAsGroup`. |
 | Handshake fails ~6 h after start | The application read the key once at start-up and never reloaded. |
 | AWS `CreateSession` or GCP STS refuses the certificate | `svidlet_cloud_profile_findings_total{cloud,rule}` with `SVIDLET_CLOUD_PROFILE` set — the `rule` label names the problem (`subject`, `uri_san`, `chain_order`, …). |

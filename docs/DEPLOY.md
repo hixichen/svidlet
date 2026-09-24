@@ -24,6 +24,7 @@ certificate svidlet issues are the same.
 ```sh
 kubectl apply -k deploy/standalone            # or: make deploy
 kubectl apply -k deploy/with-node-bootstrap   # or: make deploy VARIANT=with-node-bootstrap
+kubectl apply -k deploy/with-tokens           # with-node-bootstrap, plus JWT-SVIDs (see Token issuer)
 ```
 
 `deploy/base` holds everything the variants share and is not deployable by itself.
@@ -98,6 +99,53 @@ the component follows them.
   the key half of this interface only.
 - svidlet-node-bootstrap never talks to Vault's PKI or sees a workload key.
 - `svidlet-policy` never sees `/node`.
+
+## Token issuer
+
+JWT-SVIDs ([USAGE.md](USAGE.md) §3) come from a central issuer, `svidlet-token-issuer`, deployed
+once per trust domain — or once per `iss`, if production and non-production are to be revoked
+separately ([ROADMAP.md](ROADMAP.md) §5). svidlet calls it on the pod's behalf, authenticating with
+the node certificate, so tokens need `with-node-bootstrap`; `deploy/with-tokens` is that variant
+with `SVIDLET_TOKEN_ISSUER` set.
+
+The issuer checks, for every token: the caller's certificate chains to the node registration CA
+and names a node; the pod's chains to the Vault CA and is in the same cluster; the request is
+signed by the pod's key, for this node, within two minutes; and a grant allows this SPIFFE ID
+this audience. `svidlet_token_denied_total{reason}` counts which check refused.
+
+```sh
+# The serving certificate, from a Vault role that allows exactly this DNS name.
+TOKEN_ISSUER_DNS=svidlet-token-issuer.svidlet-system.svc \
+  AUTH=cert NODE_CA_FILE=step-ca-root.pem ./deploy/vault-bootstrap.sh example.org cluster-a
+# … then the two commands it prints, which create svidlet-token-issuer-tls.
+
+# A signing key (P-256, PKCS#8). Generate it where it will be kept — KMS, an HSM export, or:
+openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-256 -out current.pem
+kubectl -n svidlet-system create secret generic svidlet-token-issuer-keys --from-file=current.pem
+
+# Who may call, and whose certificates count.
+vault read -field=ca_chain pki/cert/ca_chain > pod-ca.pem
+kubectl -n svidlet-system create configmap svidlet-token-issuer-cas \
+  --from-file=node-ca.pem=step-ca-root.pem --from-file=pod-ca.pem
+
+# Edit deploy/token-issuer/config.toml — the issuer URL and the grants — then:
+kubectl apply -k deploy/token-issuer
+```
+
+**Discovery.** Verifiers — Azure, GCP, SaaS — fetch `<issuer>/.well-known/openid-configuration`
+and the JWKS it names from the internet, while the issuer usually is not on it. Either route
+the `public` port (plain HTTP, nothing secret) through a TLS-terminating load balancer at the
+issuer URL, or publish static copies:
+
+```sh
+svidlet-token-issuer discovery config.toml ./site   # writes site/.well-known/{openid-configuration,jwks.json}
+```
+
+**Key rotation** is three restarts: add the next key with `sign = false` and wait out the
+verifiers' JWKS cache (hours, not minutes); flip the new key to `sign = true` and the old one to
+`sign = false`; remove the old key once `token_ttl_secs` has passed. A static discovery copy must
+be republished at each step. Grants, CAs and the serving certificate are likewise read at start:
+change them with a rolling restart.
 
 ## Standalone
 

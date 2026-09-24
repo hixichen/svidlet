@@ -1,0 +1,10 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: svidlet
+  namespace: svidlet-system
+data:
+  # Verified with the Vault ca.crt svidlet already holds, which issued the
+  # issuer's serving certificate; SVIDLET_TOKEN_ISSUER_CACERT overrides it.
+  SVIDLET_TOKEN_ISSUER: https://svidlet-token-issuer.svidlet-system.svc:8443
+  # SVIDLET_TOKEN_TIMEOUT: 10s
