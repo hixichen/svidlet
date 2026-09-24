@@ -4,7 +4,7 @@
 //! be written into the pod's tmpfs, and never sent anywhere.
 
 use rcgen::string::Ia5String;
-use rcgen::{CertificateParams, DistinguishedName, KeyPair, SanType};
+use rcgen::{CertificateParams, DistinguishedName, DnType, KeyPair, SanType};
 
 use crate::error::{Error, Result};
 use crate::template::SpiffeId;
@@ -21,10 +21,11 @@ pub struct KeyAndCsr {
 /// Generate a P-256 key and a CSR whose only subject alternative name is the
 /// workload's SPIFFE URI.
 ///
-/// The subject DN is left empty on purpose: the SPIFFE ID is the whole
-/// identity, and an empty DN keeps the PKI role from having to permit any
-/// subject fields. A Vault role must therefore set `require_cn=false`.
-pub fn generate(spiffe_id: &SpiffeId) -> Result<KeyAndCsr> {
+/// The SPIFFE ID is the whole identity. `common_name`, when given, is the
+/// Subject's only attribute — a label for relying parties that insist on a
+/// non-empty Subject (see [`crate::subject`]), never a SAN. Without one the
+/// Subject is empty, and a Vault role must then set `require_cn=false`.
+pub fn generate(spiffe_id: &SpiffeId, common_name: Option<&str>) -> Result<KeyAndCsr> {
     let san = Ia5String::try_from(spiffe_id.as_str())
         .map_err(|e| Error::Crypto(format!("SPIFFE ID is not a valid IA5 string: {e}")))?;
 
@@ -33,6 +34,9 @@ pub fn generate(spiffe_id: &SpiffeId) -> Result<KeyAndCsr> {
 
     let mut params = CertificateParams::default();
     params.distinguished_name = DistinguishedName::new();
+    if let Some(cn) = common_name {
+        params.distinguished_name.push(DnType::CommonName, cn);
+    }
     params.subject_alt_names = vec![SanType::URI(san)];
 
     let csr = params
@@ -55,7 +59,7 @@ mod tests {
     #[test]
     fn csr_carries_the_spiffe_uri_san_and_nothing_else() {
         let id = SpiffeId::parse("spiffe://example.org/cluster/a/ns/default/sa/web").unwrap();
-        let out = generate(&id).unwrap();
+        let out = generate(&id, None).unwrap();
 
         assert!(out.key_pem.starts_with("-----BEGIN PRIVATE KEY-----"));
         assert!(out
@@ -84,11 +88,37 @@ mod tests {
     }
 
     #[test]
+    fn a_common_name_is_the_only_subject_attribute_and_never_a_san() {
+        let id = SpiffeId::parse("spiffe://example.org/cluster/a/ns/default/sa/web").unwrap();
+        let out = generate(&id, Some("web-7d9f-x2x")).unwrap();
+
+        let (_, pem) = parse_x509_pem(out.csr_pem.as_bytes()).unwrap();
+        let (_, csr) = X509CertificationRequest::from_der(&pem.contents).unwrap();
+        let subject = &csr.certification_request_info.subject;
+        assert_eq!(subject.iter_attributes().count(), 1);
+        assert_eq!(
+            subject.iter_common_name().next().unwrap().as_str().unwrap(),
+            "web-7d9f-x2x"
+        );
+
+        let sans = csr
+            .requested_extensions()
+            .unwrap()
+            .find_map(|ext| match ext {
+                ParsedExtension::SubjectAlternativeName(san) => Some(san),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(sans.general_names.len(), 1);
+        assert!(matches!(sans.general_names[0], GeneralName::URI(_)));
+    }
+
+    #[test]
     fn each_call_generates_a_new_key() {
         let id = SpiffeId::parse("spiffe://example.org/ns/a/sa/b").unwrap();
         assert_ne!(
-            generate(&id).unwrap().key_pem,
-            generate(&id).unwrap().key_pem
+            generate(&id, None).unwrap().key_pem,
+            generate(&id, None).unwrap().key_pem
         );
     }
 }

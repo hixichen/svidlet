@@ -254,6 +254,7 @@ pub fn unexpose(farm_root: &Path, name: &str) -> io::Result<()> {
 }
 
 #[cfg(target_os = "linux")]
+#[allow(unsafe_code)]
 fn expose_at(point: &Path, target: &Path) -> io::Result<()> {
     if point.exists() && is_mount_point(point)? {
         return Ok(());
@@ -429,15 +430,59 @@ fn remove_stale_versions(target: &Path, prefix: &str, keep: u64) -> io::Result<(
     Ok(())
 }
 
-/// True when `path` sits on a different filesystem from its parent.
+/// True when `path` is a mount point.
+///
+/// The kernel's mount table is the authority. A bind mount of a directory on
+/// the same filesystem — which is what the policy farm is whenever the kubelet
+/// root and the farm share a disk — keeps its parent's device number, so the
+/// device comparison below is only the fallback for a host without `/proc`.
 fn is_mount_point(path: &Path) -> io::Result<bool> {
+    #[cfg(target_os = "linux")]
+    if let Ok(table) = fs::read_to_string("/proc/self/mountinfo") {
+        let wanted = fs::canonicalize(path)?;
+        return Ok(table
+            .lines()
+            .filter_map(|line| line.split(' ').nth(4))
+            .any(|point| Path::new(&unescape_mountinfo(point)) == wanted));
+    }
+    same_device_as_parent(path).map(|same| !same)
+}
+
+/// Undo the octal escaping `/proc/self/mountinfo` applies to space, tab,
+/// newline and backslash in a mount point.
+#[cfg(target_os = "linux")]
+fn unescape_mountinfo(field: &str) -> String {
+    let bytes = field.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'\\' && i + 3 < bytes.len() {
+            let digits = &bytes[i + 1..i + 4];
+            if digits.iter().all(|d| (b'0'..=b'7').contains(d)) {
+                let value = digits
+                    .iter()
+                    .fold(0u32, |acc, d| acc * 8 + u32::from(d - b'0'));
+                if let Ok(value) = u8::try_from(value) {
+                    out.push(value);
+                    i += 4;
+                    continue;
+                }
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+fn same_device_as_parent(path: &Path) -> io::Result<bool> {
     use std::os::unix::fs::MetadataExt;
     let here = fs::metadata(path)?;
     let parent = match path.parent() {
         Some(p) => fs::metadata(p)?,
-        None => return Ok(true),
+        None => return Ok(false),
     };
-    Ok(here.dev() != parent.dev())
+    Ok(here.dev() == parent.dev())
 }
 
 #[cfg(target_os = "linux")]
@@ -767,6 +812,17 @@ mod tests {
             assert!(!name.starts_with('.'), "{id:?} -> {name:?}");
             assert_ne!(name, "..");
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn mountinfo_escapes_are_undone() {
+        assert_eq!(unescape_mountinfo("/var/lib/kubelet"), "/var/lib/kubelet");
+        assert_eq!(unescape_mountinfo("/a\\040b"), "/a b");
+        assert_eq!(unescape_mountinfo("/a\\011b\\134c"), "/a\tb\\c");
+        // A trailing or malformed escape is left as it is.
+        assert_eq!(unescape_mountinfo("/a\\04"), "/a\\04");
+        assert_eq!(unescape_mountinfo("/a\\999"), "/a\\999");
     }
 
     #[test]

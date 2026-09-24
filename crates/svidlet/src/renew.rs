@@ -64,7 +64,11 @@ pub fn renew_one(publisher: &Publisher, entry: &Entry) {
     }
 
     let started = std::time::Instant::now();
-    match publisher.issue(&entry.spiffe_id, &entry.target_path) {
+    match publisher.issue(
+        &entry.spiffe_id,
+        entry.common_name.as_deref(),
+        &entry.target_path,
+    ) {
         Ok(bundle) => {
             publisher.metrics.observe_renew(started.elapsed());
             let renew_at = jittered_renew_at(

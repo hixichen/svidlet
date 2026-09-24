@@ -175,6 +175,11 @@ pub fn adopt(cfg: &Config, policy: &IdPolicy, store: &Store, metrics: &Metrics) 
             volume_id: found.volume_id.clone(),
             target_path: found.target_path.clone(),
             spiffe_id: facts.spiffe_id.clone(),
+            // Whatever the first issuance put in the Subject — possibly
+            // nothing, for a certificate from before SVIDLET_CERT_SUBJECT
+            // existed. The pod name is not in the kubelet's volume record, so
+            // this is the only place it can come back from.
+            common_name: facts.common_name.clone(),
             pod,
             not_before: facts.not_before,
             not_after: facts.not_after,

@@ -22,8 +22,8 @@ key on the node, has a PKI backend sign a certificate for
 mounts it into only the containers that should hold it. It renews in the background and
 can also ship the authorization policy that goes with the identity.
 
-No control plane, no API-server access, no sidecars, no CRDs, no datastore. 3.2 MB
-resident idle, 6.7 MB with 2000 certificates on the node.
+No control plane, no API-server access, no sidecars, no CRDs, no datastore. 5.4 MB
+resident idle, 7.7 MB with 2000 certificates on the node (Linux).
 
 ## Goal
 
@@ -33,9 +33,9 @@ honestly do it:
 - **Lightweight.** One process per node for identity, plus an optional second for policy
   — against three Go processes, or an agent with a server and its datastore. The budget
   is **16 MB resident or under**, which is what makes it deployable on edge and
-  resource-constrained nodes where the existing agents do not fit. Measured: 5.7 MB idle,
-  9.2 MB with 2000 certificates, both processes together.
-- **Easy to deploy.** A DaemonSet, a ConfigMap and a Secret. One PKI credential per
+  resource-constrained nodes where the existing agents do not fit. Measured on Linux:
+  9.3 MB idle, 11.7 MB with 2000 certificates, both processes together.
+- **Easy to deploy.** A DaemonSet and a ConfigMap. One PKI role and one auth role per
   cluster, set up once; adding a workload never touches the PKI backend.
 - **Easy to maintain.** Nothing to run but the DaemonSet. No control plane to upgrade, no
   database to back up, no API-server objects churning through etcd on every issuance. The
@@ -46,9 +46,14 @@ honestly do it:
   federation or bundle exchange. Vault enforces the per-cluster prefix, so a compromised
   node can only mint identities in its own cluster.
 
-Explicitly **not** goals: replacing SPIRE, JWT SVIDs, evaluating or enforcing policy
-(Svidlet delivers bytes), certificate revocation (short lifetimes replace it), or
-federation with external trust domains.
+Explicitly **not** goals: replacing SPIRE, signing JWT-SVIDs on the node, evaluating or
+enforcing policy (Svidlet delivers bytes), certificate revocation (short lifetimes replace
+it), or federation with external trust domains.
+
+**Where it is going:** [docs/ROADMAP.md](docs/ROADMAP.md) — TPM-attested node
+registration instead of a shared secret, the certificate itself as an AWS and GCP
+credential, and a small central issuer for JWT-SVIDs, sized for ~100 clusters and
+~120k rented GPU nodes. Its progress table says what has landed.
 
 **Known gap:** Svidlet issues identity to whatever the cluster admitted. Verifying that a
 workload is what it claims to be — signed images, a reviewed pod spec — needs a
@@ -67,6 +72,10 @@ It is a single small Rust process per node, running as a CSI node plugin:
   pluggable `Issuer` trait for other backends;
 - the certificate is mounted **only into the containers that should hold it**,
   via a `csi` ephemeral volume that is allowed under restricted Pod Security Standards;
+- the same certificate is a **cloud credential**: AWS IAM Roles Anywhere and GCP
+  workload identity federation accept it as issued, conditioned on its SPIFFE ID;
+- the node proves itself to Vault with its **own node certificate**, issued by node
+  registration — no shared secret in the cluster;
 - optionally, **authorization policy** is published into the same volume and refreshed
   when it changes upstream — either streamed per identity from a policy backend, or
   pulled as a signed, content-addressed bundle with a staged ring rollout
@@ -91,22 +100,27 @@ The trust model is stated plainly in [docs/DESIGN.md](docs/DESIGN.md).
 ## Status
 
 Implemented and covered by tests: kubelet registration,
-`NodePublishVolume`/`NodeUnpublishVolume`, Vault PKI signing over three
-authentication methods, customisable SPIFFE IDs, renewal with jitter, restart
-recovery, trust-bundle refresh, policy bundle streaming, and Prometheus metrics.
-Policy is distributed either way: streamed per identity over gRPC, or pulled as signed
-OCI bundles with a staged ring rollout.
+`NodePublishVolume`/`NodeUnpublishVolume`, Vault PKI signing over four
+authentication methods (node certificate, Kubernetes, AppRole, static token),
+customisable SPIFFE IDs, a Subject CN for cloud federation, on-node checks against
+AWS and GCP certificate rules, renewal with jitter, restart recovery, trust-bundle
+refresh, policy bundle streaming, and Prometheus metrics. Policy is distributed
+either way: streamed per identity over gRPC, or pulled as signed OCI bundles with a
+staged ring rollout.
 
 Policy distribution runs in a second process so that a compromise of the policy path
 cannot mint identities — see [Policy](#policy).
 
-241 tests, plus six integration tests that run against a real Vault
-(`./hack/local-vault.sh`).
+270 tests, plus ten integration tests that run against a real Vault
+(`./hack/local-vault.sh`) — among them that what the documented role signs passes
+both clouds' rules, and that a node certificate from another cluster cannot log in.
 
-Not started: a validating admission controller for workload provenance (the
+Not started: the TPM-backed signer for the node key, the node registration service
+itself (step-ca or go-attestation, outside this repo), the Stage 2 JWT issuer, a
+validating admission controller for workload provenance (the
 [missing half](docs/DESIGN.md#admission-control-the-missing-half-of-the-chain) of the
-trust chain), cloud IAM authentication, PKI backends other than Vault, and
-`PodCertificateRequest` signer mode for Kubernetes 1.35+.
+trust chain), PKI backends other than Vault, and `PodCertificateRequest` signer mode
+for Kubernetes 1.35+. [docs/ROADMAP.md](docs/ROADMAP.md) orders them.
 
 It has not been run on a production cluster. Treat it as working code that still
 needs soak time.
@@ -146,7 +160,8 @@ Everything under the volume is swapped atomically through a `..data` symlink, th
 same way the kubelet publishes Secret volumes, so a reloading application never
 reads a certificate that does not match its key or a half-written policy set.
 
-Vault asserts "this certificate was requested by a node in cluster X". Svidlet asserts
+Vault asserts "this certificate was requested by a node in cluster X" — because that
+node's own registration certificate says so. Svidlet asserts
 "for this pod, the kubelet told me namespace N and ServiceAccount S" — and the kubelet
 is already root on the node, so this adds no trust. Compromising one node means being
 able to mint any identity **in that cluster**; cross-cluster impersonation is blocked
@@ -161,14 +176,16 @@ this chain, and it is
 composing with Sigstore policy-controller or Kyverno is the likely shape, since a webhook
 of svidlet's own would put it on the critical path of every pod create in the cluster.
 
-**The AppRole credential is the weakest part of the design.** It is a shared bearer
-secret in a Kubernetes Secret: whoever can read that Secret can mint any identity in
-the cluster, from anywhere, until it is rotated. It proves possession of a secret, not
-that the caller is a node. It stays the default because it is the only method that
-works everywhere including bare metal, and it is simple enough to reason about in one
-sentence — but where the environment allows it, use `SVIDLET_VAULT_AUTH=kubernetes`,
-which proves the plugin's own ServiceAccount to Vault with no shared secret at all.
-[docs/DESIGN.md](docs/DESIGN.md) states this in full.
+**Nodes authenticate with a certificate, not a shared secret.** With
+`SVIDLET_VAULT_AUTH=cert` — what the shipped DaemonSet uses — each node logs in to Vault
+with the certificate node registration issued it,
+`spiffe://<td>/cluster/<c>/node/<n>`, and Vault's cert role binds the cluster from that
+URI SAN. There is no secret in a Kubernetes Secret that works for every node. The key is
+still read from a file today; a TPM-backed signer in its place is what makes it
+non-exportable ([ROADMAP.md](docs/ROADMAP.md) §3). Without a TPM,
+`SVIDLET_VAULT_AUTH=kubernetes` proves the plugin's own ServiceAccount instead. AppRole
+— a shared bearer secret that proves possession, not that the caller is a node — remains
+for dev and kind clusters only. [docs/DESIGN.md](docs/DESIGN.md) states this in full.
 
 ## Identity shape
 
@@ -316,14 +333,14 @@ SVIDLET_POLICY_ENABLED=false cargo run -p svidlet     # no policy backend needed
 never drift. The gate a change must pass is `make ci`.
 
 ```sh
-cargo test                  # 241 tests, no cluster and no Vault needed
+cargo test                  # 270 tests, no cluster and no Vault needed
 ./hack/coverage.sh          # coverage report; fails under 80%
 ./hack/bench-memory.sh      # resident memory under load
 
 # Against a real Vault on this machine:
 ./hack/local-vault.sh start
 eval "$(./hack/local-vault.sh env)"
-cargo test -p svidlet-issue -- --ignored     # 6 tests against real Vault
+cargo test -p svidlet-issue -- --ignored     # 10 tests against real Vault
 ./hack/local-vault.sh stop
 
 ./hack/kind-e2e.sh          # kind + dev Vault + DaemonSet + a workload, end to end
@@ -335,8 +352,12 @@ wrong identity), a real in-process gRPC server covers the policy stream includin
 reconnect and resubscribe, and a stub OCI registry covers the whole bundle rollout —
 promotion, rollback without network, freeze, a manifest signed by the wrong key, a
 bundle that does not match its signed digest, and a registry that goes away. The `--ignored` tests are the ones that need a real Vault:
-that the CSR svidlet builds is one Vault actually signs, and that the per-cluster role
-really refuses an identity outside its prefix.
+that the CSR svidlet builds is one Vault actually signs, that the per-cluster role
+really refuses an identity outside its prefix and a CN that would become a host name,
+that what it signs passes AWS's and GCP's certificate rules, and that a node
+certificate logs in to its own cluster and no other. `hack/local-vault.sh` runs Vault
+with TLS (cert auth needs it) and a second PKI mount standing in for the node
+registration CA.
 
 `hack/kind-e2e.sh` asserts the whole path: a pod's `app` container gets a certificate
 whose SPIFFE ID matches its ServiceAccount, its `sidecar` container cannot read that
@@ -345,7 +366,12 @@ certificate, and the volume is a real tmpfs on the node.
 ## Deploy
 
 ```sh
-# One-time, per cluster. Prints the role ID and secret ID to configure.
+# One-time, per cluster: the PKI role, and a cert auth role trusting the node
+# registration CA. Prints the ConfigMap values to set.
+VAULT_ADDR=… VAULT_TOKEN=… AUTH=cert NODE_CA_FILE=registration-ca.pem \
+  ./deploy/vault-bootstrap.sh example.org cluster-a
+
+# Dev and kind clusters, without a registration CA: AppRole instead.
 VAULT_ADDR=… VAULT_TOKEN=… ./deploy/vault-bootstrap.sh example.org cluster-a
 
 kubectl apply -f deploy/csidriver.yaml
@@ -380,31 +406,34 @@ accidental commit hard rather than to tidy up afterwards.
 
 | Secret | Where it lives | Never |
 |---|---|---|
-| Vault AppRole secret ID | a Kubernetes Secret, mounted at `SVIDLET_SECRET_ID_FILE` | in Git, in the image, in a ConfigMap |
+| Node private key | on the node, from registration, at `SVIDLET_NODE_KEY_FILE` (a TPM, once the signer lands) | anywhere but that node |
+| Vault AppRole secret ID (dev only) | a Kubernetes Secret, mounted at `SVIDLET_SECRET_ID_FILE` | in Git, in the image, in a ConfigMap |
 | Vault token (dev only) | `.local-vault/`, written by `hack/local-vault.sh` | anywhere but a workstation |
 | Bundle signing key (private) | Vault Transit, or a CI secret store | on a node, in Git — nodes only ever need the public half |
 | Bundle signing key (public) | `SVIDLET_BUNDLE_PUBLIC_KEY`, a ConfigMap, or this repo | — it is safe to publish |
 
 `.gitignore` therefore excludes `/.local-vault` and `/.bundle-keys` — the two
-directories the local tooling writes real key material into — plus `*.key`, `*.p12`,
+directories the local tooling writes real key material into, including the local node
+certificate and key — plus `*.key`, `*.p12`,
 `*.pfx` and `secret-id`, which are the shapes that get dropped into a repository by
 accident. Nothing in svidlet reads those paths; they are there so a stray copy cannot be
 committed without noticing.
 
 Two things follow from the design that are worth stating plainly:
 
-- **The AppRole secret ID is the most valuable secret in the system.** Whoever can read
-  it can mint any identity in that cluster, from anywhere, until it is rotated. This is
-  the weakest part of the design and [docs/DESIGN.md](docs/DESIGN.md) says so at length;
-  `SVIDLET_VAULT_AUTH=kubernetes` removes it entirely where Vault can validate
-  ServiceAccount tokens.
+- **A node's key is worth one cluster, for one day.** Whoever copies it can mint any
+  identity in that node's cluster until the node certificate expires (24 h) or is
+  revoked; it is useless for any other cluster. Where AppRole is still in use (dev), its
+  secret ID is worse — every node's credential at once, until rotated — which is why
+  production does not use it.
 - **Nodes never hold a signing key.** Bundle verification is offline against a public
   key, so compromising a node yields no ability to sign a bundle for anyone else.
   `hack/build-bundle.sh keygen` writes a private key to a local file because that is
   the right shape for a demo and the wrong shape for production, and the script says so
   in its header.
 
-The manifests in `deploy/` carry `replace-me` placeholders rather than working values,
+The manifests in `deploy/` carry placeholder addresses rather than working values, and
+no credential at all — the node certificate comes from the node, not from the manifest —
 so applying them unedited fails loudly instead of running with a checked-in credential.
 
 ## Configuration
@@ -418,7 +447,9 @@ between clusters only by a ConfigMap.
 | `SVIDLET_CLUSTER` | *required* | Cluster segment of the SPIFFE path |
 | `NODE_NAME` | *required* | Node name, from `spec.nodeName` |
 | `VAULT_ADDR` | *required* | Vault address |
-| `SVIDLET_VAULT_AUTH` | `approle` | `approle`, `kubernetes` or `token` |
+| `SVIDLET_VAULT_AUTH` | `approle` | `cert` (production; the shipped DaemonSet sets it), `kubernetes`, `approle` (dev) or `token` |
+| `SVIDLET_VAULT_CERT_ROLE` | `svidlet-$SVIDLET_CLUSTER` | Vault cert auth role for `cert` |
+| `SVIDLET_NODE_CERT_FILE` / `_KEY_FILE` | `/etc/svidlet/node/tls.crt` / `tls.key` | Node certificate and key from registration; re-read on every login |
 | `SVIDLET_ROLE_ID` | required for `approle` | AppRole role ID (not a secret) |
 | `SVIDLET_SECRET_ID_FILE` | `/etc/svidlet/vault/secret-id` | Mounted secret ID; re-read on every login, so rotation needs no restart |
 | `SVIDLET_VAULT_K8S_ROLE` | required for `kubernetes` | Vault role for Kubernetes auth |
@@ -447,7 +478,9 @@ between clusters only by a ConfigMap.
 | `SVIDLET_PKI_MOUNT` | `pki` | PKI mount path |
 | `SVIDLET_PKI_ROLE` | `spiffe-$SVIDLET_CLUSTER` | PKI role to sign with |
 | `SVIDLET_APPROLE_MOUNT` | `approle` | AppRole auth mount path |
-| `SVIDLET_CERT_TTL` | `24h` | Requested certificate lifetime |
+| `SVIDLET_CERT_TTL` | `6h` | Requested certificate lifetime |
+| `SVIDLET_CERT_SUBJECT` | `pod_name` | Subject CN: `pod_name`, `service_account` or `none`. Never a SAN |
+| `SVIDLET_CLOUD_PROFILE` | — | `aws`, `gcp` or `aws,gcp`: check every issued certificate against those clouds' rules; count, never block |
 | `SVIDLET_RENEW_MIN_FRACTION` / `_MAX_` | `0.5` / `0.7` | Renewal jitter window, as a fraction of lifetime |
 | `SVIDLET_RENEW_CHECK_INTERVAL` | `30s` | How often the renewal loop wakes |
 | `SVIDLET_STARTUP_SPREAD` | `300s` | Window over which already-due renewals are spread after a restart |
@@ -531,6 +564,7 @@ Every label combination is exported from process start, including the zero ones,
 | `svidlet_volumes_recovered_total` | adopted after a restart, not re-issued |
 | `svidlet_volumes_adoption_skipped_total` | non-zero means certificates are being re-issued that need not be |
 | `svidlet_ca_refresh_total`, `…_failures_total` | trust bundle |
+| `svidlet_cloud_profile_findings_total{cloud,rule}` | with `SVIDLET_CLOUD_PROFILE`: issued certificates that cloud would refuse, and why |
 | `svidlet_policy_stream_connected` | 0 means policy changes have stopped arriving |
 | `svidlet_policy_bundles_applied_total` | bundles written into a volume |
 | `svidlet_policy_updates_rejected_total` | non-zero means the backend is sending something svidlet will not publish |
@@ -551,14 +585,18 @@ very long time.
 
 Measured with `./hack/bench-memory.sh`, which runs the real release binary against a
 real Vault and drives it over the real CSI protocol with `svidlet-bench` standing in for
-the kubelet:
+the kubelet. On Linux, as root, every volume a real tmpfs:
 
 | Certificates on the node | `svidlet` | `svidlet-policy` | Both |
 |---|---|---|---|
-| 0 (idle) | 3.2 MB | 2.5 MB | 5.7 MB |
-| 100 | 4.6 MB | 2.5 MB | 7.1 MB |
-| 500 | 5.1 MB | 2.5 MB | 7.6 MB |
-| 2000 | 6.7 MB | 2.5 MB | 9.2 MB |
+| 0 (idle) | 5.4 MB | 3.9 MB | 9.3 MB |
+| 100 | 5.6 MB | 3.9 MB | 9.5 MB |
+| 500 | 6.2 MB | 3.9 MB | 10.1 MB |
+| 2000 | 7.7 MB | 3.9 MB | 11.7 MB |
+
+The earlier macOS run, where volumes are plain directories and RSS is accounted
+differently, measured 3.2 / 4.6 / 5.1 / 6.7 MB for `svidlet` and 2.5 MB for
+`svidlet-policy`.
 
 The two processes are the point, not an accident — see
 [Policy](#policy) and
@@ -576,11 +614,12 @@ The `svidlet-policy` figures are idle: the benchmark drives certificates, not po
 the daemon was scanning and finding nothing. A node genuinely distributing policy will
 sit higher by roughly the size of one unpacked bundle.
 
-Two caveats. These numbers are from macOS, where the volumes are plain directories rather
-than tmpfs and RSS is accounted differently — treat them as an order of magnitude and
-measure on a real node before quoting them to anyone. And the ~10/s publish rate the
-benchmark reports is the dev-mode Vault and the sequential load generator, not svidlet;
-it says nothing about issuance throughput.
+Two caveats. These are from a single development VM, not a production node — treat them
+as an order of magnitude and measure on a real node before quoting them to anyone. And
+the publish rate the benchmark reports (150–350/s on Linux, ~10/s on macOS) is the
+dev-mode Vault and the sequential load generator as much as svidlet. It is high enough
+to trip the per-cluster 200/s Vault quota `vault-bootstrap.sh` sets, which
+`hack/local-vault.sh` lifts for that reason.
 
 The dependency tree is a compromise worth naming: the design says "no Tokio-heavy
 dependency tree", but CSI is gRPC, and `tonic` brings `tokio`, `hyper` and `h2`. The
@@ -617,10 +656,12 @@ crates/
     src/bin/svidlet-bench.rs  A load generator that stands in for the kubelet
   svidlet-issue/          Issuance library
     src/template.rs       SPIFFE ID templates and the operator's ID pattern
+    src/subject.rs        The Subject CN, and which workload attribute it comes from
+    src/profile.rs        AWS Roles Anywhere and GCP X.509 acceptance rules
     src/issuer.rs         The PKI-engine seam
     src/auth.rs           The authentication seam, and the token cache every backend needs
     src/error.rs          The stable error-code taxonomy
-    src/vault/            Vault PKI: HTTP, three auth methods, the issuer
+    src/vault/            Vault PKI: HTTP, four auth methods, the issuer
 deploy/                   CSIDriver, DaemonSet, example workload, Vault bootstrap
 hack/local-vault.sh       A dev-mode Vault on this machine, configured for svidlet
 hack/kind-e2e.sh          End-to-end check on kind against a dev Vault
@@ -628,6 +669,7 @@ hack/bench-memory.sh      Resident memory against a real Vault under real CSI lo
 hack/build-bundle.sh      What CI does: package, sign and push a bundle and rollout
 hack/coverage.sh          Coverage report with an 80% floor
 docs/DESIGN.md            Design document
+docs/ROADMAP.md           Node attestation, cloud federation, the JWT issuer — and progress
 docs/config.md            Configuration reference: every environment variable, by process
 ../svidlet-policy/authz-management-plane.md   Authorization management (svidlet-policy repo):
                           two processes, exposure farm,

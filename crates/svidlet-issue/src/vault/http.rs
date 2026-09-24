@@ -2,7 +2,7 @@
 
 use std::time::Duration;
 
-use ureq::tls::{Certificate, RootCerts, TlsConfig};
+use ureq::tls::{Certificate, ClientCert, PemItem, RootCerts, TlsConfig};
 use ureq::Agent;
 
 use crate::error::{Error, Result};
@@ -38,7 +38,44 @@ impl std::fmt::Debug for VaultHttp {
 
 impl VaultHttp {
     pub fn new(endpoint: VaultEndpoint) -> Result<VaultHttp> {
-        let mut tls = TlsConfig::builder();
+        VaultHttp::build(endpoint, None)
+    }
+
+    /// A client for the same Vault that presents a TLS client certificate —
+    /// what Vault's `cert` auth method authenticates.
+    ///
+    /// Built per login rather than once, so a node certificate rotated on disk
+    /// is what the next login presents. A PEM that does not parse is an auth
+    /// error, not a configuration one: the likeliest cause is a renewer caught
+    /// mid-write, and the next attempt will read a whole file.
+    pub fn with_client_cert(&self, cert_chain_pem: &str, key_pem: &str) -> Result<VaultHttp> {
+        let mut chain = Vec::new();
+        for item in ureq::tls::parse_pem(cert_chain_pem.as_bytes()) {
+            match item {
+                Ok(PemItem::Certificate(cert)) => chain.push(cert),
+                Ok(_) => {}
+                Err(e) => {
+                    return Err(Error::Auth(format!(
+                        "the node certificate is not valid PEM: {e}"
+                    )))
+                }
+            }
+        }
+        if chain.is_empty() {
+            return Err(Error::Auth(
+                "the node certificate file holds no certificate".into(),
+            ));
+        }
+        let key = ureq::tls::PrivateKey::from_pem(key_pem.as_bytes())
+            .map_err(|e| Error::Auth(format!("the node private key is not valid PEM: {e}")))?;
+        VaultHttp::build(
+            self.endpoint.clone(),
+            Some(ClientCert::new_with_certs(&chain, key)),
+        )
+    }
+
+    fn build(endpoint: VaultEndpoint, client_cert: Option<ClientCert>) -> Result<VaultHttp> {
+        let mut tls = TlsConfig::builder().client_cert(client_cert);
         if let Some(pem) = &endpoint.ca_cert_pem {
             let cert = Certificate::from_pem(pem.as_bytes()).map_err(|e| {
                 Error::Config(format!("the Vault CA certificate is not valid PEM: {e}"))
@@ -176,6 +213,39 @@ mod tests {
         let err = VaultHttp::new(ep).unwrap_err();
         assert_eq!(err.code(), crate::error::ErrorCode::Config);
         assert!(!err.is_retryable());
+    }
+
+    #[test]
+    fn a_client_certificate_that_does_not_parse_is_an_auth_error() {
+        let http = VaultHttp::new(endpoint("https://vault.example:8200")).unwrap();
+        for (cert, key, want) in [
+            ("", "", "holds no certificate"),
+            ("not pem at all", "", "holds no certificate"),
+            (
+                "-----BEGIN CERTIFICATE-----\nZm9v\n-----END CERTIFICATE-----\n",
+                "nope",
+                "private key",
+            ),
+        ] {
+            let err = http.with_client_cert(cert, key).unwrap_err();
+            assert_eq!(err.code(), crate::error::ErrorCode::Auth, "{err}");
+            assert!(err.is_retryable());
+            assert!(err.to_string().contains(want), "{err}");
+        }
+    }
+
+    #[test]
+    fn a_client_certificate_client_keeps_the_endpoint() {
+        let key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
+        let cert = rcgen::CertificateParams::new(vec!["node-1".into()])
+            .unwrap()
+            .self_signed(&key)
+            .unwrap();
+        let http = VaultHttp::new(endpoint("https://vault.example:8200")).unwrap();
+        let mtls = http
+            .with_client_cert(&cert.pem(), &key.serialize_pem())
+            .unwrap();
+        assert_eq!(mtls.url("auth/cert/login"), http.url("auth/cert/login"));
     }
 
     #[test]

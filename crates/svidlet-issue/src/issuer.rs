@@ -19,6 +19,10 @@ pub struct SignRequest<'a> {
     pub spiffe_id: &'a SpiffeId,
     /// PKCS#10, PEM encoded.
     pub csr_pem: &'a str,
+    /// The Subject Common Name the CSR carries, if any. Repeated here because
+    /// some backends — Vault with `use_csr_common_name=false` — take it from
+    /// the request rather than the CSR. A label, never an identity.
+    pub common_name: Option<&'a str>,
     /// Requested lifetime. Backends may clamp it to their own maximum; the
     /// caller reads the real lifetime back off the issued certificate.
     pub ttl: Duration,

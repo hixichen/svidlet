@@ -17,10 +17,12 @@ What a workload can do with the files in its volume — all of it, in one list.
   policy.revision  upstream revision of those rules
 ```
 
-The identity is the **URI SAN**, not the subject — the subject is deliberately empty:
+The identity is the **URI SAN**, not the subject. The subject is a label — `CN=<pod name>` by default (`SVIDLET_CERT_SUBJECT`) — there because AWS IAM Roles Anywhere refuses a certificate without one and writes the CN into CloudTrail as `sourceIdentity`. Never authorize on it:
 
 ```sh
-openssl x509 -in /var/run/svid/tls.crt -noout -text | grep -A1 'Subject Alternative Name'
+openssl x509 -in /var/run/svid/tls.crt -noout -subject -ext subjectAltName
+# subject=CN=api-7d9f8c-x2x4q
+# X509v3 Subject Alternative Name:
 #     URI:spiffe://example.org/cluster/cluster-a/ns/payments/sa/api
 ```
 
@@ -29,7 +31,7 @@ Properties worth knowing before anything else:
 | Property | Value |
 |---|---|
 | Key | P-256, generated on the node, never leaves the tmpfs |
-| Lifetime | short (24 h by default), renewed at a random point in the second half |
+| Lifetime | short (6 h by default), renewed at a random point between 50 % and 70 % |
 | Chain | `tls.crt` = leaf + intermediates; `ca.crt` = the fleet's trust bundle |
 | Updates | files are swapped atomically as a set — reload, don't re-read once |
 | Group | `tls.key` is `0640`, owned by `SVIDLET_KEY_GID` = the workload's `runAsGroup` |
@@ -145,16 +147,18 @@ The server you call matches your SPIFFE ID against its own policy — you are, b
 
 Not just your own services: anything that accepts a client certificate over TLS can be handed this pair — from service code or from the CLIs you already run in the pod.
 
-- **PostgreSQL:** `sslcert=/var/run/svid/tls.crt sslkey=/var/run/svid/tls.key sslrootcert=/var/run/svid/ca.crt`. Honest caveat: Postgres's `cert` authentication maps the CN, and the subject here is empty — so this gives you a *known-fleet* client cert plus an encrypted channel, not per-identity database users. Identity-scoped database auth needs an auth hook or a proxy in front.
-- **Kafka, brokers, private registries, internal dashboards:** same shape — client certificate for transport, with the caveat that ACL systems that key on CN rather than URI SAN see every pod as the same subject. The identity signal is in the SAN; use it where the product reads it.
+- **PostgreSQL:** `sslcert=/var/run/svid/tls.crt sslkey=/var/run/svid/tls.key sslrootcert=/var/run/svid/ca.crt`. Honest caveat: Postgres's `cert` authentication maps the CN, and the CN here is the pod name — different for every replica — so this gives you a *known-fleet* client cert plus an encrypted channel, not per-identity database users. `SVIDLET_CERT_SUBJECT=service_account` makes the CN stable per ServiceAccount, which a `pg_ident.conf` map can use, but the CN is not namespace- or cluster-qualified: treat it as a convenience, not an identity. Identity-scoped database auth properly needs an auth hook or a proxy that reads the URI SAN.
+- **Kafka, brokers, private registries, internal dashboards:** same shape — client certificate for transport, with the caveat that ACL systems that key on CN rather than URI SAN see a pod name, not an identity. The identity signal is in the SAN; use it where the product reads it.
 
 ### Exchange it for AWS credentials
 
-[IAM Roles Anywhere](https://docs.aws.amazon.com/rolesanywhere/) is designed for exactly this: a trust anchor for your CA bundle, a profile mapping to an IAM role, and a credential helper that turns the certificate into normal AWS credentials — no long-lived cloud key in the pod.
+[IAM Roles Anywhere](https://docs.aws.amazon.com/rolesanywhere/) is designed for exactly this: a trust anchor for your CA, a profile mapping to an IAM role, and a credential helper that turns the certificate into normal AWS credentials — no long-lived cloud key in the pod.
 
 ```sh
-# One-time: trust the intermediate, not a leaf.
-aws rolesanywhere create-trust-anchor --name svidlet --source '...certificate bundle...'
+# One-time, per account: anchor on the ROOT. Intermediates travel in tls.crt,
+# so rotating an intermediate never touches AWS.
+aws rolesanywhere create-trust-anchor --name svidlet \
+  --source 'sourceType=CERTIFICATE_BUNDLE,sourceData={x509CertificateData=<root PEM>}'
 
 # In the pod: every AWS SDK picks this up via ~/.aws/config credential_process.
 aws_signing_helper credential-process \
@@ -162,24 +166,42 @@ aws_signing_helper credential-process \
   --trust-anchor-arn "$TRUST_ANCHOR_ARN" --profile-arn "$PROFILE_ARN" --role-arn "$ROLE_ARN"
 ```
 
-The helper re-reads the certificate on every call, so renewals are free. **Scope the IAM role's trust policy to the exact SPIFFE ID** (`aws:PrincipalTag/x509SAN/URI`) — a trust anchor alone grants every workload in the fleet the same role.
+The helper re-reads the certificate on every call, so renewals are free. **Scope every role's trust policy to a cluster-qualified SPIFFE path** — a trust anchor alone grants every workload in the fleet the role, and `cluster/*` grants every cluster:
+
+```json
+"Condition": {
+  "StringLike": {
+    "aws:PrincipalTag/x509SAN/URI": "spiffe://example.org/cluster/prod-*/ns/payments/sa/api"
+  }
+}
+```
+
+Two certificate rules Roles Anywhere enforces, both met by default: the Subject must not be empty (`SVIDLET_CERT_SUBJECT=none` breaks this), and only the first URI SAN is mapped (svidlet issues exactly one). The CN appears in CloudTrail as `sourceIdentity`, which is how an AWS call is traced back to a pod.
 
 ### Exchange it for GCP credentials
 
-[Workload Identity Federation with X.509](https://cloud.google.com/iam/docs/workload-identity-federation): an x509 provider with your `ca.crt` as the trust store, and the SPIFFE ID mapped to the federated principal:
+[Workload Identity Federation with X.509](https://cloud.google.com/iam/docs/workload-identity-federation-with-x509-certificates): an X.509 provider with your root as the trust anchor, and the SPIFFE ID mapped into attributes. `google.subject` is capped at 127 bytes, so map the cluster-relative path into it and keep the whole ID as an attribute:
 
 ```sh
+gcloud iam workload-identity-pools providers create-x509 svidlet \
+  --location=global --workload-identity-pool=svidlet \
+  --trust-store-config-path=trust_store.yaml \
+  --attribute-mapping="google.subject=assertion.san.uri.extract('spiffe://example.org/cluster/{id}'),attribute.spiffe_id=assertion.san.uri" \
+  --attribute-condition="assertion.san.uri.startsWith('spiffe://example.org/cluster/prod-')"
+
 gcloud storage buckets add-iam-policy-binding gs://payments-data \
   --role=roles/storage.objectViewer \
   --member="principal://iam.googleapis.com/projects/$NUM/locations/global/\
-workloadIdentityPools/svidlet/subject/spiffe://example.org/cluster/cluster-a/ns/payments/sa/api"
+workloadIdentityPools/svidlet/subject/cluster-a/ns/payments/sa/api"
 ```
 
-In the pod, an `external_account` credential configuration pointing at the two files lets the Google SDKs do the exchange (`GOOGLE_APPLICATION_CREDENTIALS`).
+In the pod, a certificate-based credential configuration pointing at the two files lets the Google client libraries do the mTLS token exchange themselves (`google-auth` ≥ 2.39, `cloud.google.com/go/auth` ≥ 0.16).
+
+Whether a given certificate would pass either cloud is something svidlet can tell you before a pod finds out: set `SVIDLET_CLOUD_PROFILE=aws,gcp` and watch `svidlet_cloud_profile_findings_total`.
 
 ### Azure — keep two credentials, each doing what it is good at
 
-Azure has no first-party certificate federation that accepts an arbitrary CA. The supported path is federated identity credentials with OIDC: use the cluster's projected ServiceAccount token for Azure, and keep the svidlet certificate for service-to-service mTLS. Do not contort the design to upload daily-rotating certificates to an app registration.
+Azure has no first-party certificate federation that accepts an arbitrary CA. The supported path is federated identity credentials with OIDC: use the cluster's projected ServiceAccount token for Azure, and keep the svidlet certificate for service-to-service mTLS. Do not contort the design to upload six-hourly certificates to an app registration. The planned central token issuer ([ROADMAP.md](ROADMAP.md), Stage 2) turns the certificate into a JWT-SVID for exactly these OIDC-only relying parties.
 
 ### Prove your own identity, to yourself
 
@@ -201,9 +223,9 @@ openssl s_client -connect billing:8443 -CAfile /var/run/svid/ca.crt \
 
 Just as important, and each of these has bitten someone:
 
-- **Sign things.** The key is a TLS authentication key (`digitalSignature` in a TLS handshake), not a code-signing key. No artifact signing, no commit signing, no JWT SVIDs — the design has none, on purpose.
+- **Sign things.** The key is a TLS authentication key (`digitalSignature` in a TLS handshake), not a code-signing key. No artifact signing, no commit signing, no JWT SVIDs signed by the node — JWTs, when they come, are minted by a central issuer ([ROADMAP.md](ROADMAP.md), Stage 2), never with this key.
 - **Issue certificates.** The leaf is not a CA, and nothing in the volume will make it one.
-- **Act as a bearer secret.** Pasting the PEM into a header or a cookie is a misuse: any receiver would have to treat it as a long-lived password, which is exactly what the 24 h rotation exists to avoid.
+- **Act as a bearer secret.** Pasting the PEM into a header or a cookie is a misuse: any receiver would have to treat it as a long-lived password, which is exactly what the 6 h rotation exists to avoid.
 - **Prove what you run.** The cert proves *who* runs — namespace and ServiceAccount per the kubelet. Whether that workload should exist is admission control's half of the chain, still future work ([DESIGN.md](DESIGN.md)).
 - **Be trusted outside the trust domain.** A peer must hold your `ca.crt` to verify you. There is no federation with external trust domains; external systems need your bundle (as in the AWS/GCP exchanges above) or nothing.
 - **Stand in for authorization.** The certificate answers "who is calling". Whether that caller may do it is a policy decision — §3, tier 2 or 3.
@@ -222,7 +244,7 @@ No revocation, deliberately; short lifetimes replace it. So the answer depends o
 
 **Stopping issuance for a namespace or identity.** Tighten `SVIDLET_SPIFFE_ID_PATTERN` (the node refuses the next request) or the Vault role's `allowed_uri_sans` (Vault refuses it). Existing certificates are unaffected until they expire.
 
-**A node is compromised.** The node can mint any identity in its cluster, so the certificate is the smaller problem: cordon and drain; rotate that cluster's AppRole secret ID (healthy nodes re-read it without a restart); consider rotating the cluster's PKI role or the intermediate.
+**A node is compromised.** The node can mint any identity in its cluster, so the certificate is the smaller problem: cordon and drain; remove its EK hash from the inventory and revoke its node certificate at the registration CA — its Vault token lasts at most an hour, and the node certificate at most a day, so it loses Vault even if the CRL step is late ([ROADMAP.md](ROADMAP.md) §3.4). On a dev cluster still on AppRole, rotate the secret ID instead (healthy nodes re-read it without a restart). Consider rotating the cluster's PKI role or the intermediate.
 
 **Rotating the CA — the full stop**, for when a leaked key must actually be invalidated. Cross-sign or add the new intermediate first; `ca.crt` refreshes on every node within the CA refresh interval, and workloads must trust the new root *before* leaves signed by it appear, or every handshake in the fleet fails. Then switch the PKI role, wait out one full certificate lifetime, and remove the old intermediate. Skipping the wait is how you break a whole fleet at once.
 
@@ -232,7 +254,8 @@ No revocation, deliberately; short lifetimes replace it. So the answer depends o
 |---|---|
 | Pod stuck `ContainerCreating` | `kubectl describe pod` — the mount error is svidlet's. `InvalidArgument`: volume context missing a field (check `podInfoOnMount`); `PermissionDenied`: `SVIDLET_SPIFFE_ID_PATTERN` refused the identity; `Unavailable`: `SVIDLET_POLICY_REQUIRED` is set and no policy arrived. |
 | `permission denied` reading `tls.key` | `SVIDLET_KEY_GID` does not match the workload's `runAsGroup`. |
-| Handshake fails after ~12 h | The application read the key once at start-up and never reloaded. |
+| Handshake fails ~6 h after start | The application read the key once at start-up and never reloaded. |
+| AWS `CreateSession` or GCP STS refuses the certificate | `svidlet_cloud_profile_findings_total{cloud,rule}` with `SVIDLET_CLOUD_PROFILE` set — the `rule` label names the problem (`subject`, `uri_san`, `chain_order`, …). |
 | Intermittent handshake failures at renewal | Certificate and key loaded separately across a swap. Retry the load once. |
 | Peer accepted that should not have been | The peer's SPIFFE ID is not being checked — only the CA. §3. |
 | `svidlet_earliest_certificate_expiry_seconds` falling | Renewal is failing; `svidlet_issue_failures_total{code=…}` says why. |

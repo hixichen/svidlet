@@ -14,7 +14,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use svidlet_issue::ErrorCode;
+use svidlet_issue::{Cloud, ErrorCode, Rule};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
@@ -106,6 +106,8 @@ pub struct Metrics {
     /// non-zero value here means certificates are being re-issued that did not
     /// need to be.
     pub adoption_skipped: AtomicU64,
+    /// Issued certificates a configured cloud would refuse, by cloud and rule.
+    cloud_findings: [[AtomicU64; Rule::ALL.len()]; Cloud::ALL.len()],
 
     /// Static identification of the backend in use, for `svidlet_build_info`.
     backend: std::sync::OnceLock<(&'static str, &'static str)>,
@@ -135,6 +137,11 @@ impl Metrics {
 
     pub fn renew_failed(&self, code: ErrorCode) {
         self.failed_renew.inc(code);
+    }
+
+    /// Count one issued certificate breaking one cloud's rule.
+    pub fn cloud_finding(&self, cloud: Cloud, rule: Rule) {
+        self.cloud_findings[cloud.index()][rule.index()].fetch_add(1, Ordering::Relaxed);
     }
 
     pub fn observe_publish(&self, elapsed: Duration) {
@@ -192,6 +199,29 @@ impl Metrics {
                         out,
                         "{name}{{reason=\"{reason}\",code=\"{code}\"}} {}",
                         counter.get(code)
+                    );
+                }
+            }
+        }
+
+        {
+            use std::fmt::Write as _;
+            let name = "svidlet_cloud_profile_findings_total";
+            let _ = writeln!(
+                out,
+                "# HELP {name} Issued certificates a configured cloud would refuse, by rule. \
+                 Non-zero means the PKI role and SVIDLET_CERT_SUBJECT do not produce what \
+                 SVIDLET_CLOUD_PROFILE asks for."
+            );
+            let _ = writeln!(out, "# TYPE {name} counter");
+            for cloud in Cloud::ALL {
+                for rule in Rule::ALL.into_iter().filter(|r| r.applies_to(cloud)) {
+                    let _ = writeln!(
+                        out,
+                        "{name}{{cloud=\"{}\",rule=\"{}\"}} {}",
+                        cloud.as_str(),
+                        rule.as_str(),
+                        self.cloud_findings[cloud.index()][rule.index()].load(Ordering::Relaxed)
                     );
                 }
             }
@@ -425,6 +455,27 @@ mod tests {
     }
 
     #[test]
+    fn cloud_findings_are_exported_from_zero_for_the_rules_each_cloud_enforces() {
+        let metrics = Metrics::default();
+        let out = metrics.render(&Store::new());
+        assert!(
+            out.contains("svidlet_cloud_profile_findings_total{cloud=\"aws\",rule=\"subject\"} 0")
+        );
+        assert!(out.contains(
+            "svidlet_cloud_profile_findings_total{cloud=\"gcp\",rule=\"gcp_subject\"} 0"
+        ));
+        // A rule a cloud does not enforce has no series for it.
+        assert!(!out.contains("cloud=\"gcp\",rule=\"subject\""));
+
+        metrics.cloud_finding(Cloud::Aws, Rule::Subject);
+        let out = metrics.render(&Store::new());
+        assert!(
+            out.contains("svidlet_cloud_profile_findings_total{cloud=\"aws\",rule=\"subject\"} 1")
+        );
+        assert_parses(&out);
+    }
+
+    #[test]
     fn failures_are_counted_against_their_code() {
         let metrics = Metrics::default();
         metrics.publish_failed(ErrorCode::Policy);
@@ -513,6 +564,7 @@ mod tests {
                 namespace: "a".into(),
                 uid: "u".into(),
             },
+            common_name: None,
             not_before: now - 100,
             not_after: now + 900,
             renew_at: now - 1,

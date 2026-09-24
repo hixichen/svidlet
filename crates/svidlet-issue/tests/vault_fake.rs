@@ -216,10 +216,11 @@ fn id() -> SpiffeId {
 
 fn sign(issuer: &dyn Issuer) -> svidlet_issue::Result<svidlet_issue::IssuedBundle> {
     let id = id();
-    let generated = svidlet_issue::generate(&id)?;
+    let generated = svidlet_issue::generate(&id, None)?;
     issuer.sign(&SignRequest {
         spiffe_id: &id,
         csr_pem: &generated.csr_pem,
+        common_name: None,
         ttl: Duration::from_secs(3600),
         node_name: "node-1",
     })

@@ -22,6 +22,10 @@ pub struct Entry {
     pub volume_id: String,
     pub target_path: PathBuf,
     pub spiffe_id: SpiffeId,
+    /// The Subject Common Name the certificate was first issued with. Renewal
+    /// reuses it, so a label chosen from the pod name survives a restart that
+    /// can no longer see the pod name.
+    pub common_name: Option<String>,
     pub pod: PodRef,
     pub not_before: i64,
     pub not_after: i64,
@@ -124,9 +128,9 @@ impl Store {
     /// backoff and jitter, capped so a long Vault outage still retries often
     /// enough to recover quickly once it ends.
     ///
-    /// The existing certificate is never removed on failure: with a 24 h
-    /// lifetime and renewal starting at 12 h, running pods keep working through
-    /// a half-day outage.
+    /// The existing certificate is never removed on failure: renewal starts at
+    /// half the lifetime, so with the default 6 h lifetime running pods keep
+    /// working through a three-hour outage.
     pub fn record_failure(&self, target_path: &Path, now: i64) -> u32 {
         let mut guard = self.lock();
         let Some(entry) = guard.get_mut(target_path) else {
@@ -167,6 +171,7 @@ mod tests {
             volume_id: format!("csi-{path}"),
             target_path: PathBuf::from(path),
             spiffe_id: spiffe_id(),
+            common_name: Some("web-0".into()),
             pod: PodRef {
                 name: "web-0".into(),
                 namespace: "default".into(),

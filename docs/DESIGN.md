@@ -2,15 +2,17 @@
 
 A lightweight SPIFFE X.509 issuer for Kubernetes, in Rust.
 
-**Status:** Design draft · **Date:** 2026-09-05 · **License:** Apache-2.0
+**Status:** Design draft · **Date:** 2026-09-24 · **License:** Apache-2.0
+
+Where this is going — node attestation, the certificate as a cloud credential, and a central JWT issuer — is [ROADMAP.md](ROADMAP.md). This document describes what svidlet is; the roadmap records which of its phases have landed.
 
 ## TL;DR
 
 Every pod that should have an identity gets a short-lived X.509 certificate carrying a SPIFFE (Secure Production Identity Framework for Everyone) ID, so services can authenticate each other with mutual TLS (mTLS) at the application layer instead of trusting network position.
 
-Svidlet is a small Rust DaemonSet that acts as a CSI (Container Storage Interface) node plugin. When a pod starts, the kubelet tells the plugin which namespace and ServiceAccount the pod belongs to; the plugin generates a private key on the node, asks a PKI backend (HashiCorp Vault PKI first; other backends later) to sign a certificate with the identity `spiffe://<trust-domain>/cluster/<cluster>/ns/<namespace>/sa/<serviceaccount>`, and mounts the result into only the containers that should hold it. The plugin authenticates to Vault with one AppRole per cluster.
+Svidlet is a small Rust DaemonSet that acts as a CSI (Container Storage Interface) node plugin. When a pod starts, the kubelet tells the plugin which namespace and ServiceAccount the pod belongs to; the plugin generates a private key on the node, asks a PKI backend (HashiCorp Vault PKI first; other backends later) to sign a certificate with the identity `spiffe://<trust-domain>/cluster/<cluster>/ns/<namespace>/sa/<serviceaccount>`, and mounts the result into only the containers that should hold it. The plugin authenticates to Vault with its node certificate — issued by node registration, bound to the cluster by its URI SAN — through Vault's cert auth method; AppRole remains for development clusters.
 
-Why this shape: it fits a small DaemonSet memory budget (target: 16 MB resident or under), keeps certificate issuance off the Kubernetes API server, works on Kubernetes 1.31+, respects restricted Pod Security Standards, and scales to tens of thousands of nodes with one PKI credential per cluster.
+Why this shape: it fits a small DaemonSet memory budget (target: 16 MB resident or under), keeps certificate issuance off the Kubernetes API server, works on Kubernetes 1.31+, respects restricted Pod Security Standards, and scales to tens of thousands of nodes with one PKI role per cluster.
 
 ## Problem
 
@@ -26,12 +28,13 @@ Why this shape: it fits a small DaemonSet memory budget (target: 16 MB resident 
 
 ## Requirements
 
-- X.509 SVIDs only (no JWT SVIDs).
+- X.509 SVIDs are what the node issues, and the only thing it signs for. JWT-SVIDs, when they come, are signed by a central issuer that takes the pod's X.509 SVID as its input ([ROADMAP.md](ROADMAP.md), Stage 2) — the node never holds a JWT signing key.
+- The SVID must be usable as a cloud credential as issued: AWS IAM Roles Anywhere and GCP Workload Identity Federation trust the CA directly ([ROADMAP.md](ROADMAP.md), Stage 1).
 - Certificates held per container: a platform-owned sidecar can hold an identity that the tenant container in the same pod cannot read.
 - The identity a pod receives must not be chosen by the pod itself (no label/annotation-derived identity).
 - The SPIFFE ID layout must be an operator's decision, not a constant in the code: not every deployment wants the cluster in the path, and some want the node or pod in it.
 - The PKI backend and the way a node authenticates to it must be separable, so a second vendor does not mean a second plugin.
-- Vault must not need to call back into cluster API servers, and must not require per-cluster key material beyond one credential per cluster.
+- Vault must not need to call back into cluster API servers, and must not require per-cluster key material: one PKI role and one auth role per cluster, with each node's credential coming from node registration.
 - Single trust domain across clusters; no bundle federation.
 - Kubernetes 1.31+, restricted PSS for tenant pods.
 
@@ -42,7 +45,7 @@ Why this shape: it fits a small DaemonSet memory budget (target: 16 MB resident 
 **1. `svidlet` — CSI node plugin (Rust, DaemonSet, one process per node)**
 
 - Implements the kubelet plugin-registration protocol itself (no `node-driver-registrar` sidecar).
-- On `NodePublishVolume`: reads the pod's namespace, ServiceAccount, name and UID from the volume context supplied by the kubelet; generates a P-256 private key in memory; builds a certificate signing request (CSR); hands the CSR to the PKI backend (Vault: `pki/sign/spiffe-<cluster>`) with the URI SAN above; writes `tls.crt`, `tls.key`, `ca.crt` to a tmpfs mount.
+- On `NodePublishVolume`: reads the pod's namespace, ServiceAccount, name and UID from the volume context supplied by the kubelet; generates a P-256 private key in memory; builds a certificate signing request (CSR); hands the CSR to the PKI backend (Vault: `pki/sign/spiffe-<cluster>`) with the URI SAN above and a Subject `CN=<pod name>` (`SVIDLET_CERT_SUBJECT`); writes `tls.crt`, `tls.key`, `ca.crt` to a tmpfs mount.
 - Renews at a random point between 50 % and 70 % of the certificate lifetime, writing files atomically so applications can reload on file change.
 - On restart, rebuilds its renewal list from the kubelet's CSI volume records under `/var/lib/kubelet/pods`; never re-issues on restart.
 - Refreshes `ca.crt` from Vault's CA chain periodically.
@@ -54,9 +57,10 @@ The backend is behind an `Issuer` trait in the `svidlet-issue` crate; Vault PKI 
 
 
 - One PKI mount and one intermediate CA shared by all clusters (single trust domain, one `ca.crt` everywhere).
-- One PKI role per cluster whose `allowed_uri_sans` is pinned to `spiffe://<td>/cluster/<cluster>/ns/*/sa/*`, with `no_store=true` and no DNS/IP SANs permitted.
-- One AppRole per cluster, with a policy granting only `update` on that cluster's `pki/sign/…` path and `read` on the CA chain. The role ID ships in the DaemonSet config; the secret ID is delivered as a Kubernetes Secret and rotated on a fixed cadence.
-- The plugin logs in once and keeps a periodic, renewable token; it does not log in per certificate.
+- One PKI role per cluster whose `allowed_uri_sans` is pinned to `spiffe://<td>/cluster/<cluster>/ns/*/sa/*`, with `no_store=true` and no DNS/IP SANs permitted. `cn_validations=disabled` accepts the pod-name CN without treating it as a host name; svidlet sends `exclude_cn_from_sans=true`, and since the role allows no DNS names a request without it is refused.
+- One cert auth role per cluster, trusting the node registration CA, with `allowed_uri_sans` pinned to `spiffe://<td>/cluster/<cluster>/node/*` and a policy granting only `update` on that cluster's `pki/sign/…` path and `read` on the CA chain. Each node logs in with its own certificate, so there is no shared secret; tokens last an hour and are re-obtained, which re-reads a rotated node certificate.
+- AppRole remains for development and kind clusters, where there is no registration CA: one per cluster, with the same policy, its secret ID in a Kubernetes Secret.
+- The plugin logs in once per token lifetime; it does not log in per certificate.
 
 **3. `svidlet-policy` — policy distribution (optional, separate process)**
 
@@ -75,7 +79,7 @@ Three things are behind traits, because they are the three that change for diffe
 | Seam | Trait | Ships with | Later |
 |---|---|---|---|
 | PKI engine | `Issuer` | Vault PKI | step-ca, cert-manager `CertificateRequest`, cloud CAs, `PodCertificateRequest` |
-| Node authentication | `TokenSource` | Vault AppRole, Vault Kubernetes auth, static token | Cloud IAM |
+| Node authentication | `TokenSource` | Vault cert auth (node certificate), Vault Kubernetes auth, Vault AppRole (dev), static token | TPM-backed signer for the node key; cloud IAM |
 | Policy source | `svidlet-policy` | gRPC stream, signed OCI bundles (mutually exclusive per node) | — |
 | Identity layout | `IdPolicy` | A template plus an optional operator regex | — |
 
@@ -95,19 +99,21 @@ The template both renders an ID and takes one apart again, which is what lets re
 2. **Issuance path avoids the API server.** Each certificate is one HTTPS call to Vault. The cert-manager path is four API server writes plus a watch per certificate — at hundreds of thousands of certificates per day that is continuous etcd churn and a per-cluster controller in the critical path of pod start-up.
 3. **Identity the pod cannot forge.** Namespace and ServiceAccount come from the kubelet, not from pod metadata, so anyone able to create a pod cannot claim another workload's identity. Private keys are generated on the node and never leave tmpfs.
 4. **Single trust domain, cluster-scoped blast radius.** The cluster name lives in the SPIFFE path, not the trust domain, so cross-cluster mTLS needs no federation. Vault enforces the per-cluster prefix: a compromised node can at most impersonate identities within its own cluster.
-5. **One PKI identity per cluster.** One AppRole per cluster, regardless of how many ServiceAccounts exist; adding a workload never touches the PKI backend.
-6. **Fail-safe under Vault outages.** With a 24 h lifetime and renewal starting at 12 h, running pods keep working through a half-day Vault outage; only new pod start-ups are delayed.
-7. **Clear upgrade path.** The issuance logic (CSR → PKI backend → files) is the standalone `svidlet-issue` crate. On Kubernetes 1.35+, it becomes a `PodCertificateRequest` signer, the kubelet takes over key generation and mounting, and the node component is retired.
+5. **One PKI role per cluster.** One role and one auth role per cluster, regardless of how many ServiceAccounts exist; adding a workload never touches the PKI backend.
+6. **Fail-safe under Vault outages.** With a 6 h lifetime and renewal starting at 3 h, running pods keep working through a three-hour Vault outage; only new pod start-ups are delayed.
+7. **The certificate is the cloud credential.** With a Subject CN and exactly one SPIFFE URI SAN, the SVID in the volume is accepted by AWS IAM Roles Anywhere and GCP's X.509 workload identity federation as issued — no static cloud keys, no token exchange service on the hot path. `SVIDLET_CLOUD_PROFILE` checks every issuance against both clouds' rules.
+8. **Clear upgrade path.** The issuance logic (CSR → PKI backend → files) is the standalone `svidlet-issue` crate. On Kubernetes 1.35+, it becomes a `PodCertificateRequest` signer, the kubelet takes over key generation and mounting, and the node component is retired.
 
 ### Trust boundaries, stated plainly
 
-- Vault asserts: "this certificate was requested by a node in cluster X."
+- Node registration asserts: "this node is inventory machine N in cluster X" — by TPM credential activation against the EK allowlist ([ROADMAP.md](ROADMAP.md), §3).
+- Vault asserts: "this certificate was requested by a node in cluster X" — because the node certificate it authenticated says so.
 - The plugin asserts: "for this pod, the kubelet told me namespace N and ServiceAccount S." The kubelet is root on the node, so this adds no trust beyond what the node already has. This is the same local-attestation model SPIRE uses.
 - Consequence: compromise of one node = ability to mint any identity in that cluster. Cross-cluster impersonation is impossible by Vault policy.
 
-**The AppRole credential is the weakest part of this design.** The secret ID is a shared bearer secret in a Kubernetes Secret: anyone who can read that Secret in the plugin's namespace can mint any identity in the cluster, from anywhere, until it is rotated. It does not prove that the caller is a node, only that the caller has the secret. Nothing else in the design has that property — the kubelet's word about a pod is backed by the kubelet already being root on the node, and Vault's per-cluster role is enforced server-side.
+**The node credential is now a certificate, not a shared secret.** Until this change the default was AppRole, whose secret ID sat in a Kubernetes Secret: anyone who could read it could mint any identity in the cluster, from anywhere, until it was rotated — it proved possession of a secret, not that the caller was a node. Vault's cert auth method with a per-node registration certificate removes that: each node proves itself with its own certificate, the cluster is bound by the certificate's URI SAN at Vault, and there is nothing to copy out of the cluster that works for every node.
 
-It is kept as the default anyway, because it is the one method that works everywhere, including bare metal, and because it is simple enough to reason about in one sentence: one secret per cluster, rotated on a cadence, blast radius bounded by the Vault role. Where the environment allows it, use something stronger — Vault Kubernetes auth (`SVIDLET_VAULT_AUTH=kubernetes`) proves the plugin's own ServiceAccount to Vault with no shared secret to leak, and cloud IAM does the same with a per-node identity. Both are additive `TokenSource` implementations, not migrations.
+What remains is the key. Today svidlet reads the node key from a file (`SVIDLET_NODE_KEY_FILE`), so a root compromise of a node can copy it — worth at most that node's cluster, for at most the certificate's one-day lifetime. A TPM-backed signer in place of the file closes that, making the credential non-exportable: a compromised node can be *used*, but not cloned. Where there is no TPM and no registration service, Vault Kubernetes auth (`SVIDLET_VAULT_AUTH=kubernetes`) proves the plugin's own ServiceAccount instead. AppRole stays for development and kind clusters only. All four are `TokenSource` implementations; switching between them is configuration, not a migration.
 
 ### Admission control: the missing half of the chain
 
@@ -139,7 +145,8 @@ Applied to each knob:
 
 | Decision | Secure end | Usable end | Default, and why |
 |---|---|---|---|
-| Certificate lifetime | hours: a leaked key expires fast | days: less issuance load, wider outage window | **24 h.** Renewal starts at 12 h, so a half-day Vault outage is invisible to running pods. |
+| Certificate lifetime | hours: a leaked key expires fast | days: less issuance load, wider outage window | **6 h.** Renewal starts at 3 h, so a three-hour Vault outage is invisible to running pods — and a cloud credential minted from a leaked key is worth hours, not days. |
+| Certificate a cloud would refuse | refuse to issue it | issue it silently | **Issue it, and count it.** It is still a valid SVID for mTLS; `svidlet_cloud_profile_findings_total` says which cloud rule it breaks. |
 | Vault unreachable | refuse to serve | keep serving | **Keep serving.** The certificate on disk is still valid and still trustworthy; refusing would convert a Vault incident into a fleet incident. |
 | Renewal failure | drop the certificate | keep it, retry with backoff | **Keep it.** Renewal begins at half the lifetime, so there is a lot of runway before anything is at risk. |
 | Policy backend unreachable | block pod start | start without policy | **Start.** `SVIDLET_POLICY_REQUIRED=true` inverts this for operators who would rather a pod not start than start unpoliced — the choice is theirs, but the default keeps a second network dependency out of pod start-up. |
@@ -153,7 +160,7 @@ Each of these can be moved. What should not move is the principle: the failure o
 ## Out of Scope
 
 - A mutating webhook for volume injection. (A *validating* admission controller for workload provenance is a different thing, and is future work rather than out of scope — see above.)
-- JWT SVIDs.
+- JWT SVIDs signed on the node. They are planned as a central issuer that consumes the pod's X.509 SVID ([ROADMAP.md](ROADMAP.md), Stage 2); the node never holds a JWT signing key.
 - SPIFFE federation with external trust domains.
 - Issuing identities to untrusted tenant containers.
 - Certificate revocation; short lifetimes replace it.
@@ -161,10 +168,10 @@ Each of these can be moved. What should not move is the principle: the failure o
 
 ## Open Questions
 
-1. **Certificate lifetime.** 24 h proposed; 48–72 h reduces Vault load and widens the outage window at the cost of a longer exposure window for a leaked key.
-3. **AppRole secret ID rotation** cadence. Rotation without restart is implemented — the secret ID is re-read on every login, and a 403 from Vault triggers exactly one re-login — but the cadence itself is a deployment decision. See the trust discussion above for why this credential is the part to replace first.
+1. **Certificate lifetime.** Settled at 6 h: the certificate is now also a cloud credential, which shortens the exposure a leaked key buys, and node authentication no longer needs a long Vault-outage runway to hide a fragile credential. Load at this lifetime is in Appendix B.
+3. **AppRole secret ID rotation** is a development-cluster concern now that production nodes use cert auth. Rotation without restart still works — the secret ID is re-read on every login, and a 403 from Vault triggers exactly one re-login.
 4. **Peer verification and authorization.** mTLS is only useful if services check the peer's SPIFFE ID, not just the CA. Direction now settled: a thin per-language SDK (Go first) wraps go-spiffe / the `spiffe` crate for peer verification and embeds CEL to evaluate the mounted policy bundle — see [../svidlet-policy/authz-enforcement-plane.md](../svidlet-policy/authz-enforcement-plane.md). What remains open there: environment versioning and the cross-language conformance mechanism.
-5. **Alternative authentication tiers.** Cloud IAM auth (per-node identity on cloud nodes) and Vault JWT auth against an aggregated JWKS endpoint are cleaner than AppRole where available; both can be added as additive login backends.
+5. **Alternative authentication tiers.** Settled as the tiers in [ROADMAP.md](ROADMAP.md) §3.3: a TPM-registered node certificate (Tier A/B, `cert`), Kubernetes auth where there is no TPM (Tier C), AppRole for development only. The TPM-backed signer for the node key is the outstanding piece.
 
 Rollout-manifest freshness was an open question here and is now resolved: the signed manifest carries a monotonic `sequence` and a `valid_until`, checked on the node against a persisted high-water mark — see [../svidlet-policy/authz-management-plane.md](../svidlet-policy/authz-management-plane.md), *Freshness*.
 
@@ -173,8 +180,8 @@ Rollout-manifest freshness was an open question here and is now resolved: the si
 ### A. Issuance flow
 
 1. Pod scheduled → kubelet calls `NodePublishVolume` with pod namespace, SA, name, UID.
-2. Plugin: generate key → CSR with URI SAN `spiffe://<td>/cluster/<c>/ns/<ns>/sa/<sa>` → `POST pki/sign/spiffe-<c>`.
-3. Vault: policy check (cluster path) → role check (URI SAN prefix) → sign. The node name travels as an `X-Svidlet-Node` request header, which reaches the audit log only if the operator lists it in `audit_non_hmac_request_headers`.
+2. Plugin: generate key → CSR with URI SAN `spiffe://<td>/cluster/<c>/ns/<ns>/sa/<sa>` and Subject `CN=<pod name>` → `POST pki/sign/spiffe-<c>` with `exclude_cn_from_sans=true`.
+3. Vault: policy check (cluster path) → role check (URI SAN prefix; no DNS names) → sign. With cert auth the token's metadata names the node — the node certificate's CN and serial — in every audit entry. With AppRole the node name travels only as an `X-Svidlet-Node` request header, which reaches the audit log only if the operator lists it in `audit_non_hmac_request_headers`.
 4. Plugin: write `tls.key`, `tls.crt`, `ca.crt` to tmpfs at the target path; record renewal time.
 5. Renew at 50–70 % of lifetime with jitter; atomic write; application reloads on inotify.
 
@@ -184,14 +191,16 @@ Rollout-manifest freshness was an open question here and is now resolved: the si
 
 | | 20 containers/node (400k certs) | 50 containers/node (1M certs) |
 |---|---|---|
+| **6 h lifetime (default)** | ~18.5/s | ~46/s |
 | 24 h lifetime | ~4.6/s | ~11.6/s |
 | 48 h lifetime | ~2.3/s | ~5.8/s |
 | 72 h lifetime | ~1.5/s | ~3.9/s |
+| Cert auth logins (1 h tokens, re-login at 40 min) | ~8.3/s | ~8.3/s |
 | AppRole logins (24 h token period) | ~0.23/s | ~0.23/s |
 | Network (~5 KB per issuance, 48 h) | ~1.7 GB/day | ~4.3 GB/day |
 | Vault audit log (~7 KB per request, 48 h) | ~1–1.5 GB/day | ~2.5–3.5 GB/day |
 
-Vault signs P-256 certificates at thousands per second per active node; steady-state renewal is not a capacity concern at any of these settings. `no_store=true` is required so issuance does not write to Vault storage; audit-log write rate then becomes the dominant I/O.
+Vault signs P-256 certificates at thousands per second per active node; steady-state renewal is not a capacity concern at any of these settings. At the roadmap's scope — 2.4M pods across ~100 clusters — the 6 h default is ~110/s fleet-wide, about 1/s per cluster, and cert auth adds one mTLS login per node every 40 minutes — ~50/s across 120k nodes. `no_store=true` is required so issuance does not write to Vault storage; audit-log write rate then becomes the dominant I/O.
 
 **Renewal jitter.** Each certificate renews at a uniformly random point in `[0.5T, 0.7T]` of its lifetime `T`. After an initial fleet-wide rollout (all certificates issued within roughly an hour), the first renewal round spreads that wave over a `0.2T` window (9.6 h at `T = 48h`); each subsequent round widens it by another `0.2T`, so renewals are uniformly distributed across `T` after about five lifetimes. A narrower jitter window converges proportionally slower.
 
@@ -203,7 +212,7 @@ Vault signs P-256 certificates at thousands per second per active node; steady-s
 
 **Vault-side controls**
 
-- A rate-limit quota on `pki/sign/*` (e.g. 200/s per cluster role) bounds the blast radius of a plugin bug; expected peaks sit well below it.
+- A rate-limit quota on `pki/sign/*` (e.g. 200/s per cluster role, `RATE_LIMIT` in `vault-bootstrap.sh`) bounds the blast radius of a plugin bug. Steady state sits far below it, but a single node can exceed it — `hack/bench-memory.sh` measures 150–350 publishes/s on Linux — so size it from the cluster's pod-rollout peak. A publish refused by the quota is a retryable `backend_status` 429; the kubelet retries.
 - Whether performance standbys can serve `pki/sign` with `no_store=true` without forwarding to the active node depends on Vault version and should be measured rather than assumed.
 - Audit log sink: file backend with rotation, sized for 3–4 GB/day; not a socket backend that can block the request path.
 
@@ -226,13 +235,19 @@ path "pki/sign/spiffe-cluster-a" { capabilities = ["update"] }
 path "pki/ca_chain"               { capabilities = ["read"] }
 ```
 
-PKI role `spiffe-cluster-a`: `allowed_uri_sans = ["spiffe://<td>/cluster/a/ns/*/sa/*"]`, `allowed_domains = []`, `allow_ip_sans = false`, `no_store = true`, `max_ttl = 72h`, `key_type = ec`, `key_bits = 256`.
+PKI role `spiffe-cluster-a`: `allowed_uri_sans = ["spiffe://<td>/cluster/a/ns/*/sa/*"]`, `allowed_domains = []`, `allow_any_name = false`, `allow_ip_sans = false`, `require_cn = false`, `cn_validations = ["disabled"]`, `use_csr_common_name = false`, `use_csr_sans = false`, `no_store = true`, `ttl = 6h`, `max_ttl = 24h`, `key_type = ec`, `key_bits = 256`.
+
+Cert auth role `svidlet-cluster-a`: `certificate` = the node registration CA, `allowed_uri_sans = ["spiffe://<td>/cluster/a/node/*"]`, `token_policies = ["svidlet-cluster-a"]`, `token_ttl = token_max_ttl = 1h`. Node certificates carry `CN=<node name>`: Vault's cert method names the entity alias after it and refuses a login without one.
+
+`deploy/vault-bootstrap.sh` writes all of this (`AUTH=cert NODE_CA_FILE=…`); `hack/local-vault.sh` stands a second PKI mount in for the registration CA.
 
 ### E. Milestones
 
-1. Plugin registers with kubelet, publishes a volume, signs via Vault, manual mount verification. No renewal.
-2. Renewal with jitter, restart recovery, CA refresh, Prometheus metrics.
-3. Policy bundle distribution over a gRPC stream, e2e tests on kind with a dev Vault, example peer-verification snippets.
-4. `svidlet-sdk-go`: mTLS helpers over go-spiffe, embedded cel-go authorization over the mounted bundle, shadow mode, conformance suite — see [../svidlet-policy/authz-enforcement-plane.md](../svidlet-policy/authz-enforcement-plane.md).
-5. Optional login backends: cloud IAM. Additional PKI backends behind the `Issuer` trait. `PodCertificateRequest` signer mode.
+The original milestones 1–4 are done; what follows them is [ROADMAP.md](ROADMAP.md) §8, with its progress table at the top. In brief:
+
+1. ✅ Plugin registers with kubelet, publishes a volume, signs via Vault.
+2. ✅ Renewal with jitter, restart recovery, CA refresh, Prometheus metrics.
+3. ✅ Policy distribution (gRPC stream and signed OCI bundles), e2e tests on kind with a dev Vault.
+4. `svidlet-sdk-go` — see [../svidlet-policy/authz-enforcement-plane.md](../svidlet-policy/authz-enforcement-plane.md).
+5. Roadmap Phase 0 (certificate profile for cloud federation) ✅, Phase 1 (node attestation; cert auth ✅, TPM-backed signer outstanding), Phase 2 (Stage 1 cloud federation), Phase 3 (Stage 2 token issuer), Phase 4 (hardening, `PodCertificateRequest` signer mode).
 6. Composition with a validating admission controller, so an identity means "the workload CI built" and not merely "a pod in namespace N". Most likely integration with Sigstore policy-controller or Kyverno rather than a webhook of svidlet's own — see *Admission control: the missing half of the chain*.

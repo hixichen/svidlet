@@ -71,7 +71,7 @@ impl NodeService {
     fn identity_from(
         &self,
         ctx: &std::collections::HashMap<String, String>,
-    ) -> Result<(SpiffeId, PodRef), Status> {
+    ) -> Result<(SpiffeId, Option<String>, PodRef), Status> {
         let cfg = &self.publisher.cfg;
         let field = |key: &str| ctx.get(key).cloned().unwrap_or_default();
 
@@ -109,7 +109,8 @@ impl NodeService {
         };
 
         let spiffe_id = self.publisher.spiffe_id(&attrs).map_err(status_for)?;
-        Ok((spiffe_id, pod))
+        let common_name = self.publisher.common_name(&attrs);
+        Ok((spiffe_id, common_name, pod))
     }
 
     /// Whether the configured template substitutes the attribute that a given
@@ -153,7 +154,7 @@ impl Node for NodeService {
             ));
         }
 
-        let (spiffe_id, pod) = self.identity_from(&req.volume_context)?;
+        let (spiffe_id, common_name, pod) = self.identity_from(&req.volume_context)?;
         let target = PathBuf::from(&req.target_path);
         let publisher = self.publisher.clone();
 
@@ -180,13 +181,14 @@ impl Node for NodeService {
         let policy_gid = publisher.cfg.policy_gid;
         let target_for_task = target.clone();
         let id_for_task = spiffe_id.clone();
+        let cn_for_task = common_name.clone();
 
         // Key generation and the call to the PKI backend both block.
         let started = std::time::Instant::now();
         let outcome = tokio::task::spawn_blocking(move || {
             volume::ensure_tmpfs(&target_for_task, &tmpfs_size, policy_gid)
                 .map_err(svidlet_issue::Error::Io)?;
-            publisher.issue(&id_for_task, &target_for_task)
+            publisher.issue(&id_for_task, cn_for_task.as_deref(), &target_for_task)
         })
         .await
         .map_err(|e| Status::internal(format!("issuance task panicked: {e}")))?;
@@ -284,6 +286,7 @@ impl Node for NodeService {
             volume_id: req.volume_id.clone(),
             target_path: target,
             spiffe_id: spiffe_id.clone(),
+            common_name,
             pod: pod.clone(),
             not_before: bundle.not_before,
             not_after: bundle.not_after,

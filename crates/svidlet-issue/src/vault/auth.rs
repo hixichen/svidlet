@@ -1,17 +1,18 @@
 //! Vault authentication methods.
 //!
 //! Each implements [`TokenSource`], so adding one does not touch issuance.
-//! AppRole is the default because it works everywhere, including bare metal.
 //!
-//! **AppRole is the weakest part of this design.** It is a bearer secret sitting
-//! in a Kubernetes Secret: whoever can read that Secret in the plugin's
+//! [`CertAuth`] is the production method: the node presents the certificate
+//! node registration issued it, and Vault binds the cluster from its URI SAN.
+//! Nothing is shared between nodes, and nothing sits in a Kubernetes Secret.
+//! [`KubernetesAuth`] is the fallback where there is no registration service —
+//! no shared secret either, but Vault must be able to validate the token.
+//!
+//! **AppRole is for development and kind clusters.** It is a bearer secret
+//! sitting in a Kubernetes Secret: whoever can read that Secret in the plugin's
 //! namespace can mint any identity in the cluster, from anywhere, until the
-//! secret ID is rotated. Every other method here is stronger — Kubernetes auth
-//! and cloud IAM prove node or workload identity to Vault instead of presenting
-//! a shared secret — but they need Vault to reach an API server or a cloud
-//! metadata service, which is not always true. AppRole is the option that always
-//! works, and it is simple enough to reason about; prefer one of the others
-//! where the environment allows it.
+//! secret ID is rotated. It proves possession of a secret, not that the caller
+//! is a node — exactly what node registration exists to replace.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -194,6 +195,76 @@ impl TokenSource for KubernetesAuth {
     }
 }
 
+// ---------------------------------------------------------------------- cert
+
+/// Vault's TLS certificate auth method, presenting the node's own certificate.
+///
+/// This is how a node proves which machine it is once registration has given
+/// it a node certificate — `spiffe://<td>/cluster/<c>/node/<n>`, issued by a
+/// registration CA after TPM credential activation against the EK inventory.
+/// Vault's cert role trusts that CA and pins `allowed_uri_sans` to the
+/// cluster's node prefix, so the policy the token carries is bound to the
+/// cluster by the certificate, not by a shared secret. No bearer credential
+/// sits in a Kubernetes Secret, and there is nothing to rotate by hand.
+///
+/// The certificate and key are re-read from disk on every login, so the
+/// registration agent can renew them (daily) without restarting svidlet.
+/// Tokens are not renewed in place: Vault's cert method re-checks the client
+/// certificate on renewal, and a fresh login re-reads a rotated one anyway.
+///
+/// The key is read from a file. On a Tier A node that file is the seam a
+/// TPM-backed signer replaces, so the key never leaves the chip; until then a
+/// file-held key already removes the shared secret, and the node certificate's
+/// one-day lifetime bounds what a copied key is worth.
+pub struct CertAuth {
+    http: Arc<VaultHttp>,
+    mount: String,
+    role: String,
+    cert_path: PathBuf,
+    key_path: PathBuf,
+}
+
+impl CertAuth {
+    pub fn new(
+        http: Arc<VaultHttp>,
+        mount: impl Into<String>,
+        role: impl Into<String>,
+        cert_path: PathBuf,
+        key_path: PathBuf,
+    ) -> CertAuth {
+        CertAuth {
+            http,
+            mount: mount.into(),
+            role: role.into(),
+            cert_path,
+            key_path,
+        }
+    }
+}
+
+impl TokenSource for CertAuth {
+    fn login(&self) -> Result<Token> {
+        let cert = read_file(&self.cert_path, "the node certificate")?;
+        let key = read_file(&self.key_path, "the node private key")?;
+        let client = self.http.with_client_cert(&cert, &key)?;
+        let body = serde_json::json!({ "name": self.role });
+        let envelope: AuthEnvelope = client
+            .post_json(&format!("auth/{}/login", self.mount), None, &[], &body)
+            .map_err(|e| classify(e, "certificate"))?;
+        Ok(Token::new(
+            envelope.auth.client_token,
+            envelope.auth.lease_duration,
+            // Renewal would need the client certificate on the shared client;
+            // logging in again is simpler and picks up a rotated certificate.
+            false,
+        ))
+    }
+
+    fn name(&self) -> &'static str {
+        "cert"
+    }
+}
+
 // -------------------------------------------------------------- static token
 
 /// A token read from a file. Intended for local development against a dev-mode
@@ -258,6 +329,17 @@ mod tests {
             "kubernetes"
         );
         assert_eq!(StaticTokenAuth::new("/dev/null".into()).name(), "token");
+        assert_eq!(
+            CertAuth::new(
+                http(),
+                "cert",
+                "svidlet-a",
+                "/dev/null".into(),
+                "/dev/null".into()
+            )
+            .name(),
+            "cert"
+        );
     }
 
     #[test]
@@ -316,6 +398,35 @@ mod tests {
             KubernetesAuth::DEFAULT_TOKEN_PATH,
             "/var/run/secrets/kubernetes.io/serviceaccount/token"
         );
+    }
+
+    #[test]
+    fn cert_auth_reads_the_node_certificate_and_key_before_the_network() {
+        let auth = CertAuth::new(
+            http(),
+            "cert",
+            "svidlet-a",
+            "/nonexistent/node/tls.crt".into(),
+            "/nonexistent/node/tls.key".into(),
+        );
+        let err = auth.login().unwrap_err();
+        assert_eq!(err.code(), ErrorCode::Auth);
+        assert!(err.to_string().contains("node certificate"), "{err}");
+
+        // A certificate that is present but a key that is not: still a
+        // credential problem, named as such.
+        let cert = scratch_file("node-crt", "-----BEGIN CERTIFICATE-----");
+        let auth = CertAuth::new(
+            http(),
+            "cert",
+            "svidlet-a",
+            cert.clone(),
+            "/nonexistent/node/tls.key".into(),
+        );
+        let err = auth.login().unwrap_err();
+        assert_eq!(err.code(), ErrorCode::Auth);
+        assert!(err.to_string().contains("node private key"), "{err}");
+        std::fs::remove_file(&cert).unwrap();
     }
 
     #[test]

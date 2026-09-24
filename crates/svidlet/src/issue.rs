@@ -15,7 +15,7 @@ use crate::config::Config;
 use crate::metrics::Metrics;
 use crate::store::Store;
 use crate::volume::{self, Identity, Modes};
-use crate::{debug, info};
+use crate::{debug, info, warn};
 
 pub struct Publisher {
     pub cfg: Arc<Config>,
@@ -65,18 +65,30 @@ impl Publisher {
         self.policy.render(attrs)
     }
 
+    /// The Subject Common Name for a workload, per `SVIDLET_CERT_SUBJECT`.
+    pub fn common_name(&self, attrs: &WorkloadAttributes) -> Option<String> {
+        self.cfg.cert_subject.common_name(attrs)
+    }
+
     /// Generate a key, get it signed, and publish all three files atomically.
     ///
     /// Blocking: the PKI backend is a blocking HTTP client, so callers run this
     /// on a blocking thread.
-    pub fn issue(&self, spiffe_id: &SpiffeId, target: &Path) -> Result<IssuedBundle> {
-        let generated = svidlet_issue::generate(spiffe_id)?;
+    pub fn issue(
+        &self,
+        spiffe_id: &SpiffeId,
+        common_name: Option<&str>,
+        target: &Path,
+    ) -> Result<IssuedBundle> {
+        let generated = svidlet_issue::generate(spiffe_id, common_name)?;
         let bundle = self.issuer.sign(&SignRequest {
             spiffe_id,
             csr_pem: &generated.csr_pem,
+            common_name,
             ttl: self.cfg.cert_ttl,
             node_name: &self.cfg.node_name,
         })?;
+        self.check_cloud_profile(spiffe_id, &bundle.cert_chain_pem);
 
         let cached = self.cached_ca();
         let ca_pem = if cached.is_empty() {
@@ -95,6 +107,35 @@ impl Publisher {
             self.modes(),
         )?;
         Ok(bundle)
+    }
+
+    /// Report anything a configured cloud would refuse about a certificate.
+    ///
+    /// Never fails issuance: the certificate is a valid SVID for mTLS whatever
+    /// a cloud thinks of it, and fail-stale says a cloud-only defect must not
+    /// cost a pod its identity. The metric is what to alert on; the log says
+    /// which rule and why.
+    fn check_cloud_profile(&self, spiffe_id: &SpiffeId, chain: &str) {
+        if self.cfg.cloud_profile.is_empty() {
+            return;
+        }
+        match svidlet_issue::profile::check(chain, &self.cfg.cloud_profile) {
+            Ok(findings) => {
+                for finding in findings {
+                    self.metrics.cloud_finding(finding.cloud, finding.rule);
+                    warn!(
+                        "issued certificate would be refused by a cloud",
+                        spiffe_id = spiffe_id,
+                        cloud = finding.cloud.as_str(),
+                        rule = finding.rule.as_str(),
+                        detail = finding.detail,
+                    );
+                }
+            }
+            // Unreachable in practice — the chain was parsed moments ago to
+            // check its identity — but not worth failing issuance over.
+            Err(e) => debug!("cloud profile check could not parse the chain", error = e),
+        }
     }
 
     /// Fetch the trust bundle and, if it changed, rewrite `ca.crt` in every

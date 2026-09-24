@@ -7,8 +7,8 @@ use tokio_stream::wrappers::UnixListenerStream;
 use tonic::transport::Server;
 
 use svidlet_issue::{
-    AppRoleAuth, Issuer, KubernetesAuth, StaticTokenAuth, VaultEndpoint, VaultHttp, VaultIssuer,
-    VaultPkiConfig,
+    AppRoleAuth, CertAuth, Issuer, KubernetesAuth, StaticTokenAuth, VaultEndpoint, VaultHttp,
+    VaultIssuer, VaultPkiConfig,
 };
 
 use crate::config::AuthSettings;
@@ -254,6 +254,22 @@ pub fn build_issuer(cfg: &Config) -> Result<Arc<dyn Issuer>, Box<dyn std::error:
             pki,
             KubernetesAuth::new(http, mount.clone(), role.clone(), token_path.clone()),
         )),
+        AuthSettings::Cert {
+            mount,
+            role,
+            cert_path,
+            key_path,
+        } => Arc::new(VaultIssuer::new(
+            http.clone(),
+            pki,
+            CertAuth::new(
+                http,
+                mount.clone(),
+                role.clone(),
+                cert_path.clone(),
+                key_path.clone(),
+            ),
+        )),
         AuthSettings::Token { path } => Arc::new(VaultIssuer::new(
             http,
             pki,
@@ -312,6 +328,8 @@ mod tests {
             },
             policy_gid: None,
             cert_ttl: Duration::from_secs(3600),
+            cert_subject: svidlet_issue::SubjectSource::PodName,
+            cloud_profile: Vec::new(),
             renew_fraction: (0.5, 0.7),
             renew_check_interval: Duration::from_secs(30),
             startup_spread: Duration::from_secs(300),

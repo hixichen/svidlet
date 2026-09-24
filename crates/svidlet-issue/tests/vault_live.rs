@@ -10,16 +10,17 @@
 //!
 //! These are the tests that a fake backend cannot replace: that the CSR svidlet
 //! builds is one Vault will actually sign, that the per-cluster role really
-//! refuses an identity outside its prefix, and that a rotated secret ID is
-//! picked up without a restart.
+//! refuses an identity outside its prefix, that what it signs is a certificate
+//! AWS and GCP would accept, and that a node certificate logs in only to its
+//! own cluster.
 
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
 use svidlet_issue::{
-    AppRoleAuth, IdPolicy, IdTemplate, Issuer, SignRequest, SpiffeId, StaticTokenAuth,
-    VaultEndpoint, VaultHttp, VaultIssuer, VaultPkiConfig, WorkloadAttributes,
+    AppRoleAuth, CertAuth, Cloud, IdPolicy, IdTemplate, Issuer, SignRequest, SpiffeId,
+    StaticTokenAuth, VaultEndpoint, VaultHttp, VaultIssuer, VaultPkiConfig, WorkloadAttributes,
 };
 
 struct Env {
@@ -31,6 +32,10 @@ struct Env {
     role_id: String,
     secret_id_path: PathBuf,
     token_path: PathBuf,
+    cert_mount: String,
+    cert_role: String,
+    node_cert_path: PathBuf,
+    node_key_path: PathBuf,
 }
 
 /// Read the environment `hack/local-vault.sh env` prints. Skips the test with a
@@ -49,7 +54,9 @@ fn env() -> Option<Env> {
         VaultHttp::new(VaultEndpoint {
             address: var("VAULT_ADDR"),
             namespace: std::env::var("VAULT_NAMESPACE").ok(),
-            ca_cert_pem: None,
+            ca_cert_pem: std::env::var("VAULT_CACERT")
+                .ok()
+                .map(|path| std::fs::read_to_string(path).expect("VAULT_CACERT is readable")),
             timeout: Duration::from_secs(10),
         })
         .expect("the Vault client builds"),
@@ -67,6 +74,10 @@ fn env() -> Option<Env> {
         role_id: var("SVIDLET_ROLE_ID"),
         secret_id_path: PathBuf::from(var("SVIDLET_SECRET_ID_FILE")),
         token_path: PathBuf::from(var("SVIDLET_VAULT_TOKEN_FILE")),
+        cert_mount: var("SVIDLET_VAULT_CERT_MOUNT"),
+        cert_role: var("SVIDLET_VAULT_CERT_ROLE"),
+        node_cert_path: PathBuf::from(var("SVIDLET_NODE_CERT_FILE")),
+        node_key_path: PathBuf::from(var("SVIDLET_NODE_KEY_FILE")),
     })
 }
 
@@ -82,6 +93,24 @@ impl Env {
                 self.secret_id_path.clone(),
             ),
         )
+    }
+
+    fn cert_issuer(&self, cert: PathBuf, key: PathBuf) -> VaultIssuer<CertAuth> {
+        VaultIssuer::new(
+            self.http.clone(),
+            self.pki.clone(),
+            CertAuth::new(
+                self.http.clone(),
+                self.cert_mount.clone(),
+                self.cert_role.clone(),
+                cert,
+                key,
+            ),
+        )
+    }
+
+    fn root_token(&self) -> String {
+        std::fs::read_to_string(&self.token_path).unwrap()
     }
 
     fn token_issuer(&self) -> VaultIssuer<StaticTokenAuth> {
@@ -106,11 +135,15 @@ impl Env {
     }
 }
 
+/// What svidlet puts in the Subject by default.
+const POD_NAME: &str = "api-7d9f8c-x2x4q";
+
 fn sign(issuer: &dyn Issuer, id: &SpiffeId) -> svidlet_issue::Result<svidlet_issue::IssuedBundle> {
-    let generated = svidlet_issue::generate(id)?;
+    let generated = svidlet_issue::generate(id, Some(POD_NAME))?;
     issuer.sign(&SignRequest {
         spiffe_id: id,
         csr_pem: &generated.csr_pem,
+        common_name: Some(POD_NAME),
         ttl: Duration::from_secs(3600),
         node_name: "test-node",
     })
@@ -135,6 +168,128 @@ fn vault_signs_the_csr_svidlet_builds() {
     );
     assert!(bundle.ca_pem.contains("-----BEGIN CERTIFICATE-----"));
     assert_eq!(issuer.auth_name(), "approle");
+
+    // The Subject survives the role, and is not a host name.
+    assert_eq!(facts.common_name.as_deref(), Some(POD_NAME));
+    assert!(
+        !dns_sans(&bundle.cert_chain_pem).contains(&POD_NAME.to_string()),
+        "the CN leaked into the DNS SANs"
+    );
+}
+
+#[test]
+#[ignore = "needs a local Vault: ./hack/local-vault.sh start"]
+fn what_the_documented_role_signs_is_a_certificate_both_clouds_accept() {
+    let Some(env) = env() else { return };
+    let bundle = sign(&env.approle_issuer(), &env.id("payments", "api")).unwrap();
+
+    // The whole Stage 1 premise: the SVID in the volume is the cloud
+    // credential. Every rule AWS Roles Anywhere and GCP's X.509 provider apply
+    // to the certificate itself holds for what Vault really issues.
+    let findings = svidlet_issue::profile::check(&bundle.cert_chain_pem, &Cloud::ALL).unwrap();
+    assert!(findings.is_empty(), "{findings:#?}");
+}
+
+#[test]
+#[ignore = "needs a local Vault: ./hack/local-vault.sh start"]
+fn the_role_refuses_a_common_name_that_would_become_a_host_name() {
+    let Some(env) = env() else { return };
+    let id = env.id("payments", "api");
+    let generated = svidlet_issue::generate(&id, Some(POD_NAME)).unwrap();
+
+    // What a compromised node might try: the same request without
+    // exclude_cn_from_sans, so Vault copies the CN into the DNS SANs. The role
+    // allows no DNS names, so this must be refused — otherwise disabling CN
+    // validation would have handed nodes certificates for arbitrary hosts.
+    let err = env
+        .http
+        .post_json::<serde_json::Value>(
+            &format!("{}/sign/{}", env.pki.mount, env.pki.role),
+            Some(&env.root_token()),
+            &[],
+            &serde_json::json!({
+                "csr": generated.csr_pem,
+                "uri_sans": id.as_str(),
+                "common_name": "payments.example.com",
+                "exclude_cn_from_sans": false,
+                "ttl": "3600s",
+            }),
+        )
+        .expect_err("a CN that becomes a DNS SAN must be refused");
+    assert!(
+        matches!(err, svidlet_issue::Error::Backend { status: 400, .. }),
+        "{err}"
+    );
+}
+
+#[test]
+#[ignore = "needs a local Vault: ./hack/local-vault.sh start"]
+fn a_registered_node_signs_with_its_node_certificate() {
+    let Some(env) = env() else { return };
+    let issuer = env.cert_issuer(env.node_cert_path.clone(), env.node_key_path.clone());
+    assert_eq!(issuer.auth_name(), "cert");
+    let id = env.id("payments", "api");
+    let bundle = sign(&issuer, &id).expect("the node certificate logs in and signs");
+    svidlet_issue::assert_identity(&bundle.cert_chain_pem, &id).unwrap();
+}
+
+#[test]
+#[ignore = "needs a local Vault: ./hack/local-vault.sh start"]
+fn a_node_registered_into_another_cluster_cannot_log_in_here() {
+    let Some(env) = env() else { return };
+
+    // A genuine certificate from the same registration CA — only its URI SAN
+    // names another cluster. The cert role's allowed_uri_sans is the whole
+    // boundary here, and it must hold.
+    let issued: serde_json::Value = env
+        .http
+        .post_json(
+            "pki-node/issue/node",
+            Some(&env.root_token()),
+            &[],
+            &serde_json::json!({
+                "uri_sans": format!(
+                    "spiffe://{}/cluster/somewhere-else/node/intruder",
+                    env.trust_domain
+                ),
+                // A CN, so the login is refused for its SAN and nothing else.
+                "common_name": "intruder",
+                "exclude_cn_from_sans": true,
+                "private_key_format": "pkcs8",
+                "ttl": "1h",
+            }),
+        )
+        .expect("the registration CA issues a node certificate");
+    let dir = std::env::temp_dir().join(format!("svidlet-foreign-node-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let (cert, key) = (dir.join("tls.crt"), dir.join("tls.key"));
+    std::fs::write(&cert, issued["data"]["certificate"].as_str().unwrap()).unwrap();
+    std::fs::write(&key, issued["data"]["private_key"].as_str().unwrap()).unwrap();
+
+    let err = sign(&env.cert_issuer(cert, key), &env.id("payments", "api"))
+        .expect_err("a node of another cluster must not log in");
+    assert_eq!(err.code(), svidlet_issue::ErrorCode::Auth, "{err}");
+
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+fn dns_sans(chain: &str) -> Vec<String> {
+    use x509_parser::prelude::*;
+    let (_, pem) = parse_x509_pem(chain.as_bytes()).unwrap();
+    let (_, cert) = X509Certificate::from_der(&pem.contents).unwrap();
+    cert.subject_alternative_name()
+        .unwrap()
+        .map(|san| {
+            san.value
+                .general_names
+                .iter()
+                .filter_map(|n| match n {
+                    GeneralName::DNSName(d) => Some(d.to_string()),
+                    _ => None,
+                })
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 #[test]

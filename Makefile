@@ -41,11 +41,11 @@ release: ## release build of the whole workspace
 	$(RUN) cargo build --release --workspace
 
 .PHONY: test
-test: ## unit + integration tests (241; no cluster, no Vault needed)
+test: ## unit + integration tests (270; no cluster, no Vault needed)
 	$(RUN) cargo test --workspace
 
 .PHONY: test-vault
-test-vault: ## the 6 live-Vault integration tests (starts and stops a dev Vault)
+test-vault: ## the 10 live-Vault integration tests (starts and stops a dev Vault)
 	./hack/local-vault.sh start
 	@status=0; \
 	eval "$$(./hack/local-vault.sh env)"; \

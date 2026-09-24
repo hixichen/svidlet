@@ -44,25 +44,41 @@ data:
   # Defaults to spiffe-$SVIDLET_CLUSTER.
   SVIDLET_PKI_ROLE: spiffe-cluster-a
 
-  # approle | kubernetes | token.
+  # cert | kubernetes | approle | token.
   #
-  # AppRole is the default because it works everywhere, including bare metal —
-  # but it is a shared bearer secret, and it is the weakest part of this design
-  # (see docs/DESIGN.md). Where Vault can validate ServiceAccount tokens, prefer:
+  # cert is the production method: the node logs in with the certificate its
+  # registration issued (spiffe://<td>/cluster/<c>/node/<n>, CN=<node name>),
+  # and Vault binds the cluster from the certificate's URI SAN. Nothing shared,
+  # nothing to rotate by hand. See docs/ROADMAP.md, "Node attestation".
+  #
+  # Without a TPM or a registration service, kubernetes proves the plugin's own
+  # ServiceAccount to Vault instead:
   #
   #   SVIDLET_VAULT_AUTH: kubernetes
   #   SVIDLET_VAULT_K8S_ROLE: svidlet
   #
-  # which proves the plugin's own identity with no secret to distribute or rotate.
-  SVIDLET_VAULT_AUTH: approle
-  SVIDLET_APPROLE_MOUNT: approle
-  # Not a secret: the role ID names the AppRole, the secret ID authenticates.
-  SVIDLET_ROLE_ID: replace-me
+  # approle is for dev and kind clusters only — a shared bearer secret, and the
+  # weakest option (see docs/DESIGN.md). hack/kind-e2e.sh shows it wired up.
+  SVIDLET_VAULT_AUTH: cert
+  # Defaults: mount "cert", role svidlet-$SVIDLET_CLUSTER, and the node
+  # certificate at /etc/svidlet/node/tls.crt and tls.key.
+  # SVIDLET_VAULT_CERT_ROLE: svidlet-cluster-a
+  # SVIDLET_NODE_CERT_FILE: /etc/svidlet/node/tls.crt
+  # SVIDLET_NODE_KEY_FILE: /etc/svidlet/node/tls.key
+
+  # Pod certificates. Six hours by default; the Subject CN is the pod name,
+  # which AWS IAM Roles Anywhere requires and records as sourceIdentity.
+  # SVIDLET_CERT_TTL: 6h
+  # SVIDLET_CERT_SUBJECT: pod_name
+  # Check every issued certificate against the clouds it will be exchanged
+  # with, and count what they would refuse in
+  # svidlet_cloud_profile_findings_total. Never blocks issuance.
+  # SVIDLET_CLOUD_PROFILE: aws,gcp
 
   # ---- read by the svidlet-policy container only ----
   #
   # Policy distribution runs as a separate process with separate credentials:
-  # it never sees SVIDLET_ROLE_ID or the AppRole secret, and it does not run as
+  # it never sees the node certificate or any Vault credential, and it does not run as
   # root. See docs/DESIGN.md, "Two processes, one volume".
   #
   # Authorization policy, streamed from a backend fronting a git repository.
@@ -99,17 +115,6 @@ data:
   # SVIDLET_BUNDLE_POLL_JITTER: 30s
   # Superseded versions kept unpacked, so a rollback needs no registry.
   # SVIDLET_BUNDLE_KEEP_VERSIONS: "2"
----
-apiVersion: v1
-kind: Secret
-metadata:
-  name: svidlet-vault-approle
-  namespace: svidlet-system
-type: Opaque
-stringData:
-  # Rotate on a fixed cadence. svidlet re-reads this file on every login, so a
-  # rotation takes effect without restarting the DaemonSet.
-  secret-id: replace-me
 ---
 apiVersion: apps/v1
 kind: DaemonSet
@@ -172,6 +177,14 @@ spec:
               # Bidirectional so the per-volume bind mounts svidlet creates here
               # propagate to the host and into the svidlet-policy container.
               mountPropagation: Bidirectional
+            # The node certificate and key the registration agent (step-ca or
+            # the go-attestation service) keeps renewed on the host. Re-read on
+            # every Vault login, so renewal needs no restart.
+            - name: node-identity
+              mountPath: /etc/svidlet/node
+              readOnly: true
+            # Only for SVIDLET_VAULT_AUTH=approle (dev and kind). Optional, so
+            # production creates no such Secret at all.
             - name: vault-approle
               mountPath: /etc/svidlet/vault
               readOnly: true
@@ -187,7 +200,7 @@ spec:
           resources:
             requests:
               cpu: 10m
-              # Measured: 3.2 MB idle, 6.7 MB with 2000 certificates on the node.
+              # Measured on Linux: 5.4 MB idle, 7.7 MB with 2000 certificates.
               memory: 24Mi
             limits:
               memory: 48Mi
@@ -259,10 +272,15 @@ spec:
           hostPath:
             path: /var/lib/svidlet/volumes
             type: DirectoryOrCreate
+        - name: node-identity
+          hostPath:
+            path: /etc/svidlet/node
+            type: DirectoryOrCreate
         - name: vault-approle
           secret:
             secretName: svidlet-vault-approle
             defaultMode: 0400
+            optional: true
         - name: bundle-cache
           hostPath:
             path: /var/lib/svidlet/policy

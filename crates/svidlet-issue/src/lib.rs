@@ -1,15 +1,17 @@
 //! Issuance library for Svidlet.
 //!
 //! Renders a SPIFFE ID from a template, generates a P-256 key and a CSR for it,
-//! hands the CSR to a PKI backend, and verifies what comes back.
+//! hands the CSR to a PKI backend, and verifies what comes back — including,
+//! through [`profile`], whether AWS and GCP would accept it as a credential.
 //!
 //! Three seams keep vendors out of the plugin:
 //!
 //! - [`Issuer`] is the PKI engine. Vault PKI is the first implementation;
 //!   step-ca, cert-manager `CertificateRequest`, cloud-managed CAs and a
 //!   `PodCertificateRequest` signer all fit behind it.
-//! - [`TokenSource`] is how a node proves who it is to that engine. Vault
-//!   AppRole, Vault Kubernetes auth and a static token ship here.
+//! - [`TokenSource`] is how a node proves who it is to that engine. Vault cert
+//!   auth with the node's registration certificate, Vault Kubernetes auth,
+//!   AppRole (for development) and a static token ship here.
 //! - [`IdPolicy`] is the shape of the identity itself, so the SPIFFE ID layout
 //!   is an operator's decision rather than a constant in the code.
 //!
@@ -27,6 +29,8 @@ pub mod bundle;
 pub mod error;
 pub mod issuer;
 pub mod key;
+pub mod profile;
+pub mod subject;
 pub mod template;
 pub mod vault;
 
@@ -35,8 +39,10 @@ pub use bundle::{assert_identity, inspect, CertFacts, IssuedBundle};
 pub use error::{Error, ErrorCode, Result};
 pub use issuer::{Issuer, SignRequest};
 pub use key::{generate, KeyAndCsr};
+pub use profile::{Cloud, Finding, Rule};
+pub use subject::SubjectSource;
 pub use template::{Field, IdPolicy, IdTemplate, SpiffeId, WorkloadAttributes};
 pub use vault::{
-    AppRoleAuth, KubernetesAuth, StaticTokenAuth, VaultEndpoint, VaultHttp, VaultIssuer,
+    AppRoleAuth, CertAuth, KubernetesAuth, StaticTokenAuth, VaultEndpoint, VaultHttp, VaultIssuer,
     VaultPkiConfig,
 };

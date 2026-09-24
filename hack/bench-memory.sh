@@ -30,6 +30,12 @@ cleanup() {
   [ -n "${SVIDLET_PID}" ] && kill "${SVIDLET_PID}" 2>/dev/null || true
   [ -n "${POLICY_PID}" ] && kill "${POLICY_PID}" 2>/dev/null || true
   ./hack/local-vault.sh stop >/dev/null 2>&1 || true
+  # On Linux, as root, every published volume is a real tmpfs; unmount them
+  # (deepest first) or rm refuses with "Device or resource busy".
+  if [ -r /proc/self/mounts ]; then
+    awk -v w="${WORK}/" 'index($2, w) == 1 { print $2 }' /proc/self/mounts \
+      | sort -r | while read -r m; do umount -l "${m}" 2>/dev/null || true; done
+  fi
   rm -rf "${WORK}"
 }
 trap cleanup EXIT
@@ -55,6 +61,7 @@ env \
   SVIDLET_CLUSTER="${SVIDLET_CLUSTER}" \
   SVIDLET_TRUST_DOMAIN="${SVIDLET_TRUST_DOMAIN}" \
   VAULT_ADDR="${VAULT_ADDR}" \
+  VAULT_CACERT="${VAULT_CACERT}" \
   SVIDLET_VAULT_AUTH=token \
   SVIDLET_VAULT_TOKEN_FILE="${SVIDLET_VAULT_TOKEN_FILE}" \
   SVIDLET_PKI_ROLE="${SVIDLET_PKI_ROLE}" \

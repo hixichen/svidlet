@@ -1,6 +1,6 @@
 # Svidlet — Configuration Reference
 
-Everything that varies between clusters is an environment variable, so one image and one manifest differ only by a ConfigMap and a Secret. `svidlet` and `svidlet-policy` run from the same image and share the ConfigMap via `envFrom`; each reads only the variables below its own tables, and nothing stops an operator from splitting the ConfigMap — the variables are simply names.
+Everything that varies between clusters is an environment variable, so one image and one manifest differ only by a ConfigMap. `svidlet` and `svidlet-policy` run from the same image and share the ConfigMap via `envFrom`; each reads only the variables below its own tables, and nothing stops an operator from splitting the ConfigMap — the variables are simply names.
 
 **Depends on:** [DESIGN.md](DESIGN.md) · [../svidlet-policy/authz-management-plane.md](../svidlet-policy/authz-management-plane.md)
 
@@ -31,7 +31,9 @@ Everything that varies between clusters is an environment variable, so one image
 | `SVIDLET_DRIVER_NAME` | `csi.svidlet.io` | The CSI driver name. Must match the CSIDriver object; also shapes the socket paths. |
 | `SVIDLET_SPIFFE_ID_TEMPLATE` | `spiffe://{trust_domain}/cluster/{cluster}/ns/{namespace}/sa/{service_account}` | Renders every issued SPIFFE ID. Placeholders: `{trust_domain} {cluster} {namespace} {service_account} {pod_name} {pod_uid} {node_name}`. Also parses IDs back — which is how restart recovery works. |
 | `SVIDLET_SPIFFE_ID_PATTERN` | *(none)* | An anchored regex every issued ID must match — a second, independent gate on top of the template. An ID that fails is refused with `PermissionDenied`, never signed. |
-| `SVIDLET_CERT_TTL` | `24h` | Requested certificate lifetime. Renewal begins at half of it. |
+| `SVIDLET_CERT_TTL` | `6h` | Requested certificate lifetime. Renewal begins at half of it. Vault clamps it to the role's `max_ttl` (24h as bootstrapped). |
+| `SVIDLET_CERT_SUBJECT` | `pod_name` | Which attribute becomes the Subject `CN`: `pod_name` \| `service_account` \| `none`. AWS IAM Roles Anywhere refuses an empty Subject and records the CN as `sourceIdentity`. Capped at 64 bytes; an attribute outside `[A-Za-z0-9_+=,.@-]` yields no CN rather than a failed issuance. Never a SAN. |
+| `SVIDLET_CLOUD_PROFILE` | *(none)* | Comma-separated `aws`, `gcp`. Every issued certificate is checked against those clouds' acceptance rules; a violation is logged and counted in `svidlet_cloud_profile_findings_total{cloud,rule}`, and **never** blocks issuance. See [ROADMAP.md](ROADMAP.md) §4. |
 
 ### Certificates and renewal
 
@@ -81,7 +83,7 @@ Everything that varies between clusters is an environment variable, so one image
 | `SVIDLET_VAULT_TIMEOUT` | `10s` | Per-request timeout for Vault calls. |
 | `SVIDLET_PKI_MOUNT` | `pki` | The PKI mount that holds the shared intermediate. |
 | `SVIDLET_PKI_ROLE` | `spiffe-<cluster>` | The per-cluster role. Its `allowed_uri_sans` pins this cluster's SPIFFE prefix. |
-| `SVIDLET_VAULT_AUTH` | `approle` | How the node authenticates to Vault: `approle` \| `kubernetes` \| `token`. Prefer `kubernetes` where Vault can validate ServiceAccount tokens — AppRole is a shared bearer secret and the weakest part of the design. |
+| `SVIDLET_VAULT_AUTH` | `approle` | How the node authenticates to Vault: `cert` \| `kubernetes` \| `approle` \| `token`. **Production is `cert`** — the node certificate registration issued, nothing shared — and the shipped DaemonSet sets it. `kubernetes` is the fallback without a TPM. The code default stays `approle` so a bare `cargo run` against `hack/local-vault.sh` needs nothing extra; AppRole is a shared bearer secret and is for dev and kind clusters only. |
 
 Per method:
 
@@ -93,11 +95,15 @@ Per method:
 | `SVIDLET_VAULT_K8S_MOUNT` | `kubernetes` | *(kubernetes)* The Kubernetes auth mount. |
 | `SVIDLET_VAULT_K8S_ROLE` | *(required for kubernetes)* | The Vault role bound to the plugin's own ServiceAccount. |
 | `SVIDLET_VAULT_K8S_TOKEN_FILE` | `/var/run/secrets/kubernetes.io/serviceaccount/token` | *(kubernetes)* The projected ServiceAccount token. |
+| `SVIDLET_VAULT_CERT_MOUNT` | `cert` | *(cert)* The TLS certificate auth mount. |
+| `SVIDLET_VAULT_CERT_ROLE` | `svidlet-<cluster>` | *(cert)* The cert role to log in against. Its `allowed_uri_sans` (`spiffe://<td>/cluster/<cluster>/node/*`) is what binds the node to this cluster. |
+| `SVIDLET_NODE_CERT_FILE` | `/etc/svidlet/node/tls.crt` | *(cert)* The node certificate from registration — URI SAN `spiffe://<td>/cluster/<cluster>/node/<node>`, and `CN=<node>`, which Vault's cert method requires. Re-read on every login, so the registration agent renews it without a restart. |
+| `SVIDLET_NODE_KEY_FILE` | `/etc/svidlet/node/tls.key` | *(cert)* Its private key, PEM. The seam a TPM-backed signer replaces. |
 | `SVIDLET_VAULT_TOKEN_FILE` | `/etc/svidlet/vault/token` | *(token)* A static token file. Dev convenience, not a production method. |
 
 ## `svidlet-policy` — the policy daemon
 
-Reads the shared ConfigMap but never the Vault credential; the Secret is mounted only into the `svidlet` container.
+Reads the shared ConfigMap but never the Vault credential; the node certificate (and, on dev clusters, the AppRole Secret) is mounted only into the `svidlet` container.
 
 ### The master switch and the two sources
 
@@ -154,5 +160,6 @@ Events are real structured events via `tracing`: fields are named values (`spiff
 ## Where these live in the manifest
 
 - **ConfigMap `svidlet`** — every `SVIDLET_*` and `VAULT_*` variable above, mounted via `envFrom` into both containers.
-- **Secret `svidlet-vault-approle`** — the AppRole secret ID, mounted `readOnly` at `/etc/svidlet/vault` **only into the `svidlet` container**. The policy daemon never sees it; that is the two-process split working.
+- **hostPath `/etc/svidlet/node`** — the node certificate and key the registration agent keeps renewed, mounted `readOnly` **only into the `svidlet` container**. The policy daemon never sees it; that is the two-process split working.
+- **Secret `svidlet-vault-approle`** — dev and kind clusters only: the AppRole secret ID, at `/etc/svidlet/vault`, likewise only in the `svidlet` container. The production manifest ships no such Secret and marks the volume optional.
 - The example values and the GID chain are in [deploy/daemonset.yaml](../deploy/daemonset.yaml); what a workload does with the result is [USAGE.md](USAGE.md).

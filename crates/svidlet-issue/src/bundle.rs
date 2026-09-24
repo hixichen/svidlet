@@ -33,6 +33,10 @@ impl IssuedBundle {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CertFacts {
     pub spiffe_id: SpiffeId,
+    /// The Subject Common Name, if the certificate has one. Read back on
+    /// restart so a renewal keeps the label the first issuance chose, even
+    /// when the attribute it came from is no longer at hand.
+    pub common_name: Option<String>,
     pub not_before: i64,
     pub not_after: i64,
 }
@@ -61,8 +65,16 @@ pub fn inspect(cert_chain_pem: &str) -> Result<CertFacts> {
         })
         .ok_or_else(|| Error::Certificate("certificate has no SPIFFE URI SAN".into()))?;
 
+    let common_name = cert
+        .subject()
+        .iter_common_name()
+        .next()
+        .and_then(|cn| cn.as_str().ok())
+        .map(str::to_string);
+
     Ok(CertFacts {
         spiffe_id: SpiffeId::parse(raw)?,
+        common_name,
         not_before: cert.validity().not_before.timestamp(),
         not_after: cert.validity().not_after.timestamp(),
     })

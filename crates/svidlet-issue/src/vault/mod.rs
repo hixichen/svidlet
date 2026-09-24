@@ -17,7 +17,7 @@ use crate::bundle::{assert_identity, IssuedBundle};
 use crate::error::{Error, Result};
 use crate::issuer::{Issuer, SignRequest};
 
-pub use auth::{AppRoleAuth, KubernetesAuth, StaticTokenAuth};
+pub use auth::{AppRoleAuth, CertAuth, KubernetesAuth, StaticTokenAuth};
 pub use http::{VaultEndpoint, VaultHttp};
 
 /// Where and how to sign.
@@ -63,14 +63,7 @@ impl<S: TokenSource> VaultIssuer<S> {
 
 impl<S: TokenSource> Issuer for VaultIssuer<S> {
     fn sign(&self, request: &SignRequest<'_>) -> Result<IssuedBundle> {
-        let body = serde_json::json!({
-            "csr": request.csr_pem,
-            "uri_sans": request.spiffe_id.as_str(),
-            // Vault takes durations as a string; seconds are unambiguous.
-            "ttl": format!("{}s", request.ttl.as_secs()),
-            "format": "pem",
-            "exclude_cn_from_sans": true,
-        });
+        let body = sign_body(request);
         // Vault records request headers in its audit log when configured to,
         // which is what makes an issuance attributable to a node.
         let headers = [("X-Svidlet-Node", request.node_name)];
@@ -127,6 +120,26 @@ impl<S: TokenSource> Issuer for VaultIssuer<S> {
     fn auth_name(&self) -> &'static str {
         self.auth_name
     }
+}
+
+/// The body of `POST <mount>/sign/<role>`.
+fn sign_body(request: &SignRequest<'_>) -> serde_json::Value {
+    let mut body = serde_json::json!({
+        "csr": request.csr_pem,
+        "uri_sans": request.spiffe_id.as_str(),
+        // Vault takes durations as a string; seconds are unambiguous.
+        "ttl": format!("{}s", request.ttl.as_secs()),
+        "format": "pem",
+        // Without this Vault copies the CN into the DNS SANs. The role also
+        // refuses any DNS name (allowed_domains is empty), so a node that
+        // omitted this flag would be refused rather than handed a certificate
+        // valid for a hostname — but it is cleaner never to ask.
+        "exclude_cn_from_sans": true,
+    });
+    if let Some(cn) = request.common_name {
+        body["common_name"] = serde_json::Value::String(cn.to_string());
+    }
+    body
 }
 
 #[derive(Deserialize)]
@@ -207,6 +220,28 @@ mod tests {
     fn a_duplicated_issuing_ca_is_not_written_twice() {
         let d = data("LEAF", &["LEAF"], "");
         assert_eq!(d.chain_pem(), "LEAF\n");
+    }
+
+    #[test]
+    fn the_sign_body_carries_a_common_name_only_when_there_is_one() {
+        let id = crate::template::SpiffeId::parse("spiffe://example.org/ns/a/sa/b").unwrap();
+        let mut request = SignRequest {
+            spiffe_id: &id,
+            csr_pem: "CSR",
+            common_name: None,
+            ttl: std::time::Duration::from_secs(21_600),
+            node_name: "node-1",
+        };
+        let body = sign_body(&request);
+        assert_eq!(body["ttl"], "21600s");
+        assert_eq!(body["uri_sans"], "spiffe://example.org/ns/a/sa/b");
+        assert_eq!(body["exclude_cn_from_sans"], true);
+        assert!(body.get("common_name").is_none());
+
+        request.common_name = Some("web-1");
+        let body = sign_body(&request);
+        assert_eq!(body["common_name"], "web-1");
+        assert_eq!(body["exclude_cn_from_sans"], true);
     }
 
     #[test]

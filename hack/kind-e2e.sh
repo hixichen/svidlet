@@ -74,7 +74,9 @@ kubectl -n svidlet-system create configmap svidlet \
   --from-literal=SVIDLET_CLUSTER="${SVIDLET_CLUSTER}" \
   --from-literal=VAULT_ADDR="http://vault.vault.svc:8200" \
   --from-literal=SVIDLET_PKI_ROLE="spiffe-${SVIDLET_CLUSTER}" \
+  --from-literal=SVIDLET_VAULT_AUTH=approle \
   --from-literal=SVIDLET_ROLE_ID="${ROLE_ID}" \
+  --from-literal=SVIDLET_CLOUD_PROFILE=aws,gcp \
   --from-literal=SVIDLET_CERT_TTL=10m \
   --from-literal=SVIDLET_LOG_LEVEL=debug \
   --dry-run=client -o yaml | kubectl apply -f -

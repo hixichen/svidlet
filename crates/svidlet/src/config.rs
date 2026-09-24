@@ -6,7 +6,7 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
-use svidlet_issue::{IdPolicy, IdTemplate, KubernetesAuth};
+use svidlet_issue::{Cloud, IdPolicy, IdTemplate, KubernetesAuth, SubjectSource};
 
 use crate::log::Level;
 
@@ -69,6 +69,11 @@ pub struct Config {
 
     /// Requested certificate lifetime.
     pub cert_ttl: Duration,
+    /// Which workload attribute becomes the certificate's Subject CN.
+    pub cert_subject: SubjectSource,
+    /// Clouds whose acceptance rules every issued certificate is checked
+    /// against. A finding is logged and counted; it never fails issuance.
+    pub cloud_profile: Vec<Cloud>,
     /// Renew at a uniformly random point in this fraction range of the
     /// certificate's lifetime.
     pub renew_fraction: (f64, f64),
@@ -295,10 +300,12 @@ pub struct VaultSettings {
 
 /// How this node proves who it is to Vault.
 ///
-/// AppRole is the default because it is the only one that works everywhere,
-/// including bare metal — but it is a shared bearer secret, and the other two
-/// are stronger where the environment supports them. See the trust discussion
-/// in docs/DESIGN.md.
+/// `Cert` is the production method — the node certificate registration
+/// issued, bound to the cluster by its URI SAN — and what the shipped
+/// DaemonSet selects. AppRole remains the code default so a bare `cargo run`
+/// against a dev Vault needs nothing else, but it is a shared bearer secret
+/// and belongs on dev and kind clusters only. See docs/DESIGN.md and
+/// docs/ROADMAP.md §3.
 #[derive(Debug, Clone)]
 pub enum AuthSettings {
     AppRole {
@@ -311,6 +318,15 @@ pub enum AuthSettings {
         role: String,
         token_path: PathBuf,
     },
+    /// Vault TLS certificate auth with the node certificate registration
+    /// issued. The strongest of the four: nothing shared, bound to the
+    /// cluster by the certificate's URI SAN.
+    Cert {
+        mount: String,
+        role: String,
+        cert_path: PathBuf,
+        key_path: PathBuf,
+    },
     Token {
         path: PathBuf,
     },
@@ -321,6 +337,7 @@ impl AuthSettings {
         match self {
             AuthSettings::AppRole { .. } => "approle",
             AuthSettings::Kubernetes { .. } => "kubernetes",
+            AuthSettings::Cert { .. } => "cert",
             AuthSettings::Token { .. } => "token",
         }
     }
@@ -409,7 +426,20 @@ impl Config {
                 initial_timeout: env
                     .duration("SVIDLET_POLICY_INITIAL_TIMEOUT", Duration::from_secs(10))?,
             },
-            cert_ttl: env.duration("SVIDLET_CERT_TTL", Duration::from_secs(86_400))?,
+            // Six hours: short enough that a leaked key or a cloud credential
+            // minted from it is worth little, long enough that renewal at
+            // 50–70 % leaves three hours of runway through a Vault outage.
+            cert_ttl: env.duration("SVIDLET_CERT_TTL", Duration::from_secs(21_600))?,
+            cert_subject: match env.opt("SVIDLET_CERT_SUBJECT") {
+                None => SubjectSource::default(),
+                Some(v) => SubjectSource::parse(&v)
+                    .map_err(|e| ConfigError(format!("SVIDLET_CERT_SUBJECT: {e}")))?,
+            },
+            cloud_profile: match env.opt("SVIDLET_CLOUD_PROFILE") {
+                None => Vec::new(),
+                Some(v) => Cloud::parse_list(&v)
+                    .map_err(|e| ConfigError(format!("SVIDLET_CLOUD_PROFILE: {e}")))?,
+            },
             renew_fraction: (renew_min, renew_max),
             renew_check_interval: env
                 .duration("SVIDLET_RENEW_CHECK_INTERVAL", Duration::from_secs(30))?,
@@ -539,6 +569,23 @@ fn vault_settings(env: &Env<'_>, cluster: &str) -> Result<VaultSettings> {
                     .unwrap_or_else(|| KubernetesAuth::DEFAULT_TOKEN_PATH.into()),
             ),
         },
+        "cert" => AuthSettings::Cert {
+            mount: env
+                .opt("SVIDLET_VAULT_CERT_MOUNT")
+                .unwrap_or_else(|| "cert".into()),
+            // One cert role per cluster, named like the AppRole it replaces.
+            role: env
+                .opt("SVIDLET_VAULT_CERT_ROLE")
+                .unwrap_or_else(|| format!("svidlet-{cluster}")),
+            cert_path: PathBuf::from(
+                env.opt("SVIDLET_NODE_CERT_FILE")
+                    .unwrap_or_else(|| "/etc/svidlet/node/tls.crt".into()),
+            ),
+            key_path: PathBuf::from(
+                env.opt("SVIDLET_NODE_KEY_FILE")
+                    .unwrap_or_else(|| "/etc/svidlet/node/tls.key".into()),
+            ),
+        },
         "token" => AuthSettings::Token {
             path: PathBuf::from(
                 env.opt("SVIDLET_VAULT_TOKEN_FILE")
@@ -547,7 +594,7 @@ fn vault_settings(env: &Env<'_>, cluster: &str) -> Result<VaultSettings> {
         },
         other => {
             return Err(ConfigError(format!(
-                "SVIDLET_VAULT_AUTH must be approle, kubernetes or token; got {other:?}"
+                "SVIDLET_VAULT_AUTH must be approle, kubernetes, cert or token; got {other:?}"
             )))
         }
     };
@@ -702,7 +749,9 @@ mod tests {
         assert_eq!(cfg.readopt_interval, Duration::from_secs(60));
         assert_eq!(cfg.spiffe_id_template, IdTemplate::DEFAULT);
         assert_eq!(cfg.spiffe_id_pattern, None);
-        assert_eq!(cfg.cert_ttl, Duration::from_secs(86_400));
+        assert_eq!(cfg.cert_ttl, Duration::from_secs(21_600));
+        assert_eq!(cfg.cert_subject, SubjectSource::PodName);
+        assert!(cfg.cloud_profile.is_empty());
         assert_eq!(cfg.renew_fraction, (0.5, 0.7));
         assert_eq!(cfg.renew_check_interval, Duration::from_secs(30));
         assert_eq!(cfg.startup_spread, Duration::from_secs(300));
@@ -794,12 +843,47 @@ mod tests {
         let err = with(&[("SVIDLET_VAULT_AUTH", "kubernetes")]).unwrap_err();
         assert!(err.0.contains("SVIDLET_VAULT_K8S_ROLE"));
 
+        // Certificate auth needs nothing but the choice: the role is named
+        // after the cluster and the node certificate has a fixed home.
+        let cfg = with(&[("SVIDLET_VAULT_AUTH", "cert")]).unwrap();
+        assert_eq!(cfg.vault.auth.method(), "cert");
+        match cfg.vault.auth {
+            AuthSettings::Cert {
+                mount,
+                role,
+                cert_path,
+                key_path,
+            } => {
+                assert_eq!(mount, "cert");
+                assert_eq!(role, "svidlet-cluster-a");
+                assert_eq!(cert_path, PathBuf::from("/etc/svidlet/node/tls.crt"));
+                assert_eq!(key_path, PathBuf::from("/etc/svidlet/node/tls.key"));
+            }
+            other => panic!("expected cert, got {other:?}"),
+        }
+        let cfg = with(&[
+            ("SVIDLET_VAULT_AUTH", "cert"),
+            ("SVIDLET_VAULT_CERT_MOUNT", "cert-nodes"),
+            ("SVIDLET_VAULT_CERT_ROLE", "nodes-a"),
+            ("SVIDLET_NODE_CERT_FILE", "/run/node/cert.pem"),
+            ("SVIDLET_NODE_KEY_FILE", "/run/node/key.pem"),
+        ])
+        .unwrap();
+        assert!(matches!(
+            cfg.vault.auth,
+            AuthSettings::Cert { ref mount, ref role, ref cert_path, ref key_path }
+                if mount == "cert-nodes"
+                    && role == "nodes-a"
+                    && cert_path == &PathBuf::from("/run/node/cert.pem")
+                    && key_path == &PathBuf::from("/run/node/key.pem")
+        ));
+
         let cfg = with(&[("SVIDLET_VAULT_AUTH", "token")]).unwrap();
         assert_eq!(cfg.vault.auth.method(), "token");
         assert!(matches!(cfg.vault.auth, AuthSettings::Token { .. }));
 
         let err = with(&[("SVIDLET_VAULT_AUTH", "oidc")]).unwrap_err();
-        assert!(err.0.contains("approle, kubernetes or token"));
+        assert!(err.0.contains("approle, kubernetes, cert or token"));
     }
 
     #[test]
@@ -1118,6 +1202,25 @@ mod tests {
 
         let err = with(&[("SVIDLET_CERT_TTL", "one day")]).unwrap_err();
         assert!(err.0.contains("30s, 10m, 24h or 3d"));
+    }
+
+    #[test]
+    fn the_certificate_subject_and_cloud_profile_are_validated() {
+        let cfg = with(&[
+            ("SVIDLET_CERT_SUBJECT", "service_account"),
+            ("SVIDLET_CLOUD_PROFILE", "aws,gcp"),
+        ])
+        .unwrap();
+        assert_eq!(cfg.cert_subject, SubjectSource::ServiceAccount);
+        assert_eq!(cfg.cloud_profile, vec![Cloud::Aws, Cloud::Gcp]);
+
+        let cfg = with(&[("SVIDLET_CERT_SUBJECT", "none")]).unwrap();
+        assert_eq!(cfg.cert_subject, SubjectSource::None);
+
+        let err = with(&[("SVIDLET_CERT_SUBJECT", "namespace")]).unwrap_err();
+        assert!(err.0.contains("SVIDLET_CERT_SUBJECT"), "{err}");
+        let err = with(&[("SVIDLET_CLOUD_PROFILE", "azure")]).unwrap_err();
+        assert!(err.0.contains("SVIDLET_CLOUD_PROFILE"), "{err}");
     }
 
     #[test]
