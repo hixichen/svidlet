@@ -176,6 +176,10 @@ pub fn adopt(cfg: &Config, policy: &IdPolicy, store: &Store, metrics: &Metrics) 
             namespace: attrs.namespace,
             uid: found.pod_uid,
         };
+        let (audiences, tokens_expire_at) = recover_audiences(&found.target_path);
+        // Tokens that would lapse before the next certificate renewal re-mints
+        // them are owed now; otherwise the renewal takes care of it.
+        let tokens_due_at = tokens_expire_at.filter(|exp| *exp <= renew_at).map(|_| now);
         store.insert(Entry {
             volume_id: found.volume_id.clone(),
             target_path: found.target_path.clone(),
@@ -190,6 +194,10 @@ pub fn adopt(cfg: &Config, policy: &IdPolicy, store: &Store, metrics: &Metrics) 
             not_after: facts.not_after,
             renew_at,
             failures: 0,
+            audiences,
+            tokens_expire_at,
+            tokens_due_at,
+            token_failures: 0,
         });
         // The bind mount normally survives a plugin restart, but a first boot
         // or a wiped farm directory re-creates it here — the policy daemon
@@ -293,6 +301,40 @@ pub fn identity_belongs_here(
         ));
     }
     Ok(())
+}
+
+/// The audiences a volume's pod declared, read back from the tokens already
+/// published: the file is the name, the token's `aud` claim the audience. The
+/// kubelet's volume record does not keep the pod's volume attributes, so this
+/// is the only place they survive a restart.
+fn recover_audiences(target: &Path) -> (Vec<svidlet_token::Audience>, Option<i64>) {
+    let Ok(identity) = volume::read_identity(target) else {
+        return (Vec::new(), None);
+    };
+    let mut audiences = Vec::new();
+    let mut earliest: Option<i64> = None;
+    for (name, token) in identity.tokens {
+        let recovered = svidlet_token::Claims::read_unverified(&token)
+            .map_err(|e| e.to_string())
+            .and_then(|claims| {
+                svidlet_token::Audience::new(&name, &claims.aud)
+                    .map(|audience| (audience, claims.exp))
+                    .map_err(|e| e.to_string())
+            });
+        match recovered {
+            Ok((audience, exp)) => {
+                audiences.push(audience);
+                earliest = Some(earliest.map_or(exp, |e| e.min(exp)));
+            }
+            Err(e) => warn!(
+                "cannot read back a published token; it will not be renewed",
+                path = target.display(),
+                token = name,
+                error = e,
+            ),
+        }
+    }
+    (audiences, earliest)
 }
 
 #[cfg(test)]

@@ -11,9 +11,12 @@ use svidlet_issue::{
     Error, IdPolicy, IssuedBundle, Issuer, Result, SignRequest, SpiffeId, WorkloadAttributes,
 };
 
-use crate::config::Config;
+use svidlet_token::Audience;
+
+use crate::config::{AuthSettings, Config};
 use crate::metrics::Metrics;
 use crate::store::Store;
+use crate::token::TokenClient;
 use crate::volume::{self, Identity, Modes};
 use crate::{debug, info, warn};
 
@@ -28,6 +31,8 @@ pub struct Publisher {
     /// chain returned alongside a signature, because it also carries a new root
     /// during a CA rotation, before any leaf has been signed by it.
     ca: Mutex<String>,
+    /// The token issuer, when one is configured.
+    tokens: Option<TokenClient>,
 }
 
 impl std::fmt::Debug for Publisher {
@@ -50,6 +55,23 @@ impl Publisher {
         store: Arc<Store>,
         metrics: Arc<Metrics>,
     ) -> Self {
+        // Configuration already refused a token issuer without certificate
+        // auth, so the node certificate is there to present.
+        let tokens = match (&cfg.token, &cfg.vault.auth) {
+            (
+                Some(settings),
+                AuthSettings::Cert {
+                    cert_path,
+                    key_path,
+                    ..
+                },
+            ) => Some(TokenClient::new(
+                settings.clone(),
+                cert_path.clone(),
+                key_path.clone(),
+            )),
+            _ => None,
+        };
         Publisher {
             cfg,
             issuer,
@@ -57,6 +79,7 @@ impl Publisher {
             store,
             metrics,
             ca: Mutex::new(String::new()),
+            tokens,
         }
     }
 
@@ -109,16 +132,77 @@ impl Publisher {
             cached
         };
 
+        // Tokens already in the volume stay until they are re-minted for the
+        // new certificate: they are valid until their own `exp`.
+        let tokens = volume::read_identity(target)
+            .map(|current| current.tokens)
+            .unwrap_or_default();
         volume::publish_identity(
             target,
             &Identity {
                 key_pem: generated.key_pem,
                 cert_chain_pem: bundle.cert_chain_pem.clone(),
                 ca_pem,
+                tokens,
             },
             self.modes(),
         )?;
         Ok(bundle)
+    }
+
+    /// Whether this node can mint JWT-SVIDs at all.
+    #[must_use]
+    pub fn mints_tokens(&self) -> bool {
+        self.tokens.is_some()
+    }
+
+    /// Mint a token for each audience from the certificate and key now in
+    /// `target`, and publish them in one swap. Returns the earliest expiry.
+    ///
+    /// All or nothing: if one audience fails, none of the new tokens are
+    /// published and the previous ones stay.
+    pub async fn mint_tokens(&self, target: &Path, audiences: &[Audience]) -> Result<i64> {
+        let Some(client) = &self.tokens else {
+            return Err(Error::Config(
+                "the pod declares audiences but SVIDLET_TOKEN_ISSUER is not set".into(),
+            ));
+        };
+        let current = volume::read_identity(target).map_err(Error::Io)?;
+        let bundle = {
+            let cached = self.cached_ca();
+            if cached.is_empty() {
+                current.ca_pem.clone()
+            } else {
+                cached
+            }
+        };
+        let mut tokens = Vec::with_capacity(audiences.len());
+        let mut earliest = i64::MAX;
+        for audience in audiences {
+            let minted = match client
+                .mint(&bundle, &current.cert_chain_pem, &current.key_pem, audience)
+                .await
+            {
+                Ok(minted) => minted,
+                Err(e) => {
+                    self.metrics.token_failed(e.code());
+                    return Err(e);
+                }
+            };
+            earliest = earliest.min(minted.claims.exp);
+            tokens.push((minted.name, minted.token));
+        }
+        let modes = self.modes();
+        let target = target.to_path_buf();
+        let count = tokens.len();
+        tokio::task::spawn_blocking(move || {
+            volume::publish_identity(&target, &Identity { tokens, ..current }, modes)
+        })
+        .await
+        .map_err(|e| Error::Io(std::io::Error::other(format!("publish task failed: {e}"))))?
+        .map_err(Error::Io)?;
+        self.metrics.tokens_minted(count);
+        Ok(earliest)
     }
 
     /// Report anything a configured cloud would refuse about a certificate.

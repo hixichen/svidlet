@@ -19,7 +19,52 @@ pub async fn renewal_loop(publisher: Arc<Publisher>) {
     loop {
         tokio::time::sleep(interval).await;
         renew_due(Arc::clone(&publisher)).await;
+        mint_due(&publisher).await;
     }
+}
+
+/// One pass of token minting: every volume whose certificate was renewed, or
+/// whose last attempt failed and has backed off long enough. Returns how many
+/// volumes were attempted.
+///
+/// A failure keeps the tokens already published — valid until their `exp`,
+/// which is never later than the certificate they were minted from — and
+/// retries with backoff. `svidlet_earliest_token_expiry_seconds` shows the
+/// runway left.
+pub async fn mint_due(publisher: &Publisher) -> usize {
+    let now = unix_now();
+    let due = publisher.store.tokens_due(now);
+    for entry in &due {
+        match publisher
+            .mint_tokens(&entry.target_path, &entry.audiences)
+            .await
+        {
+            Ok(expire_at) => {
+                publisher.store.record_tokens(&entry.target_path, expire_at);
+                debug!(
+                    "tokens minted",
+                    spiffe_id = entry.spiffe_id,
+                    audiences = entry.audiences.len(),
+                    expires_in_secs = expire_at - now,
+                );
+            }
+            Err(e) => {
+                let failures = publisher
+                    .store
+                    .record_token_failure(&entry.target_path, now);
+                warn!(
+                    "token minting failed; the published tokens stay until they expire",
+                    spiffe_id = entry.spiffe_id,
+                    code = e.code(),
+                    error = e,
+                    failures = failures,
+                    current_tokens_expire_in_secs =
+                        entry.tokens_expire_at.map_or(0, |exp| exp - now),
+                );
+            }
+        }
+    }
+    due.len()
 }
 
 /// One pass of the renewal loop. Returns how many certificates were attempted.

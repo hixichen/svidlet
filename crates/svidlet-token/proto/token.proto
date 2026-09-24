@@ -1,0 +1,41 @@
+// The token issuer: turns a pod's X.509-SVID into a JWT-SVID for one audience.
+//
+// Callers are svidlet processes, one per node, authenticated by mutual TLS with
+// the node certificate node bootstrap issued. Each keeps one HTTP/2 connection
+// open and sends a unary Mint per token, so the issuer sees one long-lived
+// connection per node however many pods the node hosts.
+syntax = "proto3";
+
+package svidlet.token.v1;
+
+service TokenIssuer {
+  // Mint one JWT-SVID. The subject is the pod certificate's SPIFFE ID; the
+  // pod's cluster must be the calling node's, and a grant must allow the
+  // audience for that ID. Errors are gRPC statuses:
+  //   UNAUTHENTICATED     the caller presented no usable node certificate
+  //   INVALID_ARGUMENT    the chain or proof is malformed, or the proof is stale
+  //   PERMISSION_DENIED   another cluster's pod, or no grant for the audience
+  rpc Mint(MintRequest) returns (MintResponse);
+}
+
+message MintRequest {
+  // The pod's certificate chain, leaf first, PEM: the volume's tls.crt.
+  string pod_cert_chain_pem = 1;
+  // The audience the token is for, the JWT `aud` claim.
+  string audience = 2;
+  // Unix seconds at which the proof was made. The issuer accepts a small
+  // window around its own clock.
+  int64 proof_time = 3;
+  // ECDSA P-256 with SHA-256, ASN.1 DER, by the pod's private key over the
+  // proof message (svidlet_token::pop). Pod certificates are public — every
+  // peer sees one in each handshake — so possession of the key is what shows
+  // the caller holds the identity rather than a copy of its certificate.
+  bytes proof = 4;
+}
+
+message MintResponse {
+  // The compact JWS.
+  string token = 1;
+  // Unix seconds; never later than the pod certificate's notAfter.
+  int64 expires_at = 2;
+}

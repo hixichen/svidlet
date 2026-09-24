@@ -372,6 +372,7 @@ mod tests {
             cert_ttl: Duration::from_secs(3600),
             cert_subject: svidlet_issue::SubjectSource::PodName,
             cloud_profile: Vec::new(),
+            token: None,
             renew_fraction: (0.5, 0.7),
             renew_check_interval: Duration::from_secs(30),
             startup_spread: Duration::from_secs(300),

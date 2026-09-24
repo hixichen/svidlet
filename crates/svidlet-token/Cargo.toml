@@ -1,0 +1,27 @@
+[package]
+name = "svidlet-token"
+description = "The svidlet token-issuer protocol: gRPC API, proof of possession, audience rules"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+base64.workspace = true
+prost.workspace = true
+ring.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tonic.workspace = true
+tonic-prost.workspace = true
+
+[build-dependencies]
+tonic-prost-build = "0.14"
+protoc-bin-vendored = "3"
+
+[lints]
+workspace = true

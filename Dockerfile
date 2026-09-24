@@ -12,19 +12,31 @@ WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
 COPY crates/svidlet/Cargo.toml crates/svidlet/
 COPY crates/svidlet-issue/Cargo.toml crates/svidlet-issue/
-RUN mkdir -p crates/svidlet/src crates/svidlet-issue/src \
+COPY crates/svidlet-token/Cargo.toml crates/svidlet-token/
+COPY crates/svidlet-token-issuer/Cargo.toml crates/svidlet-token-issuer/
+RUN for c in svidlet svidlet-issue svidlet-token svidlet-token-issuer; do \
+      mkdir -p crates/$c/src && touch crates/$c/src/lib.rs; \
+    done \
  && echo 'fn main() {}' > crates/svidlet/src/main.rs \
- && touch crates/svidlet/src/lib.rs crates/svidlet-issue/src/lib.rs \
+ && echo 'fn main() {}' > crates/svidlet-token-issuer/src/main.rs \
  && echo 'fn main() {}' > crates/svidlet/build.rs \
+ && echo 'fn main() {}' > crates/svidlet-token/build.rs \
  && cargo build --release --locked \
- && rm -rf crates/svidlet/src crates/svidlet-issue/src crates/svidlet/build.rs
+ && rm -rf crates/*/src crates/svidlet/build.rs crates/svidlet-token/build.rs
 
 COPY crates crates
-# Touch the manifests so cargo rebuilds the workspace crates against the
-# now-real sources.
-RUN touch crates/svidlet/src/main.rs crates/svidlet-issue/src/lib.rs \
+# COPY keeps the context's mtimes, which predate the stub build; touch every
+# source so cargo rebuilds the workspace crates against the real ones.
+RUN find crates -name '*.rs' -exec touch {} + \
  && cargo build --release --locked \
- && strip target/release/svidlet target/release/svidlet-policy
+ && strip target/release/svidlet target/release/svidlet-policy \
+          target/release/svidlet-token-issuer
+
+# The Stage 2 token issuer: a central Deployment, not part of the node image.
+#   docker build --target token-issuer -t svidlet-token-issuer .
+FROM scratch AS token-issuer
+COPY --from=build /src/target/release/svidlet-token-issuer /svidlet-token-issuer
+ENTRYPOINT ["/svidlet-token-issuer"]
 
 # The trust roots for reaching Vault are compiled in (webpki-roots), and a
 # private Vault CA is supplied through VAULT_CACERT, so nothing else is needed.

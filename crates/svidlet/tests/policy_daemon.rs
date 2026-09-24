@@ -72,6 +72,7 @@ fn publish_certificate(root: &Path, pod_uid: &str, spiffe_id: &str) -> PathBuf {
             key_pem: leaf_key.serialize_pem(),
             cert_chain_pem: cert.pem(),
             ca_pem: ca.pem(),
+            tokens: Vec::new(),
         },
         MODES,
     )
@@ -309,6 +310,7 @@ fn a_volume_that_is_not_exposed_is_invisible() {
             key_pem: "KEY\n".into(),
             cert_chain_pem: "CERT\n".into(),
             ca_pem: "CA\n".into(),
+            tokens: Vec::new(),
         },
         MODES,
     )

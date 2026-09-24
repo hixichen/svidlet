@@ -1257,6 +1257,8 @@ dependencies = [
  "serde",
  "serde_json",
  "svidlet-issue",
+ "svidlet-token",
+ "svidlet-token-issuer",
  "time",
  "tokio",
  "tokio-stream",
@@ -1278,6 +1280,43 @@ dependencies = [
  "serde_json",
  "time",
  "ureq",
+ "x509-parser",
+]
+
+[[package]]
+name = "svidlet-token"
+version = "0.0.1"
+dependencies = [
+ "base64 0.23.1",
+ "prost",
+ "protoc-bin-vendored",
+ "ring",
+ "serde",
+ "serde_json",
+ "tonic",
+ "tonic-prost",
+ "tonic-prost-build",
+]
+
+[[package]]
+name = "svidlet-token-issuer"
+version = "0.0.1"
+dependencies = [
+ "base64 0.23.1",
+ "basic-toml",
+ "rcgen",
+ "ring",
+ "rustls-pki-types",
+ "rustls-webpki",
+ "serde",
+ "serde_json",
+ "svidlet-token",
+ "time",
+ "tokio",
+ "tokio-stream",
+ "tonic",
+ "tracing",
+ "tracing-subscriber",
  "x509-parser",
 ]
 

@@ -163,6 +163,19 @@ impl Node for NodeService {
         }
 
         let (spiffe_id, common_name, pod) = self.identity_from(&req.volume_context)?;
+        let audiences = svidlet_token::parse_audiences(
+            req.volume_context
+                .get(vc::AUDIENCES)
+                .map_or("", String::as_str),
+        )
+        .map_err(|e| Status::invalid_argument(e.to_string()))?;
+        // Asking for tokens a node cannot mint fails the pod, rather than
+        // starting it without credentials it declared it needs.
+        if !audiences.is_empty() && !self.publisher.mints_tokens() {
+            return Err(Status::failed_precondition(
+                "the volume declares audiences, but this node has no SVIDLET_TOKEN_ISSUER",
+            ));
+        }
         let target = PathBuf::from(&req.target_path);
         let publisher = Arc::clone(&self.publisher);
 
@@ -257,6 +270,39 @@ impl Node for NodeService {
             }
         }
 
+        // Tokens, before the pod can start: it declared it needs them. An
+        // issuer outage therefore delays new pods, like a Vault outage does,
+        // and never touches running ones.
+        let mut tokens_expire_at = None;
+        if !audiences.is_empty() {
+            match self.publisher.mint_tokens(&target, &audiences).await {
+                Ok(expire_at) => tokens_expire_at = Some(expire_at),
+                Err(e) => {
+                    if self.publisher.cfg.policy_gid.is_some() {
+                        let _ = volume::unexpose(
+                            &self.publisher.cfg.volumes_dir,
+                            &volume::farm_name(&req.volume_id),
+                        );
+                    }
+                    let _ = volume::unpublish(&target);
+                    let code = e.code();
+                    warn!(
+                        "no tokens for the declared audiences; refusing to publish",
+                        spiffe_id = spiffe_id,
+                        pod = pod.name,
+                        namespace = pod.namespace,
+                        code = code,
+                        error = e,
+                    );
+                    return Err(if e.is_caller_error() {
+                        Status::permission_denied(e.to_string())
+                    } else {
+                        Status::unavailable(e.to_string())
+                    });
+                }
+            }
+        }
+
         // The only thing svidlet knows about policy: whether a revision file
         // has appeared beside the certificate it just wrote. The policy daemon
         // discovers this volume by reading that certificate, so the certificate
@@ -300,6 +346,10 @@ impl Node for NodeService {
             not_after: bundle.not_after,
             renew_at,
             failures: 0,
+            audiences,
+            tokens_expire_at,
+            tokens_due_at: None,
+            token_failures: 0,
         });
         self.publisher.metrics.published();
 

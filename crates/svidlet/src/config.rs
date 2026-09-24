@@ -21,6 +21,10 @@ pub mod volume_context {
     pub const POD_UID: &str = "csi.storage.k8s.io/pod.uid";
     pub const SERVICE_ACCOUNT: &str = "csi.storage.k8s.io/serviceAccount.name";
     pub const EPHEMERAL: &str = "csi.storage.k8s.io/ephemeral";
+    /// From the pod's own `volumeAttributes`: the audiences it wants
+    /// JWT-SVIDs for. Pod-chosen, so a request, never a grant — the token
+    /// issuer decides per SPIFFE ID.
+    pub const AUDIENCES: &str = "audiences";
 }
 
 /// Where svidlet-node-bootstrap writes the node certificate: a memory-backed
@@ -33,6 +37,8 @@ pub const NODE_KEY_FILE: &str = "/node/node.key";
 pub const CERT_FILE: &str = "tls.crt";
 pub const KEY_FILE: &str = "tls.key";
 pub const CA_FILE: &str = "ca.crt";
+/// Directory inside the volume holding JWT-SVIDs, one file per audience name.
+pub const JWT_DIR: &str = "jwt";
 /// Holds the upstream revision of the published policy bundle, so an
 /// application can detect a change without walking the policy directory.
 pub const REVISION_FILE: &str = "policy.revision";
@@ -83,6 +89,9 @@ pub struct Config {
     /// Clouds whose acceptance rules every issued certificate is checked
     /// against. A finding is logged and counted; it never fails issuance.
     pub cloud_profile: Vec<Cloud>,
+    /// The token issuer, for pods whose volume declares `audiences`. `None`
+    /// refuses such pods rather than starting them without their tokens.
+    pub token: Option<TokenSettings>,
     /// Renew at a uniformly random point in this fraction range of the
     /// certificate's lifetime.
     pub renew_fraction: (f64, f64),
@@ -299,6 +308,19 @@ impl PolicyConfig {
     }
 }
 
+/// Where JWT-SVIDs come from. See docs/ROADMAP.md §5.
+#[derive(Debug, Clone)]
+pub struct TokenSettings {
+    /// `https://host:port` of the issuer's gRPC listener.
+    pub url: String,
+    /// CA for the issuer's serving certificate. `None` uses the trust bundle
+    /// fetched from the PKI backend — the issuer's certificate comes from the
+    /// same CA as every workload's.
+    pub ca_cert_path: Option<PathBuf>,
+    /// Per-token request deadline.
+    pub timeout: Duration,
+}
+
 #[derive(Debug, Clone)]
 pub struct VaultSettings {
     pub address: String,
@@ -454,6 +476,14 @@ impl Config {
                     .parse::<SubjectSource>()
                     .map_err(|e| ConfigError(format!("SVIDLET_CERT_SUBJECT: {e}")))?,
             },
+            token: match env.opt("SVIDLET_TOKEN_ISSUER") {
+                None => None,
+                Some(url) => Some(TokenSettings {
+                    url,
+                    ca_cert_path: env.opt("SVIDLET_TOKEN_ISSUER_CACERT").map(PathBuf::from),
+                    timeout: env.duration("SVIDLET_TOKEN_TIMEOUT", Duration::from_secs(10))?,
+                }),
+            },
             cloud_profile: match env.opt("SVIDLET_CLOUD_PROFILE") {
                 None => Vec::new(),
                 Some(v) => Cloud::parse_list(&v)
@@ -511,6 +541,26 @@ impl Config {
                  could never write into a root-only volume, so no pod would ever start"
                     .into(),
             ));
+        }
+
+        // The issuer authenticates nodes by their node certificate, which only
+        // certificate auth has. Refusing here beats every token request
+        // failing later with an unauthenticated handshake.
+        if let Some(token) = &cfg.token {
+            if !token.url.starts_with("https://") {
+                return Err(ConfigError(format!(
+                    "SVIDLET_TOKEN_ISSUER must be an https:// URL, got {:?}",
+                    token.url
+                )));
+            }
+            if !matches!(cfg.vault.auth, AuthSettings::Cert { .. }) {
+                return Err(ConfigError(
+                    "SVIDLET_TOKEN_ISSUER needs SVIDLET_VAULT_AUTH=cert: the issuer \
+                     authenticates the node by its node certificate, which only node \
+                     bootstrap provides"
+                        .into(),
+                ));
+            }
         }
 
         // Compile the identity policy here so a bad template or pattern stops
@@ -1224,6 +1274,29 @@ mod tests {
 
         let err = with(&[("SVIDLET_CERT_TTL", "one day")]).unwrap_err();
         assert!(err.0.contains("30s, 10m, 24h or 3d"));
+    }
+
+    #[test]
+    fn the_token_issuer_needs_https_and_a_node_certificate() {
+        let cfg = with(&[
+            ("SVIDLET_VAULT_AUTH", "cert"),
+            ("SVIDLET_TOKEN_ISSUER", "https://tokens.internal:8443"),
+        ])
+        .unwrap();
+        let token = cfg.token.unwrap();
+        assert_eq!(token.url, "https://tokens.internal:8443");
+        assert_eq!(token.timeout, Duration::from_secs(10));
+        assert!(token.ca_cert_path.is_none());
+        assert!(load(base()).unwrap().token.is_none());
+
+        let err = with(&[("SVIDLET_TOKEN_ISSUER", "https://tokens.internal:8443")]).unwrap_err();
+        assert!(err.0.contains("SVIDLET_VAULT_AUTH=cert"), "{err}");
+        let err = with(&[
+            ("SVIDLET_VAULT_AUTH", "cert"),
+            ("SVIDLET_TOKEN_ISSUER", "http://tokens.internal"),
+        ])
+        .unwrap_err();
+        assert!(err.0.contains("https://"), "{err}");
     }
 
     #[test]

@@ -39,4 +39,5 @@ pub mod recover;
 pub mod renew;
 pub mod server;
 pub mod store;
+pub mod token;
 pub mod volume;

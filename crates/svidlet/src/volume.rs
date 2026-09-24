@@ -28,7 +28,7 @@ use std::io;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 
-use crate::config::{CA_FILE, CERT_FILE, KEY_FILE, POLICY_DIR, REVISION_FILE};
+use crate::config::{CA_FILE, CERT_FILE, JWT_DIR, KEY_FILE, POLICY_DIR, REVISION_FILE};
 use crate::policy::PolicyBundle;
 
 /// The identity chain, written by svidlet.
@@ -39,21 +39,29 @@ const VERSION_PREFIX: &str = "..svidlet.";
 const POLICY_LINK: &str = "..policy-data";
 const POLICY_VERSION_PREFIX: &str = "..policy.";
 
-/// The certificate and its key. One atomic swap.
+/// The certificate, its key, and any JWT-SVIDs minted from them. One atomic
+/// swap, so a reader never sees a token from one generation beside a
+/// certificate from another.
 ///
-/// `Debug` redacts the private key; the certificate and bundle are public.
+/// `Debug` redacts the private key and the tokens, which are bearer
+/// credentials; the certificate and bundle are public.
 pub struct Identity {
     pub key_pem: String,
     pub cert_chain_pem: String,
     pub ca_pem: String,
+    /// `(file name, compact JWS)`, written to `jwt/<name>`. Empty for a pod
+    /// that declared no audiences, and then no `jwt` directory exists.
+    pub tokens: Vec<(String, String)>,
 }
 
 impl std::fmt::Debug for Identity {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let names: Vec<&str> = self.tokens.iter().map(|(n, _)| n.as_str()).collect();
         f.debug_struct("Identity")
             .field("key_pem", &"<redacted>")
             .field("cert_chain_pem", &self.cert_chain_pem)
             .field("ca_pem", &self.ca_pem)
+            .field("tokens", &names)
             .finish()
     }
 }
@@ -102,6 +110,20 @@ pub fn publish_identity(target: &Path, identity: &Identity, modes: Modes) -> io:
         modes.cert,
     )?;
     write_file(&dir.join(CA_FILE), identity.ca_pem.as_bytes(), modes.cert)?;
+    if !identity.tokens.is_empty() {
+        // Bearer credentials: the key's mode and group, not the certificate's.
+        let jwt = dir.join(JWT_DIR);
+        fs::create_dir(&jwt)?;
+        fs::set_permissions(&jwt, fs::Permissions::from_mode(0o755))?;
+        for (name, token) in &identity.tokens {
+            let path = jwt.join(name);
+            write_file(&path, token.as_bytes(), modes.key)?;
+            if let Some(gid) = modes.key_gid {
+                chgrp(&path, gid)?;
+            }
+        }
+        fsync_dir(&jwt)?;
+    }
     fsync_dir(&dir)?;
 
     // Visible symlinks first, then the swap. They dangle for an instant on the
@@ -110,6 +132,9 @@ pub fn publish_identity(target: &Path, identity: &Identity, modes: Modes) -> io:
     // files and not others, which is the one thing this layout exists to avoid.
     for name in [KEY_FILE, CERT_FILE, CA_FILE] {
         link(target, name, &format!("{DATA_LINK}/{name}"))?;
+    }
+    if !identity.tokens.is_empty() {
+        link(target, JWT_DIR, &format!("{DATA_LINK}/{JWT_DIR}"))?;
     }
     swap(target, DATA_LINK, VERSION_PREFIX, version)?;
     fsync_dir(target)?;
@@ -200,6 +225,7 @@ fn read_generation(dir: &Path) -> io::Result<Identity> {
         key_pem: fs::read_to_string(dir.join(KEY_FILE))?,
         cert_chain_pem: fs::read_to_string(dir.join(CERT_FILE))?,
         ca_pem: fs::read_to_string(dir.join(CA_FILE))?,
+        tokens: read_tokens(&dir.join(JWT_DIR))?,
     })
 }
 
@@ -352,6 +378,24 @@ fn swap(target: &Path, link_name: &str, prefix: &str, version: u64) -> io::Resul
     let _ = fs::remove_file(&tmp);
     std::os::unix::fs::symlink(format!("{prefix}{version}"), &tmp)?;
     fs::rename(&tmp, target.join(link_name))
+}
+
+/// The tokens in a generation's `jwt` directory, sorted by name. A generation
+/// without one has none.
+fn read_tokens(dir: &Path) -> io::Result<Vec<(String, String)>> {
+    let entries = match fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(e),
+    };
+    let mut tokens = Vec::new();
+    for entry in entries {
+        let entry = entry?;
+        let name = entry.file_name().to_string_lossy().into_owned();
+        tokens.push((name, fs::read_to_string(entry.path())?));
+    }
+    tokens.sort();
+    Ok(tokens)
 }
 
 fn link(target: &Path, name: &str, points_to: &str) -> io::Result<()> {
@@ -596,6 +640,7 @@ mod tests {
             key_pem: format!("KEY-{tag}\n"),
             cert_chain_pem: format!("CERT-{tag}\n"),
             ca_pem: format!("CA-{tag}\n"),
+            tokens: Vec::new(),
         }
     }
 
@@ -842,9 +887,66 @@ mod tests {
 
     #[test]
     fn debug_output_never_contains_the_private_key() {
-        let rendered = format!("{:?}", identity("secret-material"));
+        let mut id = identity("secret-material");
+        id.tokens = vec![("azure".into(), "eyJ.secret-token.sig".into())];
+        let rendered = format!("{id:?}");
         assert!(rendered.contains("CERT-secret-material"));
+        assert!(
+            rendered.contains("azure"),
+            "token names are shown: {rendered}"
+        );
         assert!(!rendered.contains("KEY-secret-material"), "{rendered}");
+        assert!(!rendered.contains("secret-token"), "{rendered}");
+    }
+
+    #[test]
+    fn tokens_swap_with_the_certificate_and_are_as_private_as_the_key() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = scratch("tokens");
+
+        // No audiences: no jwt directory, the layout as it always was.
+        publish_identity(&dir, &identity("1"), MODES).unwrap();
+        fs::symlink_metadata(dir.join(JWT_DIR)).unwrap_err();
+        assert!(read_identity(&dir).unwrap().tokens.is_empty());
+
+        let mut with_tokens = identity("2");
+        with_tokens.tokens = vec![
+            ("snowflake".into(), "T-snow-2".into()),
+            ("azure".into(), "T-azure-2".into()),
+        ];
+        publish_identity(&dir, &with_tokens, MODES).unwrap();
+        assert_eq!(
+            fs::read_to_string(dir.join(JWT_DIR).join("azure")).unwrap(),
+            "T-azure-2"
+        );
+        let mode = fs::metadata(dir.join(JWT_DIR).join("azure"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, MODES.key, "a bearer token gets the key's mode");
+
+        // Read back sorted by name, from the same generation as the certificate.
+        let back = read_identity(&dir).unwrap();
+        assert_eq!(back.cert_chain_pem, "CERT-2\n");
+        assert_eq!(
+            back.tokens,
+            vec![
+                ("azure".to_string(), "T-azure-2".to_string()),
+                ("snowflake".to_string(), "T-snow-2".to_string()),
+            ]
+        );
+
+        // The next generation replaces them together.
+        let mut next = identity("3");
+        next.tokens = vec![("azure".into(), "T-azure-3".into())];
+        publish_identity(&dir, &next, MODES).unwrap();
+        assert_eq!(
+            fs::read_to_string(dir.join(JWT_DIR).join("azure")).unwrap(),
+            "T-azure-3"
+        );
+        assert!(!dir.join(JWT_DIR).join("snowflake").exists());
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[cfg(target_os = "linux")]

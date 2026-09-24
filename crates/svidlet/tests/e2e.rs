@@ -225,6 +225,7 @@ fn config_with_gids(
             svidlet_issue::profile::Cloud::Aws,
             svidlet_issue::profile::Cloud::Gcp,
         ],
+        token: None,
         renew_fraction: (0.5, 0.7),
         renew_check_interval: std::time::Duration::from_secs(30),
         startup_spread: std::time::Duration::from_secs(300),

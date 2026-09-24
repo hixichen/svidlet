@@ -111,6 +111,9 @@ pub struct Metrics {
     /// non-zero value here means certificates are being re-issued that did not
     /// need to be.
     pub adoption_skipped: AtomicU64,
+    /// JWT-SVIDs minted, and minting failures by stable error code.
+    tokens_minted: AtomicU64,
+    failed_tokens: FailureCounter,
     /// Issued certificates a configured cloud would refuse, by cloud and rule.
     cloud_findings: [[AtomicU64; Rule::ALL.len()]; Cloud::ALL.len()],
 
@@ -151,6 +154,17 @@ impl Metrics {
 
     pub fn renew_failed(&self, code: ErrorCode) {
         self.failed_renew.inc(code);
+    }
+
+    /// Count tokens minted and published.
+    pub fn tokens_minted(&self, count: usize) {
+        self.tokens_minted
+            .fetch_add(u64::try_from(count).unwrap_or(u64::MAX), Ordering::Relaxed);
+    }
+
+    /// Count one failed token request.
+    pub fn token_failed(&self, code: ErrorCode) {
+        self.failed_tokens.inc(code);
     }
 
     /// Count one issued certificate breaking one cloud's rule.
@@ -317,6 +331,43 @@ impl Metrics {
             "gauge",
             "",
             store.due(now).len() as f64,
+        );
+        simple(
+            &mut out,
+            "svidlet_tokens_minted_total",
+            "JWT-SVIDs minted by the token issuer and published into volumes.",
+            "counter",
+            "",
+            self.tokens_minted.load(Ordering::Relaxed) as f64,
+        );
+        {
+            use std::fmt::Write as _;
+            let name = "svidlet_token_failures_total";
+            let _ = writeln!(
+                out,
+                "# HELP {name} Failed token requests, by stable error code. policy means the \
+                 issuer has no grant for the audience a pod asked for."
+            );
+            let _ = writeln!(out, "# TYPE {name} counter");
+            for code in ErrorCode::ALL {
+                let _ = writeln!(
+                    out,
+                    "{name}{{code=\"{code}\"}} {}",
+                    self.failed_tokens.get(code)
+                );
+            }
+        }
+        simple(
+            &mut out,
+            "svidlet_earliest_token_expiry_seconds",
+            "Seconds until the soonest-expiring JWT-SVID on this node expires. Tokens are \
+             re-minted with every certificate renewal, so a falling value means minting \
+             is failing. NaN when no volume declares audiences.",
+            "gauge",
+            "",
+            store
+                .earliest_token_expiry()
+                .map_or(f64::NAN, |at| (at - now) as f64),
         );
         simple(
             &mut out,
@@ -638,6 +689,10 @@ mod tests {
             not_after: now + 900,
             renew_at: now - 1,
             failures: 0,
+            audiences: Vec::new(),
+            tokens_expire_at: None,
+            tokens_due_at: None,
+            token_failures: 0,
         });
 
         let out = Metrics::default().render(&store);

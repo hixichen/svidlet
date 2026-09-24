@@ -1,6 +1,6 @@
 [package]
-name = "svidlet"
-description = "Lightweight SPIFFE X.509 issuer for Kubernetes — CSI node plugin"
+name = "svidlet-token-issuer"
+description = "Central issuer turning svidlet X.509-SVIDs into JWT-SVIDs for OIDC relying parties"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -11,13 +11,12 @@ categories.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-svidlet-issue.workspace = true
 svidlet-token.workspace = true
 base64.workspace = true
 basic-toml.workspace = true
-libc.workspace = true
 ring.workspace = true
-prost.workspace = true
+rustls-pki-types.workspace = true
+rustls-webpki.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
@@ -25,20 +24,11 @@ tokio-stream.workspace = true
 tonic.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
-tonic-prost.workspace = true
-ureq.workspace = true
-
-[build-dependencies]
-tonic-prost-build = "0.14"
-protoc-bin-vendored = "3"
+x509-parser.workspace = true
 
 [dev-dependencies]
-base64.workspace = true
 rcgen = { workspace = true, features = ["x509-parser"] }
 ring.workspace = true
-serde_json.workspace = true
-svidlet-issue.workspace = true
-svidlet-token-issuer.workspace = true
 time = "0.3"
 
 [lints]

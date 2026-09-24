@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use svidlet_issue::SpiffeId;
+use svidlet_token::Audience;
 
 use crate::rand;
 
@@ -33,6 +34,16 @@ pub struct Entry {
     pub renew_at: i64,
     /// Consecutive renewal failures; drives the backoff.
     pub failures: u32,
+    /// Audiences the pod's volume declared; a JWT-SVID is kept for each.
+    pub audiences: Vec<Audience>,
+    /// Earliest `exp` among the published tokens.
+    pub tokens_expire_at: Option<i64>,
+    /// When the tokens should next be minted: right after each certificate
+    /// renewal (a token never outlives its certificate), or after a backoff
+    /// when the issuer failed. `None` while nothing is owed.
+    pub tokens_due_at: Option<i64>,
+    /// Consecutive minting failures; drives the backoff.
+    pub token_failures: u32,
 }
 
 impl Entry {
@@ -104,6 +115,44 @@ impl Store {
         due
     }
 
+    /// Entries whose tokens are owed at `now`.
+    pub fn tokens_due(&self, now: i64) -> Vec<Entry> {
+        self.lock()
+            .values()
+            .filter(|e| !e.audiences.is_empty() && e.tokens_due_at.is_some_and(|at| at <= now))
+            .cloned()
+            .collect()
+    }
+
+    /// Earliest token expiry on the node, for the metrics endpoint.
+    pub fn earliest_token_expiry(&self) -> Option<i64> {
+        self.lock()
+            .values()
+            .filter_map(|e| e.tokens_expire_at)
+            .min()
+    }
+
+    /// Record freshly minted tokens.
+    pub fn record_tokens(&self, target_path: &Path, expire_at: i64) {
+        if let Some(entry) = self.lock().get_mut(target_path) {
+            entry.tokens_expire_at = Some(expire_at);
+            entry.tokens_due_at = None;
+            entry.token_failures = 0;
+        }
+    }
+
+    /// Record a failed mint and retry after a backoff. The tokens already
+    /// published stay: they are valid until their `exp`.
+    pub fn record_token_failure(&self, target_path: &Path, now: i64) -> u32 {
+        let mut guard = self.lock();
+        let Some(entry) = guard.get_mut(target_path) else {
+            return 0;
+        };
+        entry.token_failures = entry.token_failures.saturating_add(1);
+        entry.tokens_due_at = Some(now + backoff_secs(entry.token_failures));
+        entry.token_failures
+    }
+
     pub fn all(&self) -> Vec<Entry> {
         self.lock().values().cloned().collect()
     }
@@ -128,6 +177,11 @@ impl Store {
             entry.not_after = not_after;
             entry.renew_at = renew_at;
             entry.failures = 0;
+            // New certificate, new tokens: the old ones expire with the old
+            // certificate.
+            if !entry.audiences.is_empty() {
+                entry.tokens_due_at = Some(not_before.max(0));
+            }
         }
     }
 
@@ -189,6 +243,10 @@ mod tests {
             not_after,
             renew_at: jittered_renew_at(not_before, not_after, (0.5, 0.7)),
             failures: 0,
+            audiences: Vec::new(),
+            tokens_expire_at: None,
+            tokens_due_at: None,
+            token_failures: 0,
         }
     }
 
@@ -272,5 +330,37 @@ mod tests {
         store.record_renewal(Path::new("/gone"), 0, 1, 2);
         assert_eq!(store.record_failure(Path::new("/gone"), 0), 0);
         assert_eq!(store.len(), 0);
+    }
+
+    #[test]
+    fn tokens_fall_due_with_each_renewal_and_back_off_on_failure() {
+        let store = Store::new();
+        let mut with_tokens = entry("/t", 0, 21_600);
+        with_tokens.audiences = vec![Audience::new("azure", "api://x").unwrap()];
+        store.insert(with_tokens);
+        store.insert(entry("/plain", 0, 21_600));
+
+        // Nothing owed until a certificate is renewed.
+        assert!(store.tokens_due(1_000_000).is_empty());
+
+        store.record_renewal(Path::new("/t"), 20_000, 41_600, 32_000);
+        store.record_renewal(Path::new("/plain"), 20_000, 41_600, 32_000);
+        let due = store.tokens_due(20_000);
+        assert_eq!(due.len(), 1, "only volumes with audiences owe tokens");
+        assert_eq!(due[0].target_path, PathBuf::from("/t"));
+
+        // A failure keeps them owed, later.
+        store.record_token_failure(Path::new("/t"), 20_000);
+        assert!(store.tokens_due(20_000).is_empty());
+        let retry = store.get(Path::new("/t")).unwrap().tokens_due_at.unwrap();
+        // The certificate renewal backoff: 60 s ± 25 % after one failure.
+        assert!((20_000 + 45..=20_000 + 75).contains(&retry), "{retry}");
+        assert_eq!(store.tokens_due(retry).len(), 1);
+
+        // Success clears the debt and records the expiry.
+        store.record_tokens(Path::new("/t"), 41_600);
+        assert!(store.tokens_due(i64::MAX).is_empty());
+        assert_eq!(store.earliest_token_expiry(), Some(41_600));
+        assert_eq!(store.get(Path::new("/t")).unwrap().token_failures, 0);
     }
 }
