@@ -129,6 +129,15 @@ impl Stub {
                 ),
             );
         }
+        if path.ends_with("/transit/keys/jwt") {
+            if token != "s.reader" {
+                return (403, r#"{"errors":["permission denied"]}"#.into());
+            }
+            return (
+                200,
+                r#"{"data":{"type":"ecdsa-p256","latest_version":2}}"#.into(),
+            );
+        }
         if path.ends_with("/pki/ca_chain") {
             return (200, self.ca_pem.clone());
         }
@@ -335,4 +344,26 @@ fn a_ca_endpoint_that_does_not_return_pem_is_a_protocol_error() {
     );
     let err = issuer.ca_chain().unwrap_err();
     assert_eq!(err.code(), ErrorCode::BackendStatus);
+}
+
+#[test]
+fn an_authenticated_get_decodes_json_and_reports_refusals() {
+    let stub = Stub::start();
+    let http = VaultHttp::new(VaultEndpoint {
+        address: stub.addr.clone(),
+        namespace: None,
+        ca_cert_pem: None,
+        timeout: Duration::from_secs(5),
+    })
+    .unwrap();
+    let read: serde_json::Value = http.get_json("transit/keys/jwt", Some("s.reader")).unwrap();
+    assert_eq!(read["data"]["latest_version"], 2);
+
+    let err = http
+        .get_json::<serde_json::Value>("transit/keys/jwt", Some("s.other"))
+        .unwrap_err();
+    assert!(
+        matches!(err, svidlet_issue::Error::Backend { status: 403, .. }),
+        "{err}"
+    );
 }

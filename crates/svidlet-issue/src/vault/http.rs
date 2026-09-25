@@ -157,6 +157,40 @@ impl VaultHttp {
             .map_err(|e| Error::Protocol(format!("POST {url}: {e}")))
     }
 
+    /// GET and decode a JSON answer, authenticated when `token` is given.
+    ///
+    /// # Errors
+    ///
+    /// As [`VaultHttp::post_json`].
+    pub fn get_json<T: serde::de::DeserializeOwned>(
+        &self,
+        path: &str,
+        token: Option<&str>,
+    ) -> Result<T> {
+        let url = self.url(path);
+        let mut req = self.agent.get(&url);
+        if let Some(token) = token {
+            req = req.header("X-Vault-Token", token);
+        }
+        if let Some(ns) = &self.endpoint.namespace {
+            req = req.header("X-Vault-Namespace", ns);
+        }
+        let mut resp = req
+            .call()
+            .map_err(|e| Error::Transport(format!("GET {url}: {e}")))?;
+
+        let status = resp.status().as_u16();
+        if !(200..300).contains(&status) {
+            return Err(Error::Backend {
+                status,
+                body: truncate(&resp.body_mut().read_to_string().unwrap_or_default()),
+            });
+        }
+        resp.body_mut()
+            .read_json::<T>()
+            .map_err(|e| Error::Protocol(format!("GET {url}: {e}")))
+    }
+
     /// GET a plain-text body. Vault's `ca_chain` endpoint returns PEM, not JSON.
     ///
     /// # Errors
