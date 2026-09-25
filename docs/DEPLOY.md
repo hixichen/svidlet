@@ -105,7 +105,9 @@ the component follows them.
 JWT-SVIDs ([USAGE.md](USAGE.md) §3) come from a central issuer,
 [svidlet-token-issuer](https://github.com/hixichen/svidlet-token-issuer) — its own project,
 deployed once per trust domain or once per `iss` ([ROADMAP.md](ROADMAP.md) §5). svidlet is a
-caller: it asks on the pod's behalf, authenticating with the node certificate, so tokens need
+caller: it asks on the pod's behalf, authenticating with the node certificate, and the issuer has
+Vault Transit sign each token with a key that never leaves Vault
+([its design](https://github.com/hixichen/svidlet-token-issuer/blob/claude/compassionate-davinci-29520m/docs/DESIGN.md)). Tokens need
 `with-node-bootstrap`. `deploy/with-tokens` is that variant with `SVIDLET_TOKEN_ISSUER` set.
 
 What follows is the whole contract. The `svidlet-token` crate is its reference implementation —
