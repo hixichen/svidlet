@@ -31,10 +31,12 @@ RUN touch crates/svidlet/src/main.rs crates/svidlet-issue/src/lib.rs crates/svid
 
 # The trust roots for reaching Vault are compiled in (webpki-roots), and a
 # private Vault CA is supplied through VAULT_CACERT, so nothing else is needed.
-# One image, two binaries. They run as two containers in the same DaemonSet pod
-# so that identity issuance and policy distribution are separate processes with
-# separate credentials — see docs/DESIGN-v0.1.md, "Two processes, one volume".
-# The broker and the two control-plane tools ship in the same image.
+# One image, every binary. svidlet and svidlet-policy run as two containers in
+# the same DaemonSet pod, so identity issuance and policy distribution are
+# separate processes with separate credentials (docs/DESIGN-v0.1.md, "Two
+# processes, one volume"). svidlet-broker runs as its own Deployment
+# (docs/DESIGN.md §4); oidc-publisher and svidlet-catalog are control-plane
+# tools.
 FROM scratch
 COPY --from=build /src/target/release/svidlet /svidlet
 COPY --from=build /src/target/release/svidlet-policy /svidlet-policy

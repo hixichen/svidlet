@@ -1,0 +1,8 @@
+# The image builds from Cargo.toml, Cargo.lock and crates/ only. Everything
+# else stays out of the build context: target/ alone can be gigabytes, and the
+# local Vault state and bundle keys hold real credentials.
+*
+!Cargo.toml
+!Cargo.lock
+!crates/
+crates/**/target
