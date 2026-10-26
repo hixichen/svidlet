@@ -53,7 +53,7 @@ federation with external trust domains.
 **Known gap:** Svidlet issues identity to whatever the cluster admitted. Verifying that a
 workload is what it claims to be — signed images, a reviewed pod spec — needs a
 validating admission controller, which is essential and is
-[future work](docs/DESIGN.md#admission-control-the-missing-half-of-the-chain), not
+[future work](docs/DESIGN-v0.1.md#admission-control-the-missing-half-of-the-chain), not
 something this does today.
 
 ## How it fits together
@@ -86,7 +86,7 @@ The SPIFFE ID layout is a template, not a constant — see [Identity shape](#ide
 
 Svidlet trades SPIRE's generality and cert-manager's independent approval layer for a
 small footprint and an issuance path that never touches the API server.
-The trust model is stated plainly in [docs/DESIGN.md](docs/DESIGN.md).
+The trust model is stated plainly in [docs/DESIGN-v0.1.md](docs/DESIGN-v0.1.md).
 
 ## Status
 
@@ -104,7 +104,7 @@ cannot mint identities — see [Policy](#policy).
 (`./hack/local-vault.sh`).
 
 Not started: a validating admission controller for workload provenance (the
-[missing half](docs/DESIGN.md#admission-control-the-missing-half-of-the-chain) of the
+[missing half](docs/DESIGN-v0.1.md#admission-control-the-missing-half-of-the-chain) of the
 trust chain), cloud IAM authentication, PKI backends other than Vault, and
 `PodCertificateRequest` signer mode for Kubernetes 1.35+.
 
@@ -157,7 +157,7 @@ admitted — anyone who can create a pod in namespace N with ServiceAccount S ge
 identity. The real boundary is your RBAC on pod creation plus your admission control. A
 validating admission controller that checks workload provenance is the missing half of
 this chain, and it is
-[planned rather than done](docs/DESIGN.md#admission-control-the-missing-half-of-the-chain);
+[planned rather than done](docs/DESIGN-v0.1.md#admission-control-the-missing-half-of-the-chain);
 composing with Sigstore policy-controller or Kyverno is the likely shape, since a webhook
 of svidlet's own would put it on the critical path of every pod create in the cluster.
 
@@ -168,7 +168,7 @@ that the caller is a node. It stays the default because it is the only method th
 works everywhere including bare metal, and it is simple enough to reason about in one
 sentence — but where the environment allows it, use `SVIDLET_VAULT_AUTH=kubernetes`,
 which proves the plugin's own ServiceAccount to Vault with no shared secret at all.
-[docs/DESIGN.md](docs/DESIGN.md) states this in full.
+[docs/DESIGN-v0.1.md](docs/DESIGN-v0.1.md) states this in full.
 
 ## Identity shape
 
@@ -211,7 +211,7 @@ structurally cannot disturb policy and vice versa.
 
 This does not make svidlet's own compromise less bad — it is root on the node, and root
 can rewrite anything. What it closes is the direction carrying the larger attack surface.
-[docs/DESIGN.md](docs/DESIGN.md#two-processes-one-volume) states both halves.
+[docs/DESIGN-v0.1.md](docs/DESIGN-v0.1.md#two-processes-one-volume) states both halves.
 
 Within the daemon there are two sources, and most deployments want one or the other.
 
@@ -395,7 +395,7 @@ Two things follow from the design that are worth stating plainly:
 
 - **The AppRole secret ID is the most valuable secret in the system.** Whoever can read
   it can mint any identity in that cluster, from anywhere, until it is rotated. This is
-  the weakest part of the design and [docs/DESIGN.md](docs/DESIGN.md) says so at length;
+  the weakest part of the design and [docs/DESIGN-v0.1.md](docs/DESIGN-v0.1.md) says so at length;
   `SVIDLET_VAULT_AUTH=kubernetes` removes it entirely where Vault can validate
   ServiceAccount tokens.
 - **Nodes never hold a signing key.** Bundle verification is offline against a public
@@ -485,7 +485,7 @@ one. A policy backend that is down does not block pod start unless you set
 `SVIDLET_POLICY_REQUIRED=true`.
 
 Each of these is a knob and can be moved; the table in
-[docs/DESIGN.md](docs/DESIGN.md#after-admission-balancing-security-and-usability) gives
+[docs/DESIGN-v0.1.md](docs/DESIGN-v0.1.md#after-admission-balancing-security-and-usability) gives
 the secure and usable ends of each. What should not move is the principle: a dependency
 failing should cost you *new* work, never *running* work.
 
@@ -627,7 +627,7 @@ hack/kind-e2e.sh          End-to-end check on kind against a dev Vault
 hack/bench-memory.sh      Resident memory against a real Vault under real CSI load
 hack/build-bundle.sh      What CI does: package, sign and push a bundle and rollout
 hack/coverage.sh          Coverage report with an 80% floor
-docs/DESIGN.md            Design document
+docs/DESIGN.md            Design document (v0.2, broker); DESIGN-v0.1.md is the superseded node → Vault design
 docs/config.md            Configuration reference: every environment variable, by process
 ../svidlet-policy/authz-management-plane.md   Authorization management (svidlet-policy repo):
                           two processes, exposure farm,
