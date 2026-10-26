@@ -1269,9 +1269,34 @@ dependencies = [
 ]
 
 [[package]]
+name = "svidlet-broker"
+version = "0.0.1"
+dependencies = [
+ "bytes",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
+ "rcgen",
+ "rustls",
+ "rustls-pki-types",
+ "serde",
+ "serde_json",
+ "svidlet-issue",
+ "time",
+ "tokio",
+ "tokio-rustls",
+ "tracing",
+ "tracing-subscriber",
+ "ureq",
+ "x509-parser",
+]
+
+[[package]]
 name = "svidlet-issue"
 version = "0.0.1"
 dependencies = [
+ "base64 0.23.1",
+ "basic-toml",
  "rcgen",
  "regex-lite",
  "serde",

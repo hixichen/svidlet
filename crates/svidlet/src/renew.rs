@@ -64,7 +64,12 @@ pub fn renew_one(publisher: &Publisher, entry: &Entry) {
     }
 
     let started = std::time::Instant::now();
-    match publisher.issue(&entry.spiffe_id, &entry.target_path) {
+    match publisher.issue(
+        &entry.spiffe_id,
+        &entry.target_path,
+        &entry.pod,
+        entry.pod_token.as_ref(),
+    ) {
         Ok(bundle) => {
             publisher.metrics.observe_renew(started.elapsed());
             let renew_at = jittered_renew_at(
@@ -86,6 +91,15 @@ pub fn renew_one(publisher: &Publisher, entry: &Entry) {
                 lifetime_secs = bundle.lifetime_secs(),
                 next_renewal_in_secs = (renew_at - now).max(0),
             );
+            // §6.2: a new certificate is a check-in for tokens too.
+            if let Err(e) = publisher.refresh_tokens(&entry.target_path) {
+                warn!(
+                    "token check-in after renewal failed; keeping the current tokens",
+                    spiffe_id = entry.spiffe_id,
+                    code = e.code(),
+                    error = e,
+                );
+            }
         }
         Err(e) => {
             let code = e.code();
@@ -116,6 +130,65 @@ pub fn renew_one(publisher: &Publisher, entry: &Entry) {
             }
         }
     }
+}
+
+/// Check in for tokens on every published volume every
+/// `jwt_refresh_interval` (§6.2). The broker answers from its cache, so this
+/// is cheap; it is what carries an emergency key rotation to every pod within
+/// one interval.
+pub async fn token_loop(publisher: Arc<Publisher>) {
+    let Some(interval) = publisher
+        .cfg
+        .broker
+        .as_ref()
+        .filter(|b| b.jwt_enabled && publisher.broker.is_some())
+        .map(|b| b.jwt_refresh_interval)
+    else {
+        return;
+    };
+    loop {
+        // Up to a tenth of the interval of jitter, so a fleet started
+        // together does not check in together.
+        let jitter = interval.mul_f64(0.1 * crate::rand::unit());
+        tokio::time::sleep(interval + jitter).await;
+        refresh_tokens_once(publisher.clone()).await;
+    }
+}
+
+/// One pass of the token check-in. Returns how many volumes were rewritten.
+pub async fn refresh_tokens_once(publisher: Arc<Publisher>) -> usize {
+    tokio::task::spawn_blocking(move || {
+        let mut changed = 0;
+        for entry in publisher.store.all() {
+            if !entry.target_path.exists() {
+                continue;
+            }
+            match publisher.refresh_tokens(&entry.target_path) {
+                Ok(true) => changed += 1,
+                Ok(false) => {}
+                Err(e) => {
+                    warn!(
+                        "token check-in failed; keeping the current tokens",
+                        spiffe_id = entry.spiffe_id,
+                        code = e.code(),
+                        error = e,
+                    );
+                    // An unreachable broker fails every volume the same way;
+                    // waiting out a timeout per pod would stretch one pass past
+                    // the next. The next pass tries again.
+                    if e.code() == svidlet_issue::ErrorCode::Transport {
+                        break;
+                    }
+                }
+            }
+        }
+        if changed > 0 {
+            info!("tokens refreshed", volumes_updated = changed);
+        }
+        changed
+    })
+    .await
+    .unwrap_or(0)
 }
 
 /// Periodically refresh `ca.crt` in every published volume.

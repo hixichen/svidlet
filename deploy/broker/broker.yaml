@@ -1,0 +1,193 @@
+# svidlet-broker: one Deployment per cluster, the cluster's only Vault client.
+# See docs/DESIGN.md §4 and §7.4.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: svidlet-broker
+  namespace: svidlet-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: svidlet-broker
+rules:
+  # Both attestation tokens are checked by the API server, not by us.
+  - apiGroups: ["authentication.k8s.io"]
+    resources: ["tokenreviews"]
+    verbs: ["create"]
+  # I3/I4: where the pod runs, whether it is live, which ServiceAccount.
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: svidlet-broker
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: svidlet-broker
+subjects:
+  - kind: ServiceAccount
+    name: svidlet-broker
+    namespace: svidlet-system
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: svidlet-broker
+  namespace: svidlet-system
+data:
+  SVIDLET_TRUST_DOMAIN: corp.internal
+  SVIDLET_CLUSTER: gpu-a
+  SVIDLET_SPIFFE_ID_TEMPLATE: "spiffe://{trust_domain}/cluster/{cluster}/ns/{namespace}/sa/{service_account}"
+  SVIDLET_CERT_TTL: 48h
+  SVIDLET_CERT_MAX_TTL: 48h
+  VAULT_ADDR: https://vault.example.internal:8200
+  SVIDLET_PKI_MOUNT: pki_int
+  SVIDLET_SPIFFE_MOUNT: spiffe
+  # B1: JWT auth against this cluster's signing keys; no stored secret.
+  SVIDLET_BROKER_VAULT_AUTH: jwt
+  SVIDLET_BROKER_VAULT_JWT_MOUNT: k8s-gpu-a
+  SVIDLET_BROKER_VAULT_JWT_ROLE: svidlet-broker
+  # T5/T6 check against what relying parties actually see.
+  SVIDLET_JWKS_URL: https://oidc.corp.example/v1/spiffe/.well-known/keys
+  SVIDLET_LOG_LEVEL: info
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: svidlet-broker
+  namespace: svidlet-system
+  labels:
+    app.kubernetes.io/name: svidlet-broker
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: svidlet-broker
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: svidlet-broker
+    spec:
+      serviceAccountName: svidlet-broker
+      # Its own token is mounted explicitly below, with audience "vault".
+      automountServiceAccountToken: true
+      priorityClassName: system-cluster-critical
+      # Dedicated nodes: a compromised workload node must not share a kernel
+      # with the cluster's only Vault credential.
+      nodeSelector:
+        svidlet.io/broker: "true"
+      tolerations:
+        - key: svidlet.io/broker
+          operator: Exists
+          effect: NoSchedule
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - topologyKey: kubernetes.io/hostname
+              labelSelector:
+                matchLabels:
+                  app.kubernetes.io/name: svidlet-broker
+      containers:
+        - name: broker
+          image: ghcr.io/hixichen/svidlet:0.0.1
+          command: ["/svidlet-broker"]
+          envFrom:
+            - configMapRef:
+                name: svidlet-broker
+          ports:
+            - { name: sign, containerPort: 8443 }
+            - { name: tokens, containerPort: 8444 }
+            - { name: metrics, containerPort: 9466 }
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 65532
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: ["ALL"] }
+          volumeMounts:
+            - { name: vault-token, mountPath: /var/run/secrets/svidlet/vault, readOnly: true }
+            - { name: tls, mountPath: /etc/svidlet/tls, readOnly: true }
+            - { name: trust, mountPath: /etc/svidlet/trust, readOnly: true }
+            - { name: catalog, mountPath: /etc/svidlet/catalog, readOnly: true }
+          # Process-only: a Vault or API-server outage must not restart it.
+          livenessProbe:
+            httpGet: { path: /healthz, port: metrics }
+            periodSeconds: 20
+          readinessProbe:
+            httpGet: { path: /healthz, port: metrics }
+            periodSeconds: 10
+          resources:
+            requests: { cpu: 50m, memory: 32Mi }
+            limits: { memory: 128Mi }
+      volumes:
+        - name: vault-token
+          projected:
+            sources:
+              - serviceAccountToken:
+                  audience: vault
+                  expirationSeconds: 3600
+                  path: token
+        # Serving certificate for svidlet-broker.svidlet-system.svc, from a
+        # Vault PKI role of its own (the SPIFFE roles allow no DNS names),
+        # rotated daily (§9) by whatever writes this Secret; re-read in place.
+        - name: tls
+          secret: { secretName: svidlet-broker-tls }
+        # T1: the trust bundle a caller's SVID must chain to.
+        - name: trust
+          configMap: { name: svidlet-trust-bundle }
+        - name: catalog
+          configMap: { name: svidlet-catalog }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: svidlet-broker
+  namespace: svidlet-system
+spec:
+  selector:
+    app.kubernetes.io/name: svidlet-broker
+  ports:
+    - { name: sign, port: 8443, targetPort: sign }
+    - { name: tokens, port: 8444, targetPort: tokens }
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: svidlet-broker
+  namespace: svidlet-system
+spec:
+  minAvailable: 2
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: svidlet-broker
+---
+# Ingress: 8443 from svidlet-node only; 8444 from svidlet-node and from
+# namespaces that opt in to direct mode (label svidlet.io/direct-tokens).
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: svidlet-broker
+  namespace: svidlet-system
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: svidlet-broker
+  policyTypes: ["Ingress"]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: svidlet-node
+      ports:
+        - { port: 8443 }
+        - { port: 8444 }
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              svidlet.io/direct-tokens: "true"
+      ports:
+        - { port: 8444 }

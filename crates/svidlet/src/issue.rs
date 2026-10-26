@@ -8,12 +8,13 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use svidlet_issue::{
-    Error, IdPolicy, IssuedBundle, Issuer, Result, SignRequest, SpiffeId, WorkloadAttributes,
+    BrokerClient, Error, IdPolicy, IssuedBundle, Issuer, PodContext, Result, SignRequest, SpiffeId,
+    WorkloadAttributes,
 };
 
 use crate::config::Config;
 use crate::metrics::Metrics;
-use crate::store::Store;
+use crate::store::{PodRef, PodToken, Store};
 use crate::volume::{self, Identity, Modes};
 use crate::{debug, info};
 
@@ -24,6 +25,13 @@ pub struct Publisher {
     pub policy: Arc<IdPolicy>,
     pub store: Arc<Store>,
     pub metrics: Arc<Metrics>,
+    /// The broker, when this node uses one. Also `issuer`; held separately
+    /// for the token path, which is not part of the `Issuer` seam.
+    pub broker: Option<Arc<BrokerClient>>,
+    /// Serialises writes to `jwt/`. Three paths refresh tokens — publish,
+    /// renewal and the periodic check-in — and two concurrent writers of one
+    /// chain would collect each other's in-progress generation.
+    tokens_write: Mutex<()>,
     /// Trust bundle fetched from the backend's CA endpoint. Preferred over the
     /// chain returned alongside a signature, because it also carries a new root
     /// during a CA rotation, before any leaf has been signed by it.
@@ -44,8 +52,16 @@ impl Publisher {
             policy,
             store,
             metrics,
+            broker: None,
+            tokens_write: Mutex::new(()),
             ca: Mutex::new(String::new()),
         }
+    }
+
+    /// Fetch tokens from this broker as well as certificates.
+    pub fn with_broker(mut self, broker: Arc<BrokerClient>) -> Self {
+        self.broker = Some(broker);
+        self
     }
 
     fn modes(&self) -> Modes {
@@ -69,14 +85,36 @@ impl Publisher {
     ///
     /// Blocking: the PKI backend is a blocking HTTP client, so callers run this
     /// on a blocking thread.
-    pub fn issue(&self, spiffe_id: &SpiffeId, target: &Path) -> Result<IssuedBundle> {
+    pub fn issue(
+        &self,
+        spiffe_id: &SpiffeId,
+        target: &Path,
+        pod: &PodRef,
+        pod_token: Option<&PodToken>,
+    ) -> Result<IssuedBundle> {
         let generated = svidlet_issue::generate(spiffe_id)?;
         let bundle = self.issuer.sign(&SignRequest {
             spiffe_id,
             csr_pem: &generated.csr_pem,
             ttl: self.cfg.cert_ttl,
             node_name: &self.cfg.node_name,
+            pod: Some(PodContext {
+                namespace: &pod.namespace,
+                name: &pod.name,
+                uid: &pod.uid,
+                service_account: &pod.service_account,
+                token: pod_token.map(|t| t.0.as_str()),
+            }),
         })?;
+
+        // §5.2: the leaf must be for the key this node just generated. A
+        // certificate for any other key would be useless to the workload, and
+        // one the backend should never have returned.
+        if svidlet_issue::leaf_public_key(&bundle.cert_chain_pem)? != generated.public_key {
+            return Err(Error::Certificate(
+                "the signed certificate is not for the key this node generated".into(),
+            ));
+        }
 
         let cached = self.cached_ca();
         let ca_pem = if cached.is_empty() {
@@ -95,6 +133,32 @@ impl Publisher {
             self.modes(),
         )?;
         Ok(bundle)
+    }
+
+    /// Check in with the broker for this volume's tokens and rewrite `jwt/`
+    /// if any changed (§6.2). Returns whether anything was written.
+    ///
+    /// Does nothing without a broker or with tokens switched off. On failure
+    /// the files already published stay until they expire: fail stale.
+    pub fn refresh_tokens(&self, target: &Path) -> Result<bool> {
+        let Some(broker) = &self.broker else {
+            return Ok(false);
+        };
+        if !self.cfg.broker.as_ref().is_some_and(|b| b.jwt_enabled) {
+            return Ok(false);
+        }
+        let identity = volume::read_identity(target)?;
+        let grants = broker.fetch_tokens(&identity.cert_chain_pem, &identity.key_pem)?;
+        let fresh: std::collections::BTreeMap<String, String> =
+            grants.into_iter().map(|g| (g.alias, g.token)).collect();
+        // The fetch runs unlocked; only the compare-and-swap is serialised.
+        // Two fetches racing can only differ in which valid token wins.
+        let _guard = self.tokens_write.lock().expect("token write lock poisoned");
+        if !target.exists() || fresh == volume::read_tokens(target) {
+            return Ok(false);
+        }
+        volume::publish_tokens(target, &fresh, self.modes())?;
+        Ok(true)
     }
 
     /// Fetch the trust bundle and, if it changed, rewrite `ca.crt` in every

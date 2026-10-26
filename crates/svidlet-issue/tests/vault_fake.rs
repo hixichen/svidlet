@@ -131,6 +131,48 @@ impl Stub {
                 ),
             );
         }
+        if path.ends_with("/auth/k8s-a/login") {
+            let n = self.logins.fetch_add(1, Ordering::SeqCst);
+            if body["role"].as_str() != Some("svidlet-broker") || body["jwt"].as_str().is_none() {
+                return (400, r#"{"errors":["bad role"]}"#.into());
+            }
+            return (
+                200,
+                format!(
+                    r#"{{"auth":{{"client_token":"s.token-{n}","lease_duration":3600,"renewable":false}}}}"#
+                ),
+            );
+        }
+        if path.ends_with("/spiffe/.well-known/keys") {
+            return (
+                200,
+                r#"{"keys":[{"kid":"k1","kty":"EC","crv":"P-256","x":"AA","y":"AQ"}]}"#.into(),
+            );
+        }
+        if let Some(role) = path
+            .strip_prefix("/v1/spiffe/role/")
+            .and_then(|r| r.strip_suffix("/mintjwt"))
+        {
+            assert!(
+                token.starts_with("s.token-"),
+                "the mint call carries a token"
+            );
+            if role.contains("denied") {
+                return (403, r#"{"errors":["permission denied"]}"#.into());
+            }
+            let aud = body["audience"].as_str().unwrap_or_default();
+            let jwt = svidlet_issue::jwt::test_token(
+                "k1",
+                &format!("spiffe://td/{role}"),
+                aud,
+                1000,
+                2000,
+            );
+            return (
+                200,
+                serde_json::json!({ "data": { "token": jwt } }).to_string(),
+            );
+        }
         if path.ends_with("/pki/ca_chain") {
             return (200, self.ca_pem.clone());
         }
@@ -222,6 +264,7 @@ fn sign(issuer: &dyn Issuer) -> svidlet_issue::Result<svidlet_issue::IssuedBundl
         csr_pem: &generated.csr_pem,
         ttl: Duration::from_secs(3600),
         node_name: "node-1",
+        pod: None,
     })
 }
 
@@ -336,4 +379,81 @@ fn a_ca_endpoint_that_does_not_return_pem_is_a_protocol_error() {
     );
     let err = issuer.ca_chain().unwrap_err();
     assert_eq!(err.code(), ErrorCode::BackendStatus);
+}
+
+// ------------------------------------------------------------ SPIFFE engine
+
+fn spiffe(
+    stub: &Stub,
+    token_file_contents: &str,
+) -> svidlet_issue::VaultSpiffe<svidlet_issue::JwtAuth> {
+    let path = std::env::temp_dir().join(format!(
+        "svidlet-stub-jwt-{}-{:?}",
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    std::fs::write(&path, token_file_contents).unwrap();
+    let http = Arc::new(
+        VaultHttp::new(VaultEndpoint {
+            address: stub.addr.clone(),
+            namespace: None,
+            ca_cert_pem: None,
+            timeout: Duration::from_secs(5),
+        })
+        .unwrap(),
+    );
+    svidlet_issue::VaultSpiffe::new(
+        http.clone(),
+        "/spiffe/",
+        svidlet_issue::JwtAuth::new(http, "k8s-a", "svidlet-broker", path),
+    )
+}
+
+#[test]
+fn the_spiffe_engine_mints_for_a_role_and_an_audience() {
+    use svidlet_issue::JwtMinter;
+    let stub = Stub::start();
+    let minter = spiffe(&stub, "projected.sa.token");
+    let token = minter.mint("gpu-a__payments__api", "vault").unwrap();
+    let u = svidlet_issue::jwt::decode_unverified(&token).unwrap();
+    assert_eq!(u.claims.aud, vec!["vault".to_string()]);
+    assert_eq!(u.claims.sub, "spiffe://td/gpu-a__payments__api");
+    // One login, reused.
+    minter
+        .mint("gpu-a__payments__api", "sts.amazonaws.com")
+        .unwrap();
+    assert_eq!(stub.logins.load(Ordering::SeqCst), 1);
+
+    let jwks = svidlet_issue::jwt::Jwks::parse(&minter.jwks().unwrap()).unwrap();
+    assert!(jwks.contains("k1"));
+}
+
+#[test]
+fn a_mint_vault_refuses_is_a_403_after_exactly_one_relogin() {
+    use svidlet_issue::JwtMinter;
+    let stub = Stub::start();
+    let minter = spiffe(&stub, "projected.sa.token");
+    let err = minter.mint("gpu-a__denied__x", "vault").unwrap_err();
+    assert!(
+        matches!(err, svidlet_issue::Error::Backend { status: 403, .. }),
+        "{err}"
+    );
+    // The first 403 could be a forgotten token, so it logs in again once.
+    assert_eq!(stub.logins.load(Ordering::SeqCst), 2);
+}
+
+#[test]
+fn a_role_name_cannot_escape_its_path() {
+    use svidlet_issue::JwtMinter;
+    let stub = Stub::start();
+    let minter = spiffe(&stub, "t");
+    for bad in ["", "a/../../sys/seal", "x/y"] {
+        let err = minter.mint(bad, "vault").unwrap_err();
+        assert_eq!(err.code(), ErrorCode::Identity, "{bad:?}");
+    }
+    assert_eq!(
+        stub.logins.load(Ordering::SeqCst),
+        0,
+        "refused before the network"
+    );
 }

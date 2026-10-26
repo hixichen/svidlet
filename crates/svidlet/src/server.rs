@@ -7,8 +7,8 @@ use tokio_stream::wrappers::UnixListenerStream;
 use tonic::transport::Server;
 
 use svidlet_issue::{
-    AppRoleAuth, Issuer, KubernetesAuth, StaticTokenAuth, VaultEndpoint, VaultHttp, VaultIssuer,
-    VaultPkiConfig,
+    AppRoleAuth, BrokerClient, BrokerEndpoint, Issuer, KubernetesAuth, StaticTokenAuth,
+    VaultEndpoint, VaultHttp, VaultIssuer, VaultPkiConfig,
 };
 
 use crate::config::AuthSettings;
@@ -48,7 +48,11 @@ pub async fn run(cfg: Config) -> Result<(), Box<dyn std::error::Error>> {
     let cfg = Arc::new(cfg);
     let store = Arc::new(Store::new());
     let metrics = Arc::new(Metrics::default());
-    let issuer = build_issuer(&cfg)?;
+    let broker = build_broker(&cfg)?;
+    let issuer: Arc<dyn Issuer> = match &broker {
+        Some(b) => b.clone(),
+        None => build_issuer(&cfg)?,
+    };
     metrics.set_backend(issuer.name(), issuer.auth_name());
     info!(
         "pki backend",
@@ -69,13 +73,17 @@ pub async fn run(cfg: Config) -> Result<(), Box<dyn std::error::Error>> {
         );
     }
 
-    let publisher = Arc::new(Publisher::new(
+    let mut publisher = Publisher::new(
         cfg.clone(),
         policy.clone(),
         issuer.clone(),
         store.clone(),
         metrics.clone(),
-    ));
+    );
+    if let Some(b) = broker {
+        publisher = publisher.with_broker(b);
+    }
+    let publisher = Arc::new(publisher);
 
     // Prime the trust bundle before serving, but do not make it fatal: the
     // chain returned with the first signature is a usable substitute, and
@@ -111,6 +119,7 @@ pub async fn run(cfg: Config) -> Result<(), Box<dyn std::error::Error>> {
     tokio::spawn(renew::ca_refresh_loop(publisher.clone()));
     tokio::spawn(renew::reaper_loop(publisher.clone()));
     tokio::spawn(renew::adopt_loop(publisher.clone()));
+    tokio::spawn(renew::token_loop(publisher.clone()));
 
     if !cfg.metrics_addr.is_empty() {
         tokio::spawn(metrics::serve(
@@ -210,6 +219,26 @@ pub fn bind(path: &Path) -> std::io::Result<tokio::net::UnixListener> {
     })
 }
 
+/// The broker client, when `SVIDLET_ISSUER=broker`.
+pub fn build_broker(cfg: &Config) -> Result<Option<Arc<BrokerClient>>, Box<dyn std::error::Error>> {
+    let Some(b) = &cfg.broker else {
+        return Ok(None);
+    };
+    let ca_cert_pem = std::fs::read_to_string(&b.ca_cert_path).map_err(|e| {
+        format!(
+            "cannot read SVIDLET_BROKER_CACERT from {}: {e}",
+            b.ca_cert_path.display()
+        )
+    })?;
+    Ok(Some(Arc::new(BrokerClient::new(BrokerEndpoint {
+        sign_url: b.sign_url.clone(),
+        token_url: b.token_url.clone(),
+        ca_cert_pem,
+        node_token_path: b.node_token_path.clone(),
+        timeout: b.timeout,
+    })?)))
+}
+
 /// Assemble the PKI backend from its two seams: a [`TokenSource`] that proves
 /// who this node is, and an [`Issuer`] that signs. Supporting another vendor
 /// means adding arms here, not touching the CSI plugin.
@@ -306,6 +335,7 @@ mod tests {
                 pki_role: "spiffe-a".into(),
                 auth,
             },
+            broker: None,
             policy: PolicyGate {
                 required: false,
                 initial_timeout: Duration::from_secs(10),

@@ -194,6 +194,48 @@ impl TokenSource for KubernetesAuth {
     }
 }
 
+// ----------------------------------------------------------------------- jwt
+
+/// Vault's JWT auth method (tier B1 in docs/DESIGN.md §7.4): present a
+/// projected ServiceAccount token to a mount configured with this cluster's
+/// signing keys, so Vault never has to reach the cluster's API server.
+///
+/// The wire format is the same as Kubernetes auth; what differs is how Vault
+/// validates the token, which is the mount's business, not the caller's.
+pub struct JwtAuth {
+    inner: KubernetesAuth,
+}
+
+impl JwtAuth {
+    pub fn new(
+        http: Arc<VaultHttp>,
+        mount: impl Into<String>,
+        role: impl Into<String>,
+        token_path: PathBuf,
+    ) -> JwtAuth {
+        JwtAuth {
+            inner: KubernetesAuth::new(http, mount, role, token_path),
+        }
+    }
+}
+
+impl TokenSource for JwtAuth {
+    fn login(&self) -> Result<Token> {
+        self.inner.login().map_err(|e| match e {
+            Error::Auth(m) => Error::Auth(m.replacen("Kubernetes login", "JWT login", 1)),
+            other => other,
+        })
+    }
+
+    fn renew(&self, token: &str) -> Result<Token> {
+        self.inner.renew(token)
+    }
+
+    fn name(&self) -> &'static str {
+        "jwt"
+    }
+}
+
 // -------------------------------------------------------------- static token
 
 /// A token read from a file. Intended for local development against a dev-mode

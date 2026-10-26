@@ -193,6 +193,7 @@ fn config_with_gids(
                 path: PathBuf::from("/dev/null"),
             },
         },
+        broker: None,
         policy,
         policy_gid,
         cert_ttl: std::time::Duration::from_secs(3600),

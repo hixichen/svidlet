@@ -1,0 +1,31 @@
+# The identity catalog (docs/DESIGN.md §12). One file per fleet, in Git.
+# CI: `svidlet-catalog lint catalog.toml`, then per cluster
+#     `svidlet-catalog roles  catalog.toml <cluster>` and
+#     `svidlet-catalog policy catalog.toml <cluster>` into Vault.
+schema = 1
+trust_domain = "corp.internal"
+
+[mode]
+# true: identities with no entry get no certificate (I8).
+allowlist = false
+
+[sensitive]
+# Each prefix must end with "/" so a look-alike host cannot match.
+registries = ["registry.corp.example/"]
+
+[[identity]]
+cluster = "gpu-a"
+namespace = "payments"
+service_account = "api"
+token_ttl = "12h"
+sensitive = true
+audiences = [
+  { alias = "aws", audience = "sts.amazonaws.com" },
+  { alias = "vault", audience = "vault" },
+]
+
+[[identity]]
+cluster = "*"
+namespace = "batch"
+service_account = "runner"
+audiences = [{ alias = "vault", audience = "vault" }]

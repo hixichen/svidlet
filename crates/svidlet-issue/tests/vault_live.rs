@@ -113,6 +113,7 @@ fn sign(issuer: &dyn Issuer, id: &SpiffeId) -> svidlet_issue::Result<svidlet_iss
         csr_pem: &generated.csr_pem,
         ttl: Duration::from_secs(3600),
         node_name: "test-node",
+        pod: None,
     })
 }
 
