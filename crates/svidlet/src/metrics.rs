@@ -7,7 +7,7 @@
 //! exported from process start, including the ones that are still zero, because
 //! a counter that only appears after its first failure makes `rate()` alerts
 //! silently useless. And failures are labelled with the stable
-//! [`ErrorCode`](svidlet_issue::ErrorCode), so a dashboard matches on a code
+//! [`ErrorCode`], so a dashboard matches on a code
 //! rather than on log text.
 
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -265,6 +265,19 @@ impl Metrics {
         );
         simple(
             &mut out,
+            "svidlet_jwt_earliest_expiry_seconds",
+            "Seconds until the soonest-expiring JWT-SVID under any published jwt/ \
+             expires (broker mode). Tokens are re-minted at half their lifetime, so \
+             this falling towards zero means check-ins with the broker are failing. \
+             NaN when no volume holds a token.",
+            "gauge",
+            "",
+            earliest_token_expiry(store)
+                .map(|at| (at - now) as f64)
+                .unwrap_or(f64::NAN),
+        );
+        simple(
+            &mut out,
             "svidlet_renewals_due",
             "Certificates whose renewal deadline has passed and which have not yet been renewed.",
             "gauge",
@@ -362,6 +375,18 @@ fn http(status: u16, content_type: &str, body: &str) -> String {
     )
 }
 
+/// The earliest `exp` among the tokens published in every volume. Read from
+/// the files at scrape time: they are tiny, on tmpfs, and the truth.
+fn earliest_token_expiry(store: &Store) -> Option<i64> {
+    store
+        .all()
+        .iter()
+        .flat_map(|e| crate::volume::read_tokens(&e.target_path).into_values())
+        .filter_map(|t| svidlet_issue::jwt::decode_unverified(&t).ok())
+        .map(|t| t.claims.exp)
+        .min()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -406,6 +431,7 @@ mod tests {
         )));
         // No certificates yet, so the expiry gauge has nothing to report.
         assert!(out.contains("svidlet_earliest_certificate_expiry_seconds NaN"));
+        assert!(out.contains("svidlet_jwt_earliest_expiry_seconds NaN"));
     }
 
     #[test]
@@ -566,5 +592,67 @@ mod tests {
         assert!(head.contains("Content-Length: 6"));
         assert_eq!(body, "hello\n");
         assert!(head.contains("Connection: close"));
+    }
+
+    #[test]
+    fn the_jwt_gauge_reports_the_soonest_token_on_the_node() {
+        let dir = std::env::temp_dir().join(format!("svidlet-metrics-jwt-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let now = unix_now();
+        let tokens = std::collections::BTreeMap::from([
+            (
+                "aws".to_string(),
+                svidlet_issue::jwt::test_token("k", "s", "sts", now, now + 7200),
+            ),
+            (
+                "vault".to_string(),
+                svidlet_issue::jwt::test_token("k", "s", "vault", now, now + 600),
+            ),
+            ("junk".to_string(), "not a token".to_string()),
+        ]);
+        crate::volume::publish_tokens(
+            &dir,
+            &tokens,
+            crate::volume::Modes {
+                key: 0o640,
+                cert: 0o644,
+                key_gid: None,
+            },
+        )
+        .unwrap();
+
+        use crate::store::{Entry, PodRef};
+        let store = Store::new();
+        store.insert(Entry {
+            volume_id: "v".into(),
+            target_path: dir.clone(),
+            spiffe_id: svidlet_issue::SpiffeId::parse("spiffe://example.org/ns/a/sa/b").unwrap(),
+            pod: PodRef {
+                name: "p".into(),
+                namespace: "a".into(),
+                uid: "u".into(),
+                service_account: "b".into(),
+            },
+            not_before: now,
+            not_after: now + 3600,
+            renew_at: now + 1800,
+            failures: 0,
+            pod_token: None,
+        });
+        let out = Metrics::default().render(&store);
+        assert_parses(&out);
+        let value: f64 = out
+            .lines()
+            .find(|l| l.starts_with("svidlet_jwt_earliest_expiry_seconds "))
+            .unwrap()
+            .rsplit(' ')
+            .next()
+            .unwrap()
+            .parse()
+            .unwrap();
+        // The vault token, not the aws one; the unparsable file is ignored.
+        assert!((590.0..=600.0).contains(&value), "{value}");
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }
