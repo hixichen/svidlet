@@ -22,9 +22,11 @@ RUN mkdir -p crates/svidlet/src crates/svidlet-issue/src crates/svidlet-broker/s
  && rm -rf crates/svidlet/src crates/svidlet-issue/src crates/svidlet-broker/src crates/svidlet/build.rs
 
 COPY crates crates
-# Touch the manifests so cargo rebuilds the workspace crates against the
-# now-real sources.
-RUN touch crates/svidlet/src/main.rs crates/svidlet-issue/src/lib.rs crates/svidlet-broker/src/lib.rs \
+# Touch the entry points so cargo rebuilds the workspace crates against the
+# now-real sources — build.rs included: the copied one is older than the stub
+# that ran above, so without the touch cargo keeps the stub's (empty) output
+# and the generated gRPC code never appears.
+RUN touch crates/svidlet/build.rs crates/svidlet/src/main.rs crates/svidlet-issue/src/lib.rs crates/svidlet-broker/src/lib.rs \
  && cargo build --release --locked \
  && strip target/release/svidlet target/release/svidlet-policy \
           target/release/svidlet-broker target/release/oidc-publisher target/release/svidlet-catalog
