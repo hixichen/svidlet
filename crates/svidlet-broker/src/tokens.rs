@@ -37,6 +37,8 @@ pub struct Grant {
     pub jti: String,
     /// Whether this answer cost a Vault mint.
     pub minted: bool,
+    /// Time spent in that mint, when there was one.
+    pub vault_elapsed: Option<std::time::Duration>,
 }
 
 #[derive(Clone)]
@@ -285,7 +287,7 @@ impl Tokens {
             .cloned();
         if let Some(c) = cached {
             if self.servable(&c.parsed, caller, now)? {
-                return Ok(grant(approved.alias.clone(), audience, c, false));
+                return Ok(grant(approved.alias.clone(), audience, c, None));
             }
         }
 
@@ -295,7 +297,9 @@ impl Tokens {
                 format!("{} is over its mint rate", caller.spiffe_id),
             ));
         }
+        let started = std::time::Instant::now();
         let token = self.minter.mint(&role, audience).map_err(from_vault)?;
+        let took = started.elapsed();
         let parsed = decode_unverified(&token).map_err(|e| Refusal::Internal {
             message: format!("Vault minted an unreadable token: {e}"),
         })?;
@@ -334,7 +338,7 @@ impl Tokens {
             .lock()
             .expect("token cache poisoned")
             .insert(key, fresh.clone());
-        Ok(grant(approved.alias.clone(), audience, fresh, true))
+        Ok(grant(approved.alias.clone(), audience, fresh, Some(took)))
     }
 
     /// T5 and T6 for a cached token.
@@ -366,13 +370,14 @@ impl Tokens {
     }
 }
 
-fn grant(alias: String, audience: &str, c: Cached, minted: bool) -> Grant {
+fn grant(alias: String, audience: &str, c: Cached, minted: Option<std::time::Duration>) -> Grant {
     Grant {
         alias,
         audience: audience.to_string(),
         exp: c.parsed.claims.exp,
         jti: c.parsed.claims.jti.clone(),
         token: c.token,
-        minted,
+        minted: minted.is_some(),
+        vault_elapsed: minted,
     }
 }

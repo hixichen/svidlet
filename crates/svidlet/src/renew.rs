@@ -160,15 +160,26 @@ pub async fn refresh_tokens_once(publisher: Arc<Publisher>) -> usize {
     tokio::task::spawn_blocking(move || {
         let mut changed = 0;
         for entry in publisher.store.all() {
+            if !entry.target_path.exists() {
+                continue;
+            }
             match publisher.refresh_tokens(&entry.target_path) {
                 Ok(true) => changed += 1,
                 Ok(false) => {}
-                Err(e) => warn!(
-                    "token check-in failed; keeping the current tokens",
-                    spiffe_id = entry.spiffe_id,
-                    code = e.code(),
-                    error = e,
-                ),
+                Err(e) => {
+                    warn!(
+                        "token check-in failed; keeping the current tokens",
+                        spiffe_id = entry.spiffe_id,
+                        code = e.code(),
+                        error = e,
+                    );
+                    // An unreachable broker fails every volume the same way;
+                    // waiting out a timeout per pod would stretch one pass past
+                    // the next. The next pass tries again.
+                    if e.code() == svidlet_issue::ErrorCode::Transport {
+                        break;
+                    }
+                }
             }
         }
         if changed > 0 {

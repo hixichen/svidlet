@@ -391,3 +391,36 @@ fn outages_are_503_and_vault_denials_are_403() {
         (403, "vault")
     );
 }
+
+#[test]
+fn i10_a_distinct_cap_refusal_does_not_spend_the_rate_budget() {
+    let fx = fixture_with(
+        CATALOG,
+        &[
+            ("SVIDLET_NODE_RATE_PER_MINUTE", "2"),
+            ("SVIDLET_NODE_IDENTITIES_PER_HOUR", "1"),
+        ],
+    );
+    let t = now();
+    fx.signer
+        .sign(NODE_TOKEN, &sign_body(POD_TOKEN), t)
+        .unwrap();
+    fx.kube
+        .add_pod("t-run", "batch", "runner", "run-0", "u4", "n1");
+    let other = svidlet_issue::broker::SignBody {
+        pod_token: "t-run".into(),
+        namespace: "batch".into(),
+        pod_name: "run-0".into(),
+        pod_uid: "u4".into(),
+        service_account: "runner".into(),
+        csr: csr_for(&id("batch", "runner")),
+        spiffe_id: id("batch", "runner"),
+    };
+    for _ in 0..3 {
+        assert_eq!(rule_of(fx.signer.sign(NODE_TOKEN, &other, t)), (429, "I10"));
+    }
+    // The renewal of the known identity still has its second slot.
+    fx.signer
+        .sign(NODE_TOKEN, &sign_body(POD_TOKEN), t)
+        .unwrap();
+}

@@ -39,6 +39,9 @@ async fn wait_for_policy(target: &std::path::Path, timeout: std::time::Duration)
     }
 }
 
+/// How long NodePublishVolume waits for the first tokens before returning.
+const PUBLISH_TOKEN_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
+
 /// The pod token for `audience` from the kubelet's volume context, if the
 /// CSIDriver object asks for one (`tokenRequests`). The value is a JSON map of
 /// audience to `{"token": …, "expirationTimestamp": …}`.
@@ -341,25 +344,26 @@ impl Node for NodeService {
         });
         self.publisher.metrics.published();
 
-        // Tokens are best effort at publish time: a pod that needs only its
-        // certificate must not wait on the token path, and the periodic
-        // check-in fills `jwt/` as soon as the broker answers.
+        // Tokens are best effort at publish time. A pod that reads `jwt/` at
+        // start-up is best served by waiting briefly for them, but a pod that
+        // needs only its certificate must not wait out a broker timeout: the
+        // fetch gets a short head start, then carries on in the background,
+        // and the periodic check-in retries anything that failed.
         if self.publisher.broker.is_some() {
             let publisher = self.publisher.clone();
             let target = PathBuf::from(&req.target_path);
             let id = spiffe_id.clone();
-            let outcome =
-                tokio::task::spawn_blocking(move || publisher.refresh_tokens(&target)).await;
-            match outcome {
-                Ok(Ok(_)) => {}
-                Ok(Err(e)) => warn!(
-                    "could not fetch tokens at publish; will retry on the next check-in",
-                    spiffe_id = id,
-                    code = e.code(),
-                    error = e,
-                ),
-                Err(e) => error!("token fetch panicked", error = e),
-            }
+            let fetch = tokio::task::spawn_blocking(move || {
+                if let Err(e) = publisher.refresh_tokens(&target) {
+                    warn!(
+                        "could not fetch tokens at publish; will retry on the next check-in",
+                        spiffe_id = id,
+                        code = e.code(),
+                        error = e,
+                    );
+                }
+            });
+            let _ = tokio::time::timeout(PUBLISH_TOKEN_WAIT, fetch).await;
         }
 
         info!(

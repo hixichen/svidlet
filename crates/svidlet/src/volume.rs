@@ -159,6 +159,17 @@ pub fn publish_tokens(
     tokens: &std::collections::BTreeMap<String, String>,
     modes: Modes,
 ) -> io::Result<()> {
+    // Validate before creating anything, so a refused set leaves no orphan
+    // generation behind on the tmpfs.
+    if let Some(alias) = tokens
+        .keys()
+        .find(|a| a.is_empty() || a.contains('/') || a.starts_with('.'))
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{alias:?} is not a token alias"),
+        ));
+    }
     let version = next_version(target, JWT_VERSION_PREFIX)?;
     let dir = target.join(format!("{JWT_VERSION_PREFIX}{version}"));
     fs::create_dir(&dir)?;
@@ -167,12 +178,6 @@ pub fn publish_tokens(
     fs::create_dir(&jwt)?;
     fs::set_permissions(&jwt, fs::Permissions::from_mode(0o755))?;
     for (alias, token) in tokens {
-        if alias.is_empty() || alias.contains('/') || alias.starts_with('.') {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!("{alias:?} is not a token alias"),
-            ));
-        }
         let path = jwt.join(alias);
         write_file(&path, token.as_bytes(), modes.key)?;
         if let Some(gid) = modes.key_gid {
@@ -984,10 +989,13 @@ mod tests {
     fn a_token_alias_cannot_escape_the_jwt_directory() {
         let target = scratch("jwt-alias");
         for bad in ["../tls.key", "a/b", ".hidden", ""] {
-            let err = publish_tokens(&target, &tokens(&[(bad, "T")]), MODES).unwrap_err();
+            let err =
+                publish_tokens(&target, &tokens(&[("ok", "T"), (bad, "T")]), MODES).unwrap_err();
             assert_eq!(err.kind(), io::ErrorKind::InvalidInput, "{bad:?}");
         }
         assert!(read_tokens(&target).is_empty());
+        // Refused before anything was created: no orphan generations.
+        assert_eq!(fs::read_dir(&target).unwrap().count(), 0);
         let _ = fs::remove_dir_all(&target);
     }
 }

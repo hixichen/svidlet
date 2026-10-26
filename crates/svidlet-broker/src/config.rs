@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use svidlet_issue::catalog::parse_duration;
-use svidlet_issue::{IdPolicy, IdTemplate};
+use svidlet_issue::{Field, IdPolicy, IdTemplate};
 
 #[derive(Debug, PartialEq, Eq)]
 pub struct ConfigError(pub String);
@@ -279,9 +279,25 @@ impl Config {
         Ok(cfg)
     }
 
+    /// Compile the ID template. A broker serves one cluster (I2) and checks
+    /// a caller's cluster against its own (T2), so the template must carry
+    /// `{cluster}`: without it every token request would be refused while
+    /// certificates kept working, which is worse than refusing to start.
     pub fn id_policy(&self) -> Result<IdPolicy> {
-        IdPolicy::new(&self.spiffe_id_template, self.spiffe_id_pattern.as_deref())
-            .map_err(|e| ConfigError(e.to_string()))
+        let policy = IdPolicy::new(&self.spiffe_id_template, self.spiffe_id_pattern.as_deref())
+            .map_err(|e| ConfigError(e.to_string()))?;
+        if !policy
+            .template()
+            .required_fields()
+            .contains(&Field::Cluster)
+        {
+            return Err(ConfigError(format!(
+                "SVIDLET_SPIFFE_ID_TEMPLATE {:?} has no {{cluster}}; the broker needs it to keep \
+                 each cluster's identities apart",
+                self.spiffe_id_template
+            )));
+        }
+        Ok(policy)
     }
 
     /// I11: the TTL actually requested.
@@ -351,6 +367,12 @@ mod tests {
         assert!(load(&[("SVIDLET_CERT_TTL", "0")]).is_err());
         assert!(load(&[("SVIDLET_NODE_RATE_PER_MINUTE", "-1")]).is_err());
         assert!(load(&[("SVIDLET_SPIFFE_ID_TEMPLATE", "spiffe://{nope}")]).is_err());
+        let err = load(&[(
+            "SVIDLET_SPIFFE_ID_TEMPLATE",
+            "spiffe://{trust_domain}/ns/{namespace}/sa/{service_account}",
+        )])
+        .unwrap_err();
+        assert!(err.0.contains("{cluster}"), "{err}");
         let c = load(&[("SVIDLET_CERT_TTL", "72h"), ("SVIDLET_CERT_MAX_TTL", "24h")]).unwrap();
         assert_eq!(c.effective_ttl(), Duration::from_secs(24 * 3600));
     }

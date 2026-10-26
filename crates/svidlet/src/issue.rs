@@ -28,6 +28,10 @@ pub struct Publisher {
     /// The broker, when this node uses one. Also `issuer`; held separately
     /// for the token path, which is not part of the `Issuer` seam.
     pub broker: Option<Arc<BrokerClient>>,
+    /// Serialises writes to `jwt/`. Three paths refresh tokens — publish,
+    /// renewal and the periodic check-in — and two concurrent writers of one
+    /// chain would collect each other's in-progress generation.
+    tokens_write: Mutex<()>,
     /// Trust bundle fetched from the backend's CA endpoint. Preferred over the
     /// chain returned alongside a signature, because it also carries a new root
     /// during a CA rotation, before any leaf has been signed by it.
@@ -49,6 +53,7 @@ impl Publisher {
             store,
             metrics,
             broker: None,
+            tokens_write: Mutex::new(()),
             ca: Mutex::new(String::new()),
         }
     }
@@ -146,7 +151,10 @@ impl Publisher {
         let grants = broker.fetch_tokens(&identity.cert_chain_pem, &identity.key_pem)?;
         let fresh: std::collections::BTreeMap<String, String> =
             grants.into_iter().map(|g| (g.alias, g.token)).collect();
-        if fresh == volume::read_tokens(target) {
+        // The fetch runs unlocked; only the compare-and-swap is serialised.
+        // Two fetches racing can only differ in which valid token wins.
+        let _guard = self.tokens_write.lock().expect("token write lock poisoned");
+        if !target.exists() || fresh == volume::read_tokens(target) {
             return Ok(false);
         }
         volume::publish_tokens(target, &fresh, self.modes())?;

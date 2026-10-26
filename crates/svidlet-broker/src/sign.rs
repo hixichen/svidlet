@@ -22,6 +22,8 @@ pub struct Signed {
     pub pod: String,
     pub pod_uid: String,
     pub bundle: IssuedBundle,
+    /// Time spent in the Vault call alone, for `svidlet_broker_vault_seconds`.
+    pub vault_elapsed: std::time::Duration,
 }
 
 pub struct Signer {
@@ -286,8 +288,10 @@ impl Signer {
         }
 
         // I10, counted only for requests that passed every other check, so a
-        // flood of garbage cannot lock a node out of renewals.
-        if !self.node_rate.allow(&node, now) {
+        // flood of garbage cannot lock a node out of renewals. Both limits are
+        // checked before either records, so one refusing does not spend the
+        // other's budget.
+        if !self.node_rate.check(&node, now) {
             return Err(Refusal::too_many(
                 "I10",
                 format!("node {node} is over its issuance rate"),
@@ -299,7 +303,9 @@ impl Signer {
                 format!("node {node} asked for too many distinct identities this hour"),
             ));
         }
+        self.node_rate.record(&node, now);
 
+        let started = std::time::Instant::now();
         let bundle = self
             .issuer
             .sign(&SignRequest {
@@ -318,6 +324,7 @@ impl Signer {
             pod: pod.name,
             pod_uid: pod.uid,
             bundle,
+            vault_elapsed: started.elapsed(),
         })
     }
 }

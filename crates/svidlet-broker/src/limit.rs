@@ -23,19 +23,35 @@ impl Window {
     /// Record an event for `key` at `now` if it fits; `false` if it does not.
     /// A limit of zero disables the check.
     pub fn allow(&self, key: &str, now: i64) -> bool {
+        if !self.check(key, now) {
+            return false;
+        }
+        self.record(key, now);
+        true
+    }
+
+    /// Whether an event for `key` at `now` would fit, without recording it.
+    pub fn check(&self, key: &str, now: i64) -> bool {
         if self.limit == 0 {
             return true;
         }
         let mut map = self.events.lock().expect("rate limiter poisoned");
-        let q = map.entry(key.to_string()).or_default();
+        let Some(q) = map.get_mut(key) else {
+            return true;
+        };
         while q.front().is_some_and(|&t| t <= now - self.window) {
             q.pop_front();
         }
-        if q.len() as u32 >= self.limit {
-            return false;
+        (q.len() as u32) < self.limit
+    }
+
+    /// Record an event unconditionally (after a successful `check`).
+    pub fn record(&self, key: &str, now: i64) {
+        if self.limit == 0 {
+            return;
         }
-        q.push_back(now);
-        true
+        let mut map = self.events.lock().expect("rate limiter poisoned");
+        map.entry(key.to_string()).or_default().push_back(now);
     }
 
     /// Drop keys with no events in the window, so the map does not grow with
@@ -110,6 +126,12 @@ mod tests {
         w.sweep(1000);
         assert!(w.events.lock().unwrap().is_empty());
         assert!(Window::new(0, 60).allow("n", 0), "zero disables");
+
+        // check() never records; record() does.
+        let w = Window::new(1, 60);
+        assert!(w.check("k", 0) && w.check("k", 0));
+        w.record("k", 0);
+        assert!(!w.check("k", 1));
     }
 
     #[test]

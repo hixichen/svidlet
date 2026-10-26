@@ -20,8 +20,10 @@ pub const DEFAULT_PATH_TEMPLATE: &str = "/cluster/{cluster}/ns/{namespace}/sa/{s
 
 /// Token lifetime when an identity does not set one.
 pub const DEFAULT_TOKEN_TTL: Duration = Duration::from_secs(12 * 3600);
-/// The bounds of §6.2: 6 to 12 hours.
-const MIN_TOKEN_TTL: Duration = Duration::from_secs(3600);
+/// The bounds of §6.2 and §7.2: 6 to 12 hours. Shorter tokens shrink the
+/// fail-stale margin (a cached token is served only to half-life) below what
+/// the 15-minute check-in and a Vault outage need.
+const MIN_TOKEN_TTL: Duration = Duration::from_secs(6 * 3600);
 const MAX_TOKEN_TTL: Duration = Duration::from_secs(12 * 3600);
 
 #[derive(Debug, Clone, Deserialize)]
@@ -163,7 +165,7 @@ impl Catalog {
             if let Some(ttl) = &id.token_ttl {
                 match parse_duration(ttl) {
                     Some(d) if (MIN_TOKEN_TTL..=MAX_TOKEN_TTL).contains(&d) => {}
-                    Some(_) => return bad(format!("{what}: token_ttl {ttl} is outside 1h..12h")),
+                    Some(_) => return bad(format!("{what}: token_ttl {ttl} is outside 6h..12h")),
                     None => return bad(format!("{what}: token_ttl {ttl:?} is not a duration")),
                 }
             }
@@ -462,6 +464,7 @@ service_account = "runner"
             base("cluster = \"a\"\nnamespace = \"Payments\"\nservice_account = \"api\""),
             base("cluster = \"a\"\nnamespace = \"pay__x\"\nservice_account = \"api\""),
             base("cluster = \"a\"\nnamespace = \"p\"\nservice_account = \"s\"\ntoken_ttl = \"24h\""),
+            base("cluster = \"a\"\nnamespace = \"p\"\nservice_account = \"s\"\ntoken_ttl = \"1h\""),
             base("cluster = \"a\"\nnamespace = \"p\"\nservice_account = \"s\"\ntoken_ttl = \"soon\""),
             base("cluster = \"a\"\nnamespace = \"p\"\nservice_account = \"s\"\naudiences = [{ alias = \"A\", audience = \"x\" }]"),
             base("cluster = \"a\"\nnamespace = \"p\"\nservice_account = \"s\"\naudiences = [{ alias = \"a\", audience = \"x,y\" }]"),

@@ -17,7 +17,7 @@ use http_body_util::{BodyExt, Full, Limited};
 use hyper::body::Incoming;
 use hyper::service::service_fn;
 use hyper::{Method, Request, Response, StatusCode};
-use hyper_util::rt::TokioIo;
+use hyper_util::rt::{TokioIo, TokioTimer};
 use rustls::server::{ClientHello, ResolvesServerCert, WebPkiClientVerifier};
 use rustls::sign::CertifiedKey;
 use rustls::{RootCertStore, ServerConfig};
@@ -37,6 +37,32 @@ use crate::tokens::{Grant, Tokens};
 
 /// Requests are small JSON documents; anything bigger is not one of ours.
 const MAX_BODY: usize = 64 * 1024;
+
+/// A client gets this long to send its request headers, so a connection that
+/// trickles bytes cannot hold a task and a descriptor forever.
+const HEADER_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Accept the next connection. An accept error — descriptors exhausted, a
+/// connection reset before it was accepted — is logged and retried: one bad
+/// moment must not take the cluster's only broker down.
+async fn accept(listener: &TcpListener) -> (tokio::net::TcpStream, SocketAddr) {
+    loop {
+        match listener.accept().await {
+            Ok(conn) => return conn,
+            Err(e) => {
+                warn!(error = %e, "accept failed; retrying");
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        }
+    }
+}
+
+fn http1() -> hyper::server::conn::http1::Builder {
+    let mut b = hyper::server::conn::http1::Builder::new();
+    b.timer(TokioTimer::new())
+        .header_read_timeout(HEADER_TIMEOUT);
+    b
+}
 
 pub struct Broker {
     pub signer: Signer,
@@ -126,15 +152,13 @@ pub async fn handle_sign(broker: Arc<Broker>, req: Request<Incoming>) -> Respons
                 let body: SignBody = serde_json::from_slice(&body)
                     .map_err(|e| Refusal::bad("I1", format!("malformed request: {e}")))?;
                 let b = broker.clone();
-                let started = Instant::now();
-                let out = blocking(move || b.signer.sign(&node_token, &body, unix_now())).await;
-                broker.metrics.vault("pki_sign", started.elapsed());
-                out
+                blocking(move || b.signer.sign(&node_token, &body, unix_now())).await
             }
             .await;
             match outcome {
                 Ok(signed) => {
                     broker.metrics.request("sign", "ok", "");
+                    broker.metrics.vault("pki_sign", signed.vault_elapsed);
                     // I12: every decision, never a token.
                     info!(
                         target: "audit",
@@ -233,6 +257,9 @@ pub async fn handle_tokens(
             broker.metrics.request(label, "ok", "");
             for g in &grants {
                 broker.metrics.cache(g.minted);
+                if let Some(took) = g.vault_elapsed {
+                    broker.metrics.vault("mintjwt", took);
+                }
                 // T8: identity, audience, caller serial and jti; never the token.
                 info!(
                     target: "audit",
@@ -381,7 +408,7 @@ pub async fn serve(
 ) -> std::io::Result<()> {
     let acceptor = TlsAcceptor::from(tls);
     loop {
-        let (tcp, peer): (_, SocketAddr) = listener.accept().await?;
+        let (tcp, peer) = accept(&listener).await;
         let acceptor = acceptor.clone();
         let broker = broker.clone();
         tokio::spawn(async move {
@@ -412,10 +439,7 @@ pub async fn serve(
                     })
                 }
             });
-            if let Err(e) = hyper::server::conn::http1::Builder::new()
-                .serve_connection(TokioIo::new(stream), svc)
-                .await
-            {
+            if let Err(e) = http1().serve_connection(TokioIo::new(stream), svc).await {
                 tracing::debug!(peer = %peer, error = %e, "connection ended with an error");
             }
         });
@@ -426,7 +450,7 @@ pub async fn serve(
 /// Vault or API-server outage must never restart the broker.
 pub async fn serve_metrics(listener: TcpListener, broker: Arc<Broker>) -> std::io::Result<()> {
     loop {
-        let (tcp, _) = listener.accept().await?;
+        let (tcp, _) = accept(&listener).await;
         let broker = broker.clone();
         tokio::spawn(async move {
             let svc = service_fn(move |req: Request<Incoming>| {
@@ -442,9 +466,7 @@ pub async fn serve_metrics(listener: TcpListener, broker: Arc<Broker>) -> std::i
                     })
                 }
             });
-            let _ = hyper::server::conn::http1::Builder::new()
-                .serve_connection(TokioIo::new(tcp), svc)
-                .await;
+            let _ = http1().serve_connection(TokioIo::new(tcp), svc).await;
         });
     }
 }
