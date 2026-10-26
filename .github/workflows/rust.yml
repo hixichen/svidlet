@@ -6,24 +6,65 @@ on:
   pull_request:
     branches: [ "main" ]
 
+# Read the repository, nothing else.
+permissions:
+  contents: read
+
+# A new push to a PR supersedes the run in progress; main keeps every run.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 env:
   CARGO_TERM_COLOR: always
+  # Incremental caches only help repeated local rebuilds; in CI they cost disk
+  # and time and are thrown away.
+  CARGO_INCREMENTAL: 0
 
 jobs:
   build:
-
     runs-on: ubuntu-latest
-
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@v5
+    # Caches ~/.cargo and target/'s dependencies, keyed on Cargo.lock, and
+    # prunes this workspace's own artifacts before saving, so the cache holds
+    # what is worth keeping and nothing else.
+    - uses: Swatinem/rust-cache@v2
     - name: Format
       run: cargo fmt --all --check
     - name: Lint
       run: cargo clippy --workspace --all-targets -- -D warnings
+    - name: Docs
+      run: cargo doc --workspace --no-deps
+      env:
+        RUSTDOCFLAGS: -D warnings
     - name: Build
-      run: cargo build --verbose --all-targets
-    - name: Run tests
+      run: cargo build --workspace --all-targets
+    - name: Test
       # The plugin's tests mount real tmpfs and bind mounts, as it does on a
-      # node, and mounting needs root. Built above as the runner user; only
-      # the test run is elevated.
-      run: sudo -E env "PATH=$PATH" cargo test --verbose
+      # node, and mount(2) needs root. Cargo runs as the runner user; only the
+      # test binaries go through sudo (hack/root-tests.toml), so target/ stays
+      # cacheable.
+      run: cargo test --workspace --config hack/root-tests.toml
+
+  vault:
+    # The six tests that need a real Vault: that the CSR the node builds is one
+    # Vault signs, and that a per-cluster role refuses another cluster's ID.
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v5
+    - uses: Swatinem/rust-cache@v2
+    - name: Install Vault
+      run: |
+        wget -qO- https://apt.releases.hashicorp.com/gpg \
+          | sudo gpg --dearmor -o /usr/share/keyrings/hashicorp-archive-keyring.gpg
+        echo "deb [signed-by=/usr/share/keyrings/hashicorp-archive-keyring.gpg] https://apt.releases.hashicorp.com $(lsb_release -cs) main" \
+          | sudo tee /etc/apt/sources.list.d/hashicorp.list
+        sudo apt-get update -q
+        sudo apt-get install -y -q vault
+        vault version
+    - name: Live-Vault tests
+      run: make test-vault
+      env:
+        # Without this a missing Vault environment would skip, not fail.
+        SVIDLET_REQUIRE_VAULT: "1"

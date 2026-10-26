@@ -34,9 +34,16 @@ struct Env {
 }
 
 /// Read the environment `hack/local-vault.sh env` prints. Skips the test with a
-/// clear message when it is absent, rather than failing.
+/// clear message when it is absent, rather than failing — unless
+/// `SVIDLET_REQUIRE_VAULT` is set, as in CI, where a skip would be a green run
+/// that tested nothing.
 fn env() -> Option<Env> {
     if std::env::var("SVIDLET_TEST_VAULT").is_err() {
+        assert!(
+            std::env::var("SVIDLET_REQUIRE_VAULT").is_err(),
+            "SVIDLET_REQUIRE_VAULT is set but the Vault environment is not; \
+             did ./hack/local-vault.sh start succeed?"
+        );
         eprintln!(
             "skipping: set SVIDLET_TEST_VAULT and friends first \
              (eval \"$(./hack/local-vault.sh env)\")"
