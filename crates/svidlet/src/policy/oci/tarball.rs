@@ -268,7 +268,7 @@ mod tests {
     #[test]
     fn only_regular_files_are_accepted() {
         // Symlink, hard link, character device, fifo.
-        for type_flag in [b'1', b'2', b'3', b'4', b'6'] {
+        for type_flag in *b"12346" {
             let tar = build_raw("evil", b"", type_flag, 0o644);
             let err = extract(&tar, LIMIT).unwrap_err();
             assert!(
