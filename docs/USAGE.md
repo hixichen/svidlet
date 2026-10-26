@@ -2,7 +2,7 @@
 
 What a workload can do with the files in its volume — all of it, in one list.
 
-**Depends on:** [DESIGN.md](DESIGN.md) · [../svidlet-policy/authz-management-plane.md](../svidlet-policy/authz-management-plane.md) · [../svidlet-policy/authz-enforcement-plane.md](../svidlet-policy/authz-enforcement-plane.md)
+**Depends on:** [DESIGN.md](DESIGN-v0.1.md) · [../svidlet-policy/authz-management-plane.md](../svidlet-policy/authz-management-plane.md) · [../svidlet-policy/authz-enforcement-plane.md](../svidlet-policy/authz-enforcement-plane.md)
 
 ---
 
@@ -204,7 +204,7 @@ Just as important, and each of these has bitten someone:
 - **Sign things.** The key is a TLS authentication key (`digitalSignature` in a TLS handshake), not a code-signing key. No artifact signing, no commit signing, no JWT SVIDs — the design has none, on purpose.
 - **Issue certificates.** The leaf is not a CA, and nothing in the volume will make it one.
 - **Act as a bearer secret.** Pasting the PEM into a header or a cookie is a misuse: any receiver would have to treat it as a long-lived password, which is exactly what the 24 h rotation exists to avoid.
-- **Prove what you run.** The cert proves *who* runs — namespace and ServiceAccount per the kubelet. Whether that workload should exist is admission control's half of the chain, still future work ([DESIGN.md](DESIGN.md)).
+- **Prove what you run.** The cert proves *who* runs — namespace and ServiceAccount per the kubelet. Whether that workload should exist is admission control's half of the chain, still future work ([DESIGN.md](DESIGN-v0.1.md)).
 - **Be trusted outside the trust domain.** A peer must hold your `ca.crt` to verify you. There is no federation with external trust domains; external systems need your bundle (as in the AWS/GCP exchanges above) or nothing.
 - **Stand in for authorization.** The certificate answers "who is calling". Whether that caller may do it is a policy decision — §3, tier 2 or 3.
 

@@ -48,7 +48,7 @@ data:
   #
   # AppRole is the default because it works everywhere, including bare metal —
   # but it is a shared bearer secret, and it is the weakest part of this design
-  # (see docs/DESIGN.md). Where Vault can validate ServiceAccount tokens, prefer:
+  # (see docs/DESIGN-v0.1.md). Where Vault can validate ServiceAccount tokens, prefer:
   #
   #   SVIDLET_VAULT_AUTH: kubernetes
   #   SVIDLET_VAULT_K8S_ROLE: svidlet
@@ -63,7 +63,7 @@ data:
   #
   # Policy distribution runs as a separate process with separate credentials:
   # it never sees SVIDLET_ROLE_ID or the AppRole secret, and it does not run as
-  # root. See docs/DESIGN.md, "Two processes, one volume".
+  # root. See docs/DESIGN-v0.1.md, "Two processes, one volume".
   #
   # Authorization policy, streamed from a backend fronting a git repository.
   # Leave the endpoint unset to disable: no stream is opened and no policy

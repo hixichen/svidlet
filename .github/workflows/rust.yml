@@ -17,6 +17,9 @@ jobs:
     steps:
     - uses: actions/checkout@v4
     - name: Build
-      run: cargo build --verbose
+      run: cargo build --verbose --all-targets
     - name: Run tests
-      run: cargo test --verbose
+      # The plugin's tests mount real tmpfs and bind mounts, as it does on a
+      # node, and mounting needs root. Built above as the runner user; only
+      # the test run is elevated.
+      run: sudo -E env "PATH=$PATH" cargo test --verbose
