@@ -5,8 +5,9 @@
 #![allow(dead_code)]
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
 use rcgen::{
@@ -18,9 +19,11 @@ use time::OffsetDateTime;
 use svidlet_broker::catalog::CatalogHandle;
 use svidlet_broker::config::Config;
 use svidlet_broker::kube::{Kube, KubeError, Pod, Review};
+use svidlet_broker::server::{self, Broker, Port, ReloadingCert};
 use svidlet_broker::sign::Signer;
 use svidlet_broker::tokens::{JwksSource, Tokens};
 use svidlet_issue::{Catalog, IssuedBundle, JwtMinter, SignRequest};
+use tokio::net::TcpListener;
 
 pub const CLUSTER: &str = "gpu-a";
 pub const TD: &str = "corp.internal";
@@ -428,4 +431,71 @@ pub fn sign_body(pod_token: &str) -> svidlet_issue::broker::SignBody {
 
 pub fn wait() {
     std::thread::sleep(Duration::from_millis(1));
+}
+
+// ------------------------------------------------------------ serving
+
+pub struct Running {
+    pub sign_url: String,
+    pub token_url: String,
+    pub metrics_url: String,
+    pub ca_pem: String,
+    pub dir: PathBuf,
+    pub kube: Arc<FakeKube>,
+    pub minter: Arc<FakeMinter>,
+    pub ca: Arc<TestCa>,
+    pub broker: Arc<Broker>,
+}
+
+/// Serve both broker ports and metrics on loopback, in this runtime.
+pub async fn start_broker(name: &str, fx: Fx) -> Running {
+    let dir =
+        std::env::temp_dir().join(format!("svidlet-broker-e2e-{name}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+
+    let (cert, key) = fx.ca.server();
+    std::fs::write(dir.join("tls.crt"), &cert).unwrap();
+    std::fs::write(dir.join("tls.key"), &key).unwrap();
+    std::fs::write(dir.join("ca.crt"), &fx.ca.pem).unwrap();
+    std::fs::write(dir.join("node-token"), NODE_TOKEN).unwrap();
+
+    let Fx {
+        ca,
+        kube,
+        minter,
+        signer,
+        tokens,
+        ..
+    } = fx;
+    let broker = Arc::new(Broker {
+        signer,
+        tokens,
+        metrics: Default::default(),
+        bundle: RwLock::new(ca.pem.clone()),
+        bundle_path: dir.join("ca.crt"),
+    });
+    let reloading =
+        Arc::new(ReloadingCert::load(&dir.join("tls.crt"), &dir.join("tls.key")).unwrap());
+    let sign_tls = server::sign_tls(reloading.clone()).unwrap();
+    let token_tls = server::token_tls(reloading, &dir.join("ca.crt")).unwrap();
+
+    let sign = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let toks = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let metrics = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let running = Running {
+        sign_url: format!("https://localhost:{}", sign.local_addr().unwrap().port()),
+        token_url: format!("https://localhost:{}", toks.local_addr().unwrap().port()),
+        metrics_url: format!("http://127.0.0.1:{}", metrics.local_addr().unwrap().port()),
+        ca_pem: ca.pem.clone(),
+        dir,
+        kube,
+        minter,
+        ca: ca.clone(),
+        broker: broker.clone(),
+    };
+    tokio::spawn(server::serve(sign, sign_tls, broker.clone(), Port::Sign));
+    tokio::spawn(server::serve(toks, token_tls, broker.clone(), Port::Tokens));
+    tokio::spawn(server::serve_metrics(metrics, broker));
+    running
 }

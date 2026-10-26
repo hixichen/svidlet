@@ -24,5 +24,8 @@ ureq.workspace = true
 x509-parser.workspace = true
 
 [dev-dependencies]
+# The node plugin, to drive the whole path from NodePublishVolume to the broker.
+svidlet = { path = "../svidlet" }
+tonic.workspace = true
 rcgen = { workspace = true, features = ["x509-parser"] }
 time = "0.3"

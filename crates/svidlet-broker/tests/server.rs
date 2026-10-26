@@ -3,75 +3,10 @@
 
 mod common;
 
-use std::path::PathBuf;
-use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use common::*;
-use svidlet_broker::server::{self, Broker, Port, ReloadingCert};
 use svidlet_issue::{BrokerClient, BrokerEndpoint, Issuer, PodContext, SignRequest, SpiffeId};
-use tokio::net::TcpListener;
-
-struct Running {
-    sign_url: String,
-    token_url: String,
-    metrics_url: String,
-    ca_pem: String,
-    dir: PathBuf,
-    kube: Arc<FakeKube>,
-    minter: Arc<FakeMinter>,
-}
-
-async fn start(name: &str) -> Running {
-    let dir =
-        std::env::temp_dir().join(format!("svidlet-broker-e2e-{name}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-
-    let fx = fixture();
-    let (cert, key) = fx.ca.server();
-    std::fs::write(dir.join("tls.crt"), &cert).unwrap();
-    std::fs::write(dir.join("tls.key"), &key).unwrap();
-    std::fs::write(dir.join("ca.crt"), &fx.ca.pem).unwrap();
-    std::fs::write(dir.join("node-token"), NODE_TOKEN).unwrap();
-
-    let Fx {
-        ca,
-        kube,
-        minter,
-        signer,
-        tokens,
-        ..
-    } = fx;
-    let broker = Arc::new(Broker {
-        signer,
-        tokens,
-        metrics: Default::default(),
-        bundle: RwLock::new(ca.pem.clone()),
-        bundle_path: dir.join("ca.crt"),
-    });
-    let reloading =
-        Arc::new(ReloadingCert::load(&dir.join("tls.crt"), &dir.join("tls.key")).unwrap());
-    let sign_tls = server::sign_tls(reloading.clone()).unwrap();
-    let token_tls = server::token_tls(reloading, &dir.join("ca.crt")).unwrap();
-
-    let sign = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let toks = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let metrics = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let running = Running {
-        sign_url: format!("https://localhost:{}", sign.local_addr().unwrap().port()),
-        token_url: format!("https://localhost:{}", toks.local_addr().unwrap().port()),
-        metrics_url: format!("http://127.0.0.1:{}", metrics.local_addr().unwrap().port()),
-        ca_pem: ca.pem.clone(),
-        dir,
-        kube,
-        minter,
-    };
-    tokio::spawn(server::serve(sign, sign_tls, broker.clone(), Port::Sign));
-    tokio::spawn(server::serve(toks, token_tls, broker.clone(), Port::Tokens));
-    tokio::spawn(server::serve_metrics(metrics, broker));
-    running
-}
 
 fn client(r: &Running) -> BrokerClient {
     BrokerClient::new(BrokerEndpoint {
@@ -108,7 +43,7 @@ fn sign_with(
 
 #[tokio::test]
 async fn a_node_gets_a_certificate_and_then_tokens_with_it() {
-    let r = start("full").await;
+    let r = start_broker("full", fixture()).await;
     let c = client(&r);
     let out = tokio::task::spawn_blocking(move || {
         let ca = c.ca_chain().unwrap();
@@ -157,7 +92,7 @@ async fn a_node_gets_a_certificate_and_then_tokens_with_it() {
 
 #[tokio::test]
 async fn refusals_reach_the_node_as_the_right_errors() {
-    let r = start("refusals").await;
+    let r = start_broker("refusals", fixture()).await;
     r.kube
         .add_pod("t-elsewhere", "payments", "api", "api-1", "uid-api-1", "n2");
     let c = client(&r);
@@ -182,7 +117,7 @@ async fn refusals_reach_the_node_as_the_right_errors() {
 
 #[tokio::test]
 async fn direct_mode_serves_one_approved_audience_and_requires_a_client_certificate() {
-    let r = start("direct").await;
+    let r = start_broker("direct", fixture()).await;
     let c = client(&r);
     let (bundle, key) =
         tokio::task::spawn_blocking(move || sign_with(&c, Some(POD_TOKEN)).unwrap())

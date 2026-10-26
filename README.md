@@ -100,7 +100,7 @@ OCI bundles with a staged ring rollout.
 Policy distribution runs in a second process so that a compromise of the policy path
 cannot mint identities — see [Policy](#policy).
 
-241 tests, plus six integration tests that run against a real Vault
+323 tests, plus six integration tests that run against a real Vault
 (`./hack/local-vault.sh`).
 
 Not started: a validating admission controller for workload provenance (the
@@ -316,7 +316,8 @@ SVIDLET_POLICY_ENABLED=false cargo run -p svidlet     # no policy backend needed
 never drift. The gate a change must pass is `make ci`.
 
 ```sh
-cargo test                  # 241 tests, no cluster and no Vault needed
+sudo -E cargo test          # 323 tests, no cluster and no Vault needed (root: real tmpfs mounts)
+cargo test -p svidlet-broker # the v0.2 broker path alone
 ./hack/coverage.sh          # coverage report; fails under 80%
 ./hack/bench-memory.sh      # resident memory under load
 
@@ -337,6 +338,27 @@ promotion, rollback without network, freeze, a manifest signed by the wrong key,
 bundle that does not match its signed digest, and a registry that goes away. The `--ignored` tests are the ones that need a real Vault:
 that the CSR svidlet builds is one Vault actually signs, and that the per-cluster role
 really refuses an identity outside its prefix.
+
+`cargo test` runs as root because the plugin's tests mount a real tmpfs per volume
+and bind-mount it into the policy farm, exactly as on a node; unprivileged, those
+tests fail on `mount(2)`. CI does the same.
+
+The v0.2 broker path is covered three ways, none needing a cluster:
+
+- **Rules.** Every certificate invariant (I1–I11) and token rule (T1–T7) against a fake
+  API server, CA and minter (`crates/svidlet-broker/tests/{sign,tokens}.rs`).
+- **The node through the broker.** The plugin's own CSI service in broker mode
+  publishes a real volume through an in-process broker over TLS: certificate and
+  `jwt/` files, republish refreshing the pod token, renewal on it, a deleted pod
+  failing stale, refusals mapped to gRPC codes, and an emergency key rotation reaching
+  the volume on the next check-in (`node_e2e.rs`).
+- **The shipped binaries.** `svidlet-broker` as a separate process, configured from
+  the environment, with its real Kubernetes and Vault clients talking HTTP to
+  wire-level stubs; it must issue, mint, audit without logging any token, and exit
+  cleanly on SIGINT. `oidc-publisher` and `svidlet-catalog` likewise (`binaries.rs`).
+
+Not covered yet: a real API server and a real Vault Enterprise SPIFFE engine. The
+response shape of `mintjwt` (`data.token`) is the one assumption only that can check.
 
 `hack/kind-e2e.sh` asserts the whole path: a pod's `app` container gets a certificate
 whose SPIFFE ID matches its ServiceAccount, its `sidecar` container cannot read that
