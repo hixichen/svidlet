@@ -1,0 +1,28 @@
+[package]
+name = "svidlet-broker"
+description = "Per-cluster broker: attests pods, asks Vault to sign X.509 SVIDs and mint JWT-SVIDs"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+svidlet-issue = { path = "../svidlet-issue" }
+bytes.workspace = true
+http-body-util.workspace = true
+hyper.workspace = true
+hyper-util.workspace = true
+rustls.workspace = true
+rustls-pki-types.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tokio-rustls.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+ureq.workspace = true
+x509-parser.workspace = true
+
+[dev-dependencies]
+rcgen = { workspace = true, features = ["x509-parser"] }
+time = "0.3"

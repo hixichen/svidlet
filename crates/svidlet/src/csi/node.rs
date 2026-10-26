@@ -21,7 +21,7 @@ use crate::config::volume_context as vc;
 use crate::issue::Publisher;
 use crate::log::unix_now;
 use crate::metrics::Metrics;
-use crate::store::{jittered_renew_at, Entry, PodRef};
+use crate::store::{jittered_renew_at, Entry, PodRef, PodToken};
 use crate::{debug, error, info, volume, warn};
 
 /// Wait for `svidlet-policy` to publish a revision file into this volume.
@@ -39,6 +39,22 @@ async fn wait_for_policy(target: &std::path::Path, timeout: std::time::Duration)
     }
 }
 
+/// How long NodePublishVolume waits for the first tokens before returning.
+const PUBLISH_TOKEN_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// The pod token for `audience` from the kubelet's volume context, if the
+/// CSIDriver object asks for one (`tokenRequests`). The value is a JSON map of
+/// audience to `{"token": …, "expirationTimestamp": …}`.
+pub fn pod_token_from(
+    ctx: &std::collections::HashMap<String, String>,
+    audience: &str,
+) -> Option<PodToken> {
+    let raw = ctx.get(vc::SERVICE_ACCOUNT_TOKENS)?;
+    let map: serde_json::Value = serde_json::from_str(raw).ok()?;
+    let token = map.get(audience)?.get("token")?.as_str()?;
+    (!token.is_empty()).then(|| PodToken(token.to_string()))
+}
+
 /// Map an issuance failure onto the gRPC status the kubelet should see.
 ///
 /// The distinction matters in `kubectl describe pod`: `InvalidArgument` says
@@ -49,6 +65,13 @@ fn status_for(e: svidlet_issue::Error) -> Status {
     match e.code() {
         ErrorCode::Identity => Status::invalid_argument(e.to_string()),
         ErrorCode::Policy => Status::permission_denied(e.to_string()),
+        ErrorCode::Auth => Status::unauthenticated(e.to_string()),
+        ErrorCode::BackendStatus
+            if matches!(e, svidlet_issue::Error::Backend { status: 429, .. }) =>
+        {
+            Status::resource_exhausted(e.to_string())
+        }
+        _ if e.is_retryable() => Status::unavailable(e.to_string()),
         _ => Status::internal(e.to_string()),
     }
 }
@@ -106,6 +129,7 @@ impl NodeService {
             name: attrs.pod_name.clone(),
             namespace: attrs.namespace.clone(),
             uid: attrs.pod_uid.clone(),
+            service_account: attrs.service_account.clone(),
         };
 
         let spiffe_id = self.publisher.spiffe_id(&attrs).map_err(status_for)?;
@@ -156,6 +180,23 @@ impl Node for NodeService {
         let (spiffe_id, pod) = self.identity_from(&req.volume_context)?;
         let target = PathBuf::from(&req.target_path);
         let publisher = self.publisher.clone();
+        let pod_token = publisher
+            .cfg
+            .broker
+            .as_ref()
+            .and_then(|b| pod_token_from(&req.volume_context, &b.pod_token_audience));
+        if publisher.cfg.broker.is_some() && pod_token.is_none() {
+            return Err(Status::invalid_argument(format!(
+                "volume context carries no pod token for the broker; the CSIDriver object must \
+                 request one (tokenRequests: [{{audience: {}}}]) and set requiresRepublish: true",
+                publisher
+                    .cfg
+                    .broker
+                    .as_ref()
+                    .map(|b| b.pod_token_audience.as_str())
+                    .unwrap_or_default()
+            )));
+        }
 
         // The kubelet retries NodePublishVolume until it succeeds, and calls it
         // again on any subsequent mount of the same volume. Publishing twice
@@ -163,6 +204,9 @@ impl Node for NodeService {
         // list, so an already-served target is answered from the store.
         if let Some(existing) = publisher.store.get(&target) {
             if existing.spiffe_id == spiffe_id {
+                // §5.2 republish: keep the newest pod token for the next
+                // renewal, and issue nothing.
+                publisher.store.set_pod_token(&target, pod_token);
                 debug!(
                     "volume already published",
                     spiffe_id = spiffe_id,
@@ -180,13 +224,20 @@ impl Node for NodeService {
         let policy_gid = publisher.cfg.policy_gid;
         let target_for_task = target.clone();
         let id_for_task = spiffe_id.clone();
+        let pod_for_task = pod.clone();
+        let token_for_task = pod_token.clone();
 
         // Key generation and the call to the PKI backend both block.
         let started = std::time::Instant::now();
         let outcome = tokio::task::spawn_blocking(move || {
             volume::ensure_tmpfs(&target_for_task, &tmpfs_size, policy_gid)
                 .map_err(svidlet_issue::Error::Io)?;
-            publisher.issue(&id_for_task, &target_for_task)
+            publisher.issue(
+                &id_for_task,
+                &target_for_task,
+                &pod_for_task,
+                token_for_task.as_ref(),
+            )
         })
         .await
         .map_err(|e| Status::internal(format!("issuance task panicked: {e}")))?;
@@ -289,8 +340,31 @@ impl Node for NodeService {
             not_after: bundle.not_after,
             renew_at,
             failures: 0,
+            pod_token,
         });
         self.publisher.metrics.published();
+
+        // Tokens are best effort at publish time. A pod that reads `jwt/` at
+        // start-up is best served by waiting briefly for them, but a pod that
+        // needs only its certificate must not wait out a broker timeout: the
+        // fetch gets a short head start, then carries on in the background,
+        // and the periodic check-in retries anything that failed.
+        if self.publisher.broker.is_some() {
+            let publisher = self.publisher.clone();
+            let target = PathBuf::from(&req.target_path);
+            let id = spiffe_id.clone();
+            let fetch = tokio::task::spawn_blocking(move || {
+                if let Err(e) = publisher.refresh_tokens(&target) {
+                    warn!(
+                        "could not fetch tokens at publish; will retry on the next check-in",
+                        spiffe_id = id,
+                        code = e.code(),
+                        error = e,
+                    );
+                }
+            });
+            let _ = tokio::time::timeout(PUBLISH_TOKEN_WAIT, fetch).await;
+        }
 
         info!(
             "published",
@@ -364,5 +438,72 @@ impl Node for NodeService {
             node_id: self.publisher.cfg.node_name.clone(),
             max_volumes_per_node: 0,
         }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    fn ctx(json: &str) -> HashMap<String, String> {
+        HashMap::from([(vc::SERVICE_ACCOUNT_TOKENS.to_string(), json.to_string())])
+    }
+
+    #[test]
+    fn the_pod_token_comes_from_the_kubelets_token_map() {
+        let c = ctx(
+            r#"{"svidlet-broker":{"token":"tok","expirationTimestamp":"2026-10-26T00:10:00Z"},"other":{"token":"no"}}"#,
+        );
+        assert_eq!(
+            pod_token_from(&c, "svidlet-broker"),
+            Some(PodToken("tok".into()))
+        );
+        assert_eq!(pod_token_from(&c, "missing"), None);
+    }
+
+    #[test]
+    fn a_missing_or_malformed_token_map_yields_no_token() {
+        assert_eq!(pod_token_from(&HashMap::new(), "a"), None);
+        assert_eq!(pod_token_from(&ctx("not json"), "a"), None);
+        assert_eq!(pod_token_from(&ctx(r#"{"a":{"token":""}}"#), "a"), None);
+        assert_eq!(pod_token_from(&ctx(r#"{"a":{"token":7}}"#), "a"), None);
+    }
+
+    #[test]
+    fn broker_errors_reach_the_kubelet_with_the_right_code() {
+        use svidlet_issue::Error;
+        assert_eq!(
+            status_for(Error::Policy("no".into())).code(),
+            tonic::Code::PermissionDenied
+        );
+        assert_eq!(
+            status_for(Error::Auth("no".into())).code(),
+            tonic::Code::Unauthenticated
+        );
+        assert_eq!(
+            status_for(Error::Transport("down".into())).code(),
+            tonic::Code::Unavailable
+        );
+        assert_eq!(
+            status_for(Error::Backend {
+                status: 503,
+                body: "x".into()
+            })
+            .code(),
+            tonic::Code::Unavailable
+        );
+        assert_eq!(
+            status_for(Error::Backend {
+                status: 429,
+                body: "slow".into()
+            })
+            .code(),
+            tonic::Code::ResourceExhausted
+        );
+        assert_eq!(
+            status_for(Error::Certificate("bad".into())).code(),
+            tonic::Code::Internal
+        );
     }
 }

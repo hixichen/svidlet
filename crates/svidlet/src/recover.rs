@@ -170,6 +170,7 @@ pub fn adopt(cfg: &Config, policy: &IdPolicy, store: &Store, metrics: &Metrics) 
             name: attrs.pod_name,
             namespace: attrs.namespace,
             uid: found.pod_uid,
+            service_account: attrs.service_account,
         };
         store.insert(Entry {
             volume_id: found.volume_id.clone(),
@@ -180,6 +181,7 @@ pub fn adopt(cfg: &Config, policy: &IdPolicy, store: &Store, metrics: &Metrics) 
             not_after: facts.not_after,
             renew_at,
             failures: 0,
+            pod_token: None,
         });
         // The bind mount normally survives a plugin restart, but a first boot
         // or a wiped farm directory re-creates it here — the policy daemon

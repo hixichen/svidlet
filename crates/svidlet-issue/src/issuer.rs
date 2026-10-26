@@ -24,6 +24,41 @@ pub struct SignRequest<'a> {
     pub ttl: Duration,
     /// The node making the request, for the backend's audit trail.
     pub node_name: &'a str,
+    /// The pod this certificate is for, as the kubelet described it.
+    ///
+    /// A backend that signs on the node's own authority (Vault PKI with a
+    /// per-cluster credential) ignores it. The broker needs it: the pod token
+    /// in here is what proves to the broker that the kubelet on this node
+    /// asked for this pod, and everything else in it is only a hint the broker
+    /// re-derives from that token.
+    pub pod: Option<PodContext<'a>>,
+}
+
+/// What the kubelet told the node about one pod.
+#[derive(Clone, Copy)]
+pub struct PodContext<'a> {
+    pub namespace: &'a str,
+    pub name: &'a str,
+    pub uid: &'a str,
+    pub service_account: &'a str,
+    /// The pod-bound ServiceAccount token the kubelet minted for the CSI
+    /// driver (`tokenRequests` on the CSIDriver). `None` until the kubelet has
+    /// supplied one — after a restart, until the next republish.
+    pub token: Option<&'a str>,
+}
+
+/// Never print the token: a `SignRequest` is the kind of value that ends up
+/// in a `{:?}` during debugging.
+impl std::fmt::Debug for PodContext<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PodContext")
+            .field("namespace", &self.namespace)
+            .field("name", &self.name)
+            .field("uid", &self.uid)
+            .field("service_account", &self.service_account)
+            .field("token", &self.token.map(|_| "<redacted>"))
+            .finish()
+    }
 }
 
 /// A PKI backend that signs CSRs for workload identities.

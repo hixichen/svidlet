@@ -1,0 +1,124 @@
+# svidlet-node in broker mode (docs/DESIGN.md §4): no Vault credential, no
+# Kubernetes permissions, egress to the broker only. Policy distribution is
+# unchanged and omitted here; add the svidlet-policy container from
+# ../daemonset.yaml if you use it.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: svidlet-node
+  namespace: svidlet-system
+automountServiceAccountToken: false
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: svidlet-node
+  namespace: svidlet-system
+data:
+  SVIDLET_ISSUER: broker
+  SVIDLET_TRUST_DOMAIN: corp.internal
+  SVIDLET_CLUSTER: gpu-a
+  # Must render the same IDs as the broker's template; the broker refuses a
+  # mismatch rather than issuing something the node did not expect.
+  SVIDLET_SPIFFE_ID_TEMPLATE: "spiffe://{trust_domain}/cluster/{cluster}/ns/{namespace}/sa/{service_account}"
+  SVIDLET_CERT_TTL: 48h
+  SVIDLET_BROKER_URL: https://svidlet-broker.svidlet-system.svc:8443
+  SVIDLET_BROKER_TOKEN_URL: https://svidlet-broker.svidlet-system.svc:8444
+  SVIDLET_BROKER_CACERT: /etc/svidlet/broker/ca.crt
+  SVIDLET_BROKER_TOKEN_FILE: /var/run/secrets/svidlet/broker/token
+  SVIDLET_JWT_ENABLED: "true"
+  SVIDLET_JWT_REFRESH_INTERVAL: 15m
+  SVIDLET_KEY_GID: "1000"
+  SVIDLET_LOG_LEVEL: info
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  # The broker accepts a node token only from a pod this DaemonSet owns.
+  name: svidlet-node
+  namespace: svidlet-system
+  labels:
+    app.kubernetes.io/name: svidlet-node
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: svidlet-node
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 10%
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: svidlet-node
+    spec:
+      serviceAccountName: svidlet-node
+      priorityClassName: system-node-critical
+      tolerations:
+        - operator: Exists
+      containers:
+        - name: svidlet
+          image: ghcr.io/hixichen/svidlet:0.0.1
+          envFrom:
+            - configMapRef:
+                name: svidlet-node
+          env:
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+          ports:
+            - name: metrics
+              containerPort: 9464
+          securityContext:
+            privileged: true
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: true
+          volumeMounts:
+            - name: kubelet-dir
+              mountPath: /var/lib/kubelet
+              mountPropagation: Bidirectional
+            - name: volumes-farm
+              mountPath: /var/lib/svidlet/volumes
+              mountPropagation: Bidirectional
+            - name: broker-token
+              mountPath: /var/run/secrets/svidlet/broker
+              readOnly: true
+            - name: trust
+              mountPath: /etc/svidlet/broker
+              readOnly: true
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: metrics
+            initialDelaySeconds: 5
+            periodSeconds: 20
+            failureThreshold: 3
+          resources:
+            requests:
+              cpu: 10m
+              memory: 24Mi
+            limits:
+              memory: 48Mi
+      volumes:
+        - name: kubelet-dir
+          hostPath:
+            path: /var/lib/kubelet
+            type: Directory
+        - name: volumes-farm
+          hostPath:
+            path: /var/lib/svidlet/volumes
+            type: DirectoryOrCreate
+        # The node token (§5.1): audience svidlet-broker, bound to this pod.
+        - name: broker-token
+          projected:
+            sources:
+              - serviceAccountToken:
+                  audience: svidlet-broker
+                  expirationSeconds: 3600
+                  path: token
+        # The trust domain's bundle; the broker's serving certificate chains
+        # to it.
+        - name: trust
+          configMap:
+            name: svidlet-trust-bundle

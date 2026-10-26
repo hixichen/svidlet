@@ -7,6 +7,8 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+base64.workspace = true
+basic-toml.workspace = true
 rcgen.workspace = true
 regex-lite.workspace = true
 serde.workspace = true

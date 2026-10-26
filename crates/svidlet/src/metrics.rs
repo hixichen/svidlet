@@ -512,11 +512,13 @@ mod tests {
                 name: "p".into(),
                 namespace: "a".into(),
                 uid: "u".into(),
+                service_account: "b".into(),
             },
             not_before: now - 100,
             not_after: now + 900,
             renew_at: now - 1,
             failures: 0,
+            pod_token: None,
         });
 
         let out = Metrics::default().render(&store);

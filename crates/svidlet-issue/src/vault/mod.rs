@@ -7,6 +7,7 @@
 
 pub mod auth;
 pub mod http;
+pub mod spiffe;
 
 use std::sync::Arc;
 
@@ -17,8 +18,9 @@ use crate::bundle::{assert_identity, IssuedBundle};
 use crate::error::{Error, Result};
 use crate::issuer::{Issuer, SignRequest};
 
-pub use auth::{AppRoleAuth, KubernetesAuth, StaticTokenAuth};
+pub use auth::{AppRoleAuth, JwtAuth, KubernetesAuth, StaticTokenAuth};
 pub use http::{VaultEndpoint, VaultHttp};
+pub use spiffe::{JwtMinter, VaultSpiffe};
 
 /// Where and how to sign.
 #[derive(Debug, Clone)]

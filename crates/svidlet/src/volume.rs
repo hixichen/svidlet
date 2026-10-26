@@ -10,6 +10,7 @@
 //! ```text
 //! ..data        -> ..svidlet.N/    tls.crt, tls.key, ca.crt   (written by svidlet)
 //! ..policy-data -> ..policy.N/     policy/, policy.revision   (written by svidlet-policy)
+//! ..jwt-data    -> ..jwt.N/        jwt/<alias>                (written by svidlet, broker mode)
 //! ```
 //!
 //! Each writer only ever creates its own versioned directories and renames its
@@ -28,7 +29,7 @@ use std::io;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 
-use crate::config::{CA_FILE, CERT_FILE, KEY_FILE, POLICY_DIR, REVISION_FILE};
+use crate::config::{CA_FILE, CERT_FILE, JWT_DIR, KEY_FILE, POLICY_DIR, REVISION_FILE};
 use crate::policy::PolicyBundle;
 
 /// The identity chain, written by svidlet.
@@ -38,6 +39,11 @@ const VERSION_PREFIX: &str = "..svidlet.";
 /// The policy chain, written by svidlet-policy.
 const POLICY_LINK: &str = "..policy-data";
 const POLICY_VERSION_PREFIX: &str = "..policy.";
+
+/// The token chain, written by svidlet when a broker supplies JWT-SVIDs.
+/// Separate from the identity chain so a token refresh never rewrites the key.
+const JWT_LINK: &str = "..jwt-data";
+const JWT_VERSION_PREFIX: &str = "..jwt.";
 
 /// The certificate and its key. One atomic swap.
 pub struct Identity {
@@ -141,6 +147,66 @@ pub fn publish_policy(target: &Path, bundle: &PolicyBundle, mode: u32) -> io::Re
     swap(target, POLICY_LINK, POLICY_VERSION_PREFIX, version)?;
     fsync_dir(target)?;
     remove_stale_versions(target, POLICY_VERSION_PREFIX, version)
+}
+
+/// Publish JWT-SVIDs as `jwt/<alias>`. Atomic, and independent of the other
+/// two chains: every token changes in the same instant, and an alias that is
+/// no longer approved disappears rather than lingering.
+///
+/// Tokens are bearer credentials, so they get the key's mode and group.
+pub fn publish_tokens(
+    target: &Path,
+    tokens: &std::collections::BTreeMap<String, String>,
+    modes: Modes,
+) -> io::Result<()> {
+    // Validate before creating anything, so a refused set leaves no orphan
+    // generation behind on the tmpfs.
+    if let Some(alias) = tokens
+        .keys()
+        .find(|a| a.is_empty() || a.contains('/') || a.starts_with('.'))
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{alias:?} is not a token alias"),
+        ));
+    }
+    let version = next_version(target, JWT_VERSION_PREFIX)?;
+    let dir = target.join(format!("{JWT_VERSION_PREFIX}{version}"));
+    fs::create_dir(&dir)?;
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o755))?;
+    let jwt = dir.join(JWT_DIR);
+    fs::create_dir(&jwt)?;
+    fs::set_permissions(&jwt, fs::Permissions::from_mode(0o755))?;
+    for (alias, token) in tokens {
+        let path = jwt.join(alias);
+        write_file(&path, token.as_bytes(), modes.key)?;
+        if let Some(gid) = modes.key_gid {
+            chgrp(&path, gid)?;
+        }
+    }
+    fsync_dir(&jwt)?;
+    fsync_dir(&dir)?;
+    link(target, JWT_DIR, &format!("{JWT_LINK}/{JWT_DIR}"))?;
+    swap(target, JWT_LINK, JWT_VERSION_PREFIX, version)?;
+    fsync_dir(target)?;
+    remove_stale_versions(target, JWT_VERSION_PREFIX, version)
+}
+
+/// The tokens currently published, by alias. Empty when none are.
+pub fn read_tokens(target: &Path) -> std::collections::BTreeMap<String, String> {
+    let mut out = std::collections::BTreeMap::new();
+    let Ok(generation) = fs::read_link(target.join(JWT_LINK)) else {
+        return out;
+    };
+    let dir = target.join(generation).join(JWT_DIR);
+    if let Ok(entries) = fs::read_dir(&dir) {
+        for entry in entries.flatten() {
+            if let Ok(token) = fs::read_to_string(entry.path()) {
+                out.insert(entry.file_name().to_string_lossy().into_owned(), token);
+            }
+        }
+    }
+    out
 }
 
 /// The revision currently published, if any. Lets the policy daemon skip a
@@ -846,5 +912,90 @@ mod tests {
         );
 
         fs::remove_dir_all(&dir).unwrap();
+    }
+
+    fn tokens(pairs: &[(&str, &str)]) -> std::collections::BTreeMap<String, String> {
+        pairs
+            .iter()
+            .map(|(a, t)| (a.to_string(), t.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn tokens_publish_as_one_swap_and_a_dropped_alias_disappears() {
+        let target = scratch("jwt");
+        publish_identity(&target, &identity("1"), MODES).unwrap();
+        assert!(read_tokens(&target).is_empty());
+
+        publish_tokens(
+            &target,
+            &tokens(&[("aws", "T-aws-1"), ("vault", "T-vault-1")]),
+            MODES,
+        )
+        .unwrap();
+        assert_eq!(
+            fs::read_to_string(target.join("jwt/aws")).unwrap(),
+            "T-aws-1"
+        );
+        assert_eq!(
+            read_tokens(&target),
+            tokens(&[("aws", "T-aws-1"), ("vault", "T-vault-1")])
+        );
+
+        publish_tokens(&target, &tokens(&[("vault", "T-vault-2")]), MODES).unwrap();
+        assert_eq!(read_tokens(&target), tokens(&[("vault", "T-vault-2")]));
+        assert!(
+            !target.join("jwt/aws").exists(),
+            "an alias no longer approved is gone"
+        );
+
+        // Tokens are bearer credentials: the key's mode, not the cert's.
+        let mode = fs::metadata(target.join("jwt/vault"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o640);
+        // And the identity chain is untouched by any of it.
+        assert_eq!(read_identity(&target).unwrap().cert_chain_pem, "CERT-1\n");
+        fs::remove_dir_all(&target).unwrap();
+    }
+
+    #[test]
+    fn a_token_refresh_never_disturbs_the_identity_or_policy_chains() {
+        let target = scratch("jwt-chains");
+        publish_identity(&target, &identity("1"), MODES).unwrap();
+        publish_policy(&target, &bundle("r1", &[("a.cel", "x")]), 0o644).unwrap();
+        for n in 0..4 {
+            publish_tokens(&target, &tokens(&[("vault", &format!("T{n}"))]), MODES).unwrap();
+        }
+        assert_eq!(read_identity(&target).unwrap().key_pem, "KEY-1\n");
+        assert_eq!(published_revision(&target).as_deref(), Some("r1"));
+        // Superseded token generations are collected like the others.
+        let generations = fs::read_dir(&target)
+            .unwrap()
+            .flatten()
+            .filter(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .starts_with(JWT_VERSION_PREFIX)
+            })
+            .count();
+        assert!(generations <= 2, "{generations} token generations kept");
+        fs::remove_dir_all(&target).unwrap();
+    }
+
+    #[test]
+    fn a_token_alias_cannot_escape_the_jwt_directory() {
+        let target = scratch("jwt-alias");
+        for bad in ["../tls.key", "a/b", ".hidden", ""] {
+            let err =
+                publish_tokens(&target, &tokens(&[("ok", "T"), (bad, "T")]), MODES).unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::InvalidInput, "{bad:?}");
+        }
+        assert!(read_tokens(&target).is_empty());
+        // Refused before anything was created: no orphan generations.
+        assert_eq!(fs::read_dir(&target).unwrap().count(), 0);
+        let _ = fs::remove_dir_all(&target);
     }
 }

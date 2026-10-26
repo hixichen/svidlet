@@ -19,6 +19,9 @@ pub mod volume_context {
     pub const POD_UID: &str = "csi.storage.k8s.io/pod.uid";
     pub const SERVICE_ACCOUNT: &str = "csi.storage.k8s.io/serviceAccount.name";
     pub const EPHEMERAL: &str = "csi.storage.k8s.io/ephemeral";
+    /// JSON map of audience → `{token, expirationTimestamp}`, present when the
+    /// CSIDriver object declares `tokenRequests`.
+    pub const SERVICE_ACCOUNT_TOKENS: &str = "csi.storage.k8s.io/serviceAccount.tokens";
 }
 
 pub const CERT_FILE: &str = "tls.crt";
@@ -29,6 +32,8 @@ pub const CA_FILE: &str = "ca.crt";
 pub const REVISION_FILE: &str = "policy.revision";
 /// Directory inside the volume holding policy documents.
 pub const POLICY_DIR: &str = "policy";
+/// Directory of JWT-SVIDs, one file per audience alias.
+pub const JWT_DIR: &str = "jwt";
 
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -59,7 +64,12 @@ pub struct Config {
     /// Optional regex every issued ID must match, on top of the template.
     pub spiffe_id_pattern: Option<String>,
 
+    /// Vault settings. Only read when `broker` is `None`: a node behind a
+    /// broker holds no Vault credential at all.
     pub vault: VaultSettings,
+    /// `Some` when certificates and tokens come from `svidlet-broker`
+    /// (`SVIDLET_ISSUER=broker`).
+    pub broker: Option<BrokerSettings>,
     /// What the CSI path still needs to know about policy, now that
     /// distribution lives in a separate process.
     pub policy: PolicyGate,
@@ -100,6 +110,27 @@ pub struct Config {
     /// `host:port` for the Prometheus endpoint; empty disables it.
     pub metrics_addr: String,
     pub log_level: Level,
+}
+
+/// How this node reaches `svidlet-broker`. See docs/DESIGN.md §5 and §6.
+#[derive(Debug, Clone)]
+pub struct BrokerSettings {
+    /// Certificate port, e.g. `https://svidlet-broker.svidlet-system.svc:8443`.
+    pub sign_url: String,
+    /// Token port, e.g. `https://svidlet-broker.svidlet-system.svc:8444`.
+    pub token_url: String,
+    /// PEM bundle that signed the broker's serving certificate.
+    pub ca_cert_path: PathBuf,
+    /// This node's projected token, audience `svidlet-broker`.
+    pub node_token_path: PathBuf,
+    /// The audience of the pod token the kubelet mints for this driver; the
+    /// key under which it appears in the volume context.
+    pub pod_token_audience: String,
+    pub timeout: Duration,
+    /// Whether to fetch JWT-SVIDs into `jwt/`.
+    pub jwt_enabled: bool,
+    /// How often every volume checks in for tokens (§6.2: 15 minutes).
+    pub jwt_refresh_interval: Duration,
 }
 
 /// Whether a pod may start before its policy has arrived.
@@ -379,6 +410,13 @@ impl Config {
             .unwrap_or_else(|| IdTemplate::DEFAULT.to_string());
         let spiffe_id_pattern = env.opt("SVIDLET_SPIFFE_ID_PATTERN");
 
+        let issuer = env.opt("SVIDLET_ISSUER").unwrap_or_else(|| "vault".into());
+        if issuer != "vault" && issuer != "broker" {
+            return Err(ConfigError(format!(
+                "SVIDLET_ISSUER must be vault or broker; got {issuer:?}"
+            )));
+        }
+
         let cfg = Config {
             driver_name,
             node_name: env.req("NODE_NAME")?,
@@ -397,7 +435,14 @@ impl Config {
             ),
             spiffe_id_template,
             spiffe_id_pattern,
-            vault: vault_settings(&env, &cluster)?,
+            vault: match issuer.as_str() {
+                "vault" => vault_settings(&env, &cluster)?,
+                _ => VaultSettings::unused(),
+            },
+            broker: match issuer.as_str() {
+                "broker" => Some(broker_settings(&env)?),
+                _ => None,
+            },
             policy_gid: match env.opt("SVIDLET_POLICY_GID") {
                 None => None,
                 Some(v) => Some(v.parse::<u32>().map_err(|_| {
@@ -511,6 +556,50 @@ fn bundle_settings(env: &Env<'_>) -> Result<Option<BundleSettings>> {
         max_bytes: env.count("SVIDLET_BUNDLE_MAX_BYTES", 1024 * 1024)?,
         full_fetch_every: env.count("SVIDLET_BUNDLE_FULL_FETCH_EVERY", 60)?,
     }))
+}
+
+fn broker_settings(env: &Env<'_>) -> Result<BrokerSettings> {
+    let base = "https://svidlet-broker.svidlet-system.svc";
+    Ok(BrokerSettings {
+        sign_url: env
+            .opt("SVIDLET_BROKER_URL")
+            .unwrap_or_else(|| format!("{base}:8443")),
+        token_url: env
+            .opt("SVIDLET_BROKER_TOKEN_URL")
+            .unwrap_or_else(|| format!("{base}:8444")),
+        ca_cert_path: PathBuf::from(
+            env.opt("SVIDLET_BROKER_CACERT")
+                .unwrap_or_else(|| "/etc/svidlet/broker/ca.crt".into()),
+        ),
+        node_token_path: PathBuf::from(
+            env.opt("SVIDLET_BROKER_TOKEN_FILE")
+                .unwrap_or_else(|| "/var/run/secrets/svidlet/broker/token".into()),
+        ),
+        pod_token_audience: env
+            .opt("SVIDLET_BROKER_AUDIENCE")
+            .unwrap_or_else(|| "svidlet-broker".into()),
+        timeout: env.duration("SVIDLET_BROKER_TIMEOUT", Duration::from_secs(10))?,
+        jwt_enabled: env.bool("SVIDLET_JWT_ENABLED", true)?,
+        jwt_refresh_interval: env
+            .duration("SVIDLET_JWT_REFRESH_INTERVAL", Duration::from_secs(900))?,
+    })
+}
+
+impl VaultSettings {
+    /// Placeholder for a node that talks to a broker instead of Vault.
+    pub fn unused() -> VaultSettings {
+        VaultSettings {
+            address: String::new(),
+            namespace: None,
+            ca_cert_path: None,
+            timeout: Duration::from_secs(10),
+            pki_mount: String::new(),
+            pki_role: String::new(),
+            auth: AuthSettings::Token {
+                path: PathBuf::new(),
+            },
+        }
+    }
 }
 
 fn vault_settings(env: &Env<'_>, cluster: &str) -> Result<VaultSettings> {
@@ -1151,5 +1240,46 @@ mod tests {
             Some(PathBuf::from("/etc/ssl/vault.pem"))
         );
         assert_eq!(cfg.vault.pki_role, "custom-role");
+    }
+
+    #[test]
+    fn broker_mode_needs_no_vault_settings_at_all() {
+        let mut vars = HashMap::from([
+            ("NODE_NAME".to_string(), "node-1".to_string()),
+            ("SVIDLET_CLUSTER".to_string(), "gpu-a".to_string()),
+            (
+                "SVIDLET_TRUST_DOMAIN".to_string(),
+                "corp.internal".to_string(),
+            ),
+            ("SVIDLET_ISSUER".to_string(), "broker".to_string()),
+        ]);
+        let cfg = load(vars.clone()).unwrap();
+        let b = cfg.broker.expect("broker settings");
+        assert_eq!(b.sign_url, "https://svidlet-broker.svidlet-system.svc:8443");
+        assert_eq!(
+            b.token_url,
+            "https://svidlet-broker.svidlet-system.svc:8444"
+        );
+        assert_eq!(b.pod_token_audience, "svidlet-broker");
+        assert_eq!(b.jwt_refresh_interval, Duration::from_secs(900));
+        assert!(b.jwt_enabled);
+        assert!(cfg.vault.address.is_empty(), "no Vault address is read");
+
+        vars.insert("SVIDLET_JWT_ENABLED".into(), "false".into());
+        vars.insert("SVIDLET_JWT_REFRESH_INTERVAL".into(), "5m".into());
+        vars.insert("SVIDLET_BROKER_URL".into(), "https://b:1".into());
+        let b = load(vars).unwrap().broker.unwrap();
+        assert!(!b.jwt_enabled);
+        assert_eq!(b.jwt_refresh_interval, Duration::from_secs(300));
+        assert_eq!(b.sign_url, "https://b:1");
+    }
+
+    #[test]
+    fn vault_mode_is_still_the_default_and_unknown_issuers_are_refused() {
+        let cfg = load(base()).unwrap();
+        assert!(cfg.broker.is_none());
+        assert_eq!(cfg.vault.address, "https://vault.example:8200");
+        let err = with(&[("SVIDLET_ISSUER", "spire")]).unwrap_err();
+        assert!(err.0.contains("SVIDLET_ISSUER"), "{err}");
     }
 }

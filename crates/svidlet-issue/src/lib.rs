@@ -23,20 +23,25 @@
 #![forbid(unsafe_code)]
 
 pub mod auth;
+pub mod broker;
 pub mod bundle;
+pub mod catalog;
 pub mod error;
 pub mod issuer;
+pub mod jwt;
 pub mod key;
 pub mod template;
 pub mod vault;
 
 pub use auth::{Token, TokenCache, TokenSource};
-pub use bundle::{assert_identity, inspect, CertFacts, IssuedBundle};
+pub use broker::{BrokerClient, BrokerEndpoint, TokenGrant};
+pub use bundle::{assert_identity, inspect, leaf_public_key, CertFacts, IssuedBundle};
+pub use catalog::Catalog;
 pub use error::{Error, ErrorCode, Result};
-pub use issuer::{Issuer, SignRequest};
+pub use issuer::{Issuer, PodContext, SignRequest};
 pub use key::{generate, KeyAndCsr};
 pub use template::{Field, IdPolicy, IdTemplate, SpiffeId, WorkloadAttributes};
 pub use vault::{
-    AppRoleAuth, KubernetesAuth, StaticTokenAuth, VaultEndpoint, VaultHttp, VaultIssuer,
-    VaultPkiConfig,
+    AppRoleAuth, JwtAuth, JwtMinter, KubernetesAuth, StaticTokenAuth, VaultEndpoint, VaultHttp,
+    VaultIssuer, VaultPkiConfig, VaultSpiffe,
 };

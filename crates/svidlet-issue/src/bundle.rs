@@ -80,6 +80,19 @@ pub fn assert_identity(cert_chain_pem: &str, expected: &SpiffeId) -> Result<Cert
     Ok(facts)
 }
 
+/// The leaf's raw public key, to compare against the key the node generated.
+///
+/// A backend that signs a certificate for some other key — a broker bug, or a
+/// broker replaying a certificate from another request — is caught here,
+/// before the workload holds a certificate its key cannot use.
+pub fn leaf_public_key(cert_chain_pem: &str) -> Result<Vec<u8>> {
+    let (_, pem) = parse_x509_pem(cert_chain_pem.as_bytes())
+        .map_err(|e| Error::Certificate(format!("not a PEM certificate: {e}")))?;
+    let (_, cert) = X509Certificate::from_der(&pem.contents)
+        .map_err(|e| Error::Certificate(format!("not a DER certificate: {e}")))?;
+    Ok(cert.public_key().subject_public_key.data.to_vec())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
