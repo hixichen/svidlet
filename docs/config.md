@@ -71,6 +71,20 @@ Everything that varies between clusters is an environment variable, so one image
 | `SVIDLET_POLICY_INITIAL_TIMEOUT` | `10s` | How long that wait lasts. |
 | `SVIDLET_POLICY_GID` | *(none)* | The group that may write the policy chain into a published volume — set it to the `svidlet-policy` container's `runAsGroup`. Setting it is what switches on the exposure farm and the group-writable tmpfs root. Must differ from `SVIDLET_KEY_GID`. |
 
+### Issuer: Vault directly, or the broker (v0.2)
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `SVIDLET_ISSUER` | `vault` | `vault`: sign directly against Vault with the variables below (v0.1). `broker`: certificates and tokens come from `svidlet-broker` and the node holds no Vault credential ([DESIGN.md](DESIGN.md) §5–§6). The Vault variables are then not read. |
+| `SVIDLET_BROKER_URL` | `https://svidlet-broker.svidlet-system.svc:8443` | Certificate port. |
+| `SVIDLET_BROKER_TOKEN_URL` | `https://svidlet-broker.svidlet-system.svc:8444` | Token port (mTLS with each pod's own SVID). |
+| `SVIDLET_BROKER_CACERT` | `/etc/svidlet/broker/ca.crt` | Bundle that signed the broker's serving certificate. |
+| `SVIDLET_BROKER_TOKEN_FILE` | `/var/run/secrets/svidlet/broker/token` | The node's own projected token, audience `svidlet-broker`; re-read on every request. |
+| `SVIDLET_BROKER_AUDIENCE` | `svidlet-broker` | Audience of the pod token in the CSIDriver's `tokenRequests`. |
+| `SVIDLET_BROKER_TIMEOUT` | `10s` | Per-request timeout. |
+| `SVIDLET_JWT_ENABLED` | `true` | Fetch JWT-SVIDs into `jwt/<alias>`. |
+| `SVIDLET_JWT_REFRESH_INTERVAL` | `15m` | How often each volume checks in for tokens. The broker answers from cache, so this is cheap; it bounds how long an emergency key rotation takes to reach pods. |
+
 ### Vault — the PKI backend
 
 | Variable | Default | Meaning |
@@ -140,6 +154,45 @@ Setting `SVIDLET_BUNDLE_ROLLOUT_REF` switches this source on, and a trusted key 
 | `SVIDLET_POLICY_FILE_MODE` | `0644` | Mode for policy documents. They are not secret. |
 | `SVIDLET_POLICY_METRICS_ADDR` | `0.0.0.0:9465` | The daemon's own Prometheus endpoint. |
 | `SVIDLET_METRICS_ADDR` | `0.0.0.0:9464` | The plugin's Prometheus endpoint. |
+
+## `svidlet-broker` — the per-cluster broker (v0.2)
+
+Runs as a Deployment, not on workload nodes. See [DESIGN.md](DESIGN.md) §5–§7 for the rules it enforces.
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `SVIDLET_CLUSTER` | *(required)* | I2: the cluster this broker serves. Never taken from a request. |
+| `SVIDLET_TRUST_DOMAIN` | *(required)* | |
+| `SVIDLET_SPIFFE_ID_TEMPLATE` / `SVIDLET_SPIFFE_ID_PATTERN` | as for the node | I7. Must render what the node expects; a mismatch is refused. |
+| `SVIDLET_BROKER_SIGN_ADDR` | `0.0.0.0:8443` | Certificate port. |
+| `SVIDLET_BROKER_TOKEN_ADDR` | `0.0.0.0:8444` | Token port, client certificates required. |
+| `SVIDLET_BROKER_METRICS_ADDR` | `0.0.0.0:9466` | `/metrics` and `/healthz`, plain HTTP. Empty disables. |
+| `SVIDLET_BROKER_TLS_CERT` / `_KEY` | `/etc/svidlet/tls/tls.{crt,key}` | Serving certificate, re-read every 30 s. |
+| `SVIDLET_BROKER_CLIENT_CA` | `/etc/svidlet/trust/ca.crt` | T1: the bundle a caller's SVID must chain to. Read at start-up. |
+| `SVIDLET_BROKER_BUNDLE` | the client CA | Served at `GET /v1/bundle` and returned as `ca.crt`. |
+| `SVIDLET_CATALOG` | `/etc/svidlet/catalog/catalog.toml` | The catalog (§12). Reloaded every 30 s; an invalid new version is ignored and logged. |
+| `SVIDLET_BROKER_AUDIENCE` | `svidlet-broker` | Audience required of node and pod tokens. |
+| `SVIDLET_NODE_NAMESPACE` / `SVIDLET_NODE_SERVICE_ACCOUNT` / `SVIDLET_NODE_DAEMONSET` | `svidlet-system` / `svidlet-node` / `svidlet-node` | Who may call as a node. |
+| `SVIDLET_DENIED_NAMESPACES` | `kube-system,kube-public,kube-node-lease,svidlet-system` | I8. |
+| `SVIDLET_CERT_TTL` / `SVIDLET_CERT_MAX_TTL` | `48h` / `48h` | I11. |
+| `SVIDLET_NODE_RATE_PER_MINUTE` | `120` | I10: certificates per node per minute. `0` disables. |
+| `SVIDLET_NODE_IDENTITIES_PER_HOUR` | `500` | I10: distinct identities per node per hour. Renewals of an identity already counted are always allowed. |
+| `SVIDLET_MINT_RATE_PER_MINUTE` | `60` | T7: Vault mints per identity per minute. |
+| `SVIDLET_JWKS_URL` | *(Vault's own)* | T5/T6: the public JWKS relying parties fetch. Set it, so "published" means what relying parties see. |
+| `SVIDLET_JWKS_REFRESH` | `60s` | |
+| `VAULT_ADDR`, `VAULT_NAMESPACE`, `VAULT_CACERT`, `SVIDLET_VAULT_TIMEOUT` | | As for the node. |
+| `SVIDLET_PKI_MOUNT` / `SVIDLET_PKI_ROLE` | `pki_int` / `spiffe-<cluster>` | |
+| `SVIDLET_SPIFFE_MOUNT` | `spiffe` | Vault's SPIFFE secrets engine. |
+| `SVIDLET_BROKER_VAULT_AUTH` | `jwt` | `jwt` (B1), `approle` (B2) or `token` (development). |
+| `SVIDLET_BROKER_VAULT_JWT_MOUNT` / `_ROLE` / `SVIDLET_BROKER_VAULT_TOKEN_FILE` | `k8s-<cluster>` / `svidlet-broker` / `/var/run/secrets/svidlet/vault/token` | B1. |
+| `SVIDLET_BROKER_ROLE_ID` / `SVIDLET_BROKER_SECRET_ID_FILE` / `SVIDLET_BROKER_APPROLE_MOUNT` | — / `/etc/svidlet/vault/secret-id` / `approle` | B2. |
+| `SVIDLET_KUBE_API`, `SVIDLET_KUBE_CACERT`, `SVIDLET_KUBE_TOKEN_FILE`, `SVIDLET_KUBE_TIMEOUT` | in-cluster defaults, `5s` | |
+
+## `oidc-publisher` and `svidlet-catalog`
+
+`oidc-publisher` (§8) reads `VAULT_ADDR`, `VAULT_CACERT`, `VAULT_NAMESPACE`, `SVIDLET_SPIFFE_MOUNT`, `OIDC_ISSUER` (e.g. `https://oidc.corp.example/v1/spiffe`), `OIDC_OUT_DIR` and `OIDC_INTERVAL` (`60s`; `0` runs once). It writes `<OIDC_OUT_DIR>/<issuer path>/.well-known/{openid-configuration,keys}` only after checking the issuer and every key; a sidecar syncs the directory to the bucket with `Cache-Control: max-age=300`.
+
+`svidlet-catalog lint|policy|roles <catalog.toml> [cluster]` lints the catalog and prints the per-cluster Vault policy (§7.3) and the `vault write spiffe/role/…` commands (§7.2).
 
 ## Logging (both processes)
 

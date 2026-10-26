@@ -16,6 +16,9 @@ pub struct KeyAndCsr {
     pub key_pem: String,
     /// PKCS#10 PEM, as Vault's `pki/sign` endpoint expects it.
     pub csr_pem: String,
+    /// The raw public key (the SubjectPublicKeyInfo's bit string), to check
+    /// that a signed certificate is for this key and not some other.
+    pub public_key: Vec<u8>,
 }
 
 /// Generate a P-256 key and a CSR whose only subject alternative name is the
@@ -40,6 +43,7 @@ pub fn generate(spiffe_id: &SpiffeId) -> Result<KeyAndCsr> {
         .map_err(|e| Error::Crypto(format!("CSR construction failed: {e}")))?;
 
     Ok(KeyAndCsr {
+        public_key: key_pair.public_key_raw().to_vec(),
         key_pem: key_pair.serialize_pem(),
         csr_pem: csr
             .pem()

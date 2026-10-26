@@ -5,6 +5,9 @@
 //! Only the PKI backend is local — a `TestCa` that parses the CSR svidlet
 //! produced and signs it the way Vault would.
 
+mod common;
+use common::remove_tree;
+
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -190,6 +193,7 @@ fn config_with_gids(
                 path: PathBuf::from("/dev/null"),
             },
         },
+        broker: None,
         policy,
         policy_gid,
         cert_ttl: std::time::Duration::from_secs(3600),
@@ -351,7 +355,7 @@ async fn publish_issues_a_certificate_for_the_kubelet_supplied_identity() {
         "renewal at {offset}s into a {lifetime}s lifetime"
     );
 
-    std::fs::remove_dir_all(&fx.root).unwrap();
+    remove_tree(&fx.root);
 }
 
 #[tokio::test]
@@ -379,7 +383,7 @@ async fn republishing_the_same_volume_does_not_mint_a_second_certificate() {
     );
     assert_eq!(fx.store.len(), 1);
 
-    std::fs::remove_dir_all(&fx.root).unwrap();
+    remove_tree(&fx.root);
 }
 
 #[tokio::test]
@@ -423,7 +427,7 @@ async fn identity_must_come_from_the_kubelet() {
     assert_eq!(err.code(), tonic::Code::InvalidArgument);
 
     assert!(fx.ca.signed_ids().is_empty());
-    std::fs::remove_dir_all(&fx.root).unwrap();
+    remove_tree(&fx.root);
 }
 
 #[tokio::test]
@@ -465,7 +469,7 @@ async fn renewal_replaces_the_certificate_in_place() {
     assert!(renewed.renew_at > svidlet::log::unix_now());
     assert_eq!(renewed.failures, 0);
 
-    std::fs::remove_dir_all(&fx.root).unwrap();
+    remove_tree(&fx.root);
 }
 
 #[tokio::test]
@@ -492,7 +496,7 @@ async fn a_failed_renewal_keeps_the_existing_certificate() {
     assert!(after.renew_at > svidlet::log::unix_now());
     assert_eq!(after.not_after, entry.not_after);
 
-    std::fs::remove_dir_all(&fx.root).unwrap();
+    remove_tree(&fx.root);
 }
 
 #[tokio::test]
@@ -541,7 +545,7 @@ async fn restart_recovery_adopts_without_re_issuing() {
     assert_eq!(recovered.not_after, original.not_after);
     assert_eq!(recovered.volume_id, "csi-abcdef");
 
-    std::fs::remove_dir_all(&fx.root).unwrap();
+    remove_tree(&fx.root);
 }
 
 #[tokio::test]
@@ -586,7 +590,7 @@ async fn recovery_spreads_certificates_that_are_already_due() {
         "renewal pushed beyond the startup spread window"
     );
 
-    std::fs::remove_dir_all(&fx.root).unwrap();
+    remove_tree(&fx.root);
 }
 
 #[tokio::test]
@@ -624,7 +628,7 @@ async fn a_changed_trust_bundle_reaches_running_pods() {
     // A second refresh with an unchanged bundle rewrites nothing.
     assert_eq!(publisher.refresh_ca().unwrap(), 0);
 
-    std::fs::remove_dir_all(&fx.root).unwrap();
+    remove_tree(&fx.root);
 }
 
 #[tokio::test]
@@ -651,7 +655,7 @@ async fn unpublish_removes_the_volume_and_stops_renewal() {
     // The kubelet retries until it gets an OK, so this must be idempotent.
     fx.node.node_unpublish_volume(request()).await.unwrap();
 
-    std::fs::remove_dir_all(&fx.root).unwrap();
+    remove_tree(&fx.root);
 }
 
 /// With a policy group configured, publishing a volume also exposes it in the
@@ -672,10 +676,15 @@ async fn a_policy_group_exposes_the_volume_to_the_daemon_through_the_farm() {
     // The farm entry appears, and it is the same volume: the certificate the
     // daemon would read to learn the volume's identity resolves there.
     assert!(farm.exists(), "the farm entry appears on publish");
-    assert_eq!(
-        std::fs::canonicalize(farm.join(CERT_FILE)).unwrap(),
-        std::fs::canonicalize(target.join(CERT_FILE)).unwrap()
-    );
+    // Compared by inode: a bind mount (Linux, as root) and a symlink
+    // (elsewhere) both resolve to the same file, but only the symlink also
+    // canonicalises to the same path.
+    {
+        use std::os::unix::fs::MetadataExt;
+        let a = std::fs::metadata(farm.join(CERT_FILE)).unwrap();
+        let b = std::fs::metadata(target.join(CERT_FILE)).unwrap();
+        assert_eq!((a.dev(), a.ino()), (b.dev(), b.ino()));
+    }
     // The daemon reads the certificate but never the key; the entry gives it
     // no more than the volume's own permissions do.
     assert_eq!(
@@ -694,7 +703,7 @@ async fn a_policy_group_exposes_the_volume_to_the_daemon_through_the_farm() {
     assert!(!farm.exists(), "the farm entry disappears on unpublish");
     assert!(!target.exists());
 
-    std::fs::remove_dir_all(&fx.root).unwrap();
+    remove_tree(&fx.root);
 }
 
 /// Without a policy group there is no farm: the daemon is not expected to
@@ -710,7 +719,7 @@ async fn without_a_policy_group_no_farm_entry_is_created() {
 
     assert!(!fx.root.join("volumes-farm").exists());
 
-    std::fs::remove_dir_all(&fx.root).unwrap();
+    remove_tree(&fx.root);
 }
 
 // ------------------------------------------------------ customisable identity
@@ -735,7 +744,7 @@ async fn a_custom_template_changes_the_shape_of_the_identity() {
         published_spiffe_id(&target),
         "spiffe://example.org/ns/payments/sa/api"
     );
-    std::fs::remove_dir_all(&fx.root).unwrap();
+    remove_tree(&fx.root);
 }
 
 #[tokio::test]
@@ -757,7 +766,7 @@ async fn a_template_can_pin_the_identity_to_the_node_and_pod() {
         published_spiffe_id(&target),
         "spiffe://example.org/node/node-1/ns/payments/pod/web-0"
     );
-    std::fs::remove_dir_all(&fx.root).unwrap();
+    remove_tree(&fx.root);
 }
 
 #[tokio::test]
@@ -784,7 +793,7 @@ async fn a_template_needing_a_field_the_kubelet_did_not_send_fails_loudly() {
     assert!(err.message().contains("podInfoOnMount"));
     assert!(fx.ca.signed_ids().is_empty());
 
-    std::fs::remove_dir_all(&fx.root).unwrap();
+    remove_tree(&fx.root);
 }
 
 #[tokio::test]
@@ -823,7 +832,7 @@ async fn an_id_pattern_refuses_identities_the_operator_disallows() {
     assert_eq!(fx.ca.signed_ids().len(), 1);
     assert!(!denied.exists(), "a refused volume leaves nothing behind");
 
-    std::fs::remove_dir_all(&fx.root).unwrap();
+    remove_tree(&fx.root);
 }
 
 #[tokio::test]
@@ -865,7 +874,7 @@ async fn recovery_ignores_certificates_the_current_template_would_not_issue() {
         "the skip is counted so an operator can see the re-issue coming"
     );
 
-    std::fs::remove_dir_all(&fx.root).unwrap();
+    remove_tree(&fx.root);
 }
 
 // ------------------------------------------------- the policy gate, if enabled
@@ -891,7 +900,7 @@ async fn policy_required_refuses_to_publish_when_the_daemon_writes_nothing() {
     assert!(!target.exists());
     assert_eq!(fx.store.len(), 0);
 
-    std::fs::remove_dir_all(&fx.root).unwrap();
+    remove_tree(&fx.root);
 }
 
 #[tokio::test]
@@ -936,7 +945,7 @@ async fn policy_required_succeeds_once_the_daemon_publishes() {
         "spiffe://example.org/cluster/a/ns/payments/sa/api"
     );
 
-    std::fs::remove_dir_all(&fx.root).unwrap();
+    remove_tree(&fx.root);
 }
 
 #[tokio::test]
@@ -975,5 +984,5 @@ async fn a_certificate_renewal_never_disturbs_the_policy_chain() {
     );
     assert_eq!(fx.ca.signed_ids().len(), 4);
 
-    std::fs::remove_dir_all(&fx.root).unwrap();
+    remove_tree(&fx.root);
 }

@@ -222,6 +222,7 @@ fn sign(issuer: &dyn Issuer) -> svidlet_issue::Result<svidlet_issue::IssuedBundl
         csr_pem: &generated.csr_pem,
         ttl: Duration::from_secs(3600),
         node_name: "node-1",
+        pod: None,
     })
 }
 

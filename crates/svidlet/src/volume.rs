@@ -10,6 +10,7 @@
 //! ```text
 //! ..data        -> ..svidlet.N/    tls.crt, tls.key, ca.crt   (written by svidlet)
 //! ..policy-data -> ..policy.N/     policy/, policy.revision   (written by svidlet-policy)
+//! ..jwt-data    -> ..jwt.N/        jwt/<alias>                (written by svidlet, broker mode)
 //! ```
 //!
 //! Each writer only ever creates its own versioned directories and renames its
@@ -28,7 +29,7 @@ use std::io;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 
-use crate::config::{CA_FILE, CERT_FILE, KEY_FILE, POLICY_DIR, REVISION_FILE};
+use crate::config::{CA_FILE, CERT_FILE, JWT_DIR, KEY_FILE, POLICY_DIR, REVISION_FILE};
 use crate::policy::PolicyBundle;
 
 /// The identity chain, written by svidlet.
@@ -38,6 +39,11 @@ const VERSION_PREFIX: &str = "..svidlet.";
 /// The policy chain, written by svidlet-policy.
 const POLICY_LINK: &str = "..policy-data";
 const POLICY_VERSION_PREFIX: &str = "..policy.";
+
+/// The token chain, written by svidlet when a broker supplies JWT-SVIDs.
+/// Separate from the identity chain so a token refresh never rewrites the key.
+const JWT_LINK: &str = "..jwt-data";
+const JWT_VERSION_PREFIX: &str = "..jwt.";
 
 /// The certificate and its key. One atomic swap.
 pub struct Identity {
@@ -141,6 +147,61 @@ pub fn publish_policy(target: &Path, bundle: &PolicyBundle, mode: u32) -> io::Re
     swap(target, POLICY_LINK, POLICY_VERSION_PREFIX, version)?;
     fsync_dir(target)?;
     remove_stale_versions(target, POLICY_VERSION_PREFIX, version)
+}
+
+/// Publish JWT-SVIDs as `jwt/<alias>`. Atomic, and independent of the other
+/// two chains: every token changes in the same instant, and an alias that is
+/// no longer approved disappears rather than lingering.
+///
+/// Tokens are bearer credentials, so they get the key's mode and group.
+pub fn publish_tokens(
+    target: &Path,
+    tokens: &std::collections::BTreeMap<String, String>,
+    modes: Modes,
+) -> io::Result<()> {
+    let version = next_version(target, JWT_VERSION_PREFIX)?;
+    let dir = target.join(format!("{JWT_VERSION_PREFIX}{version}"));
+    fs::create_dir(&dir)?;
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o755))?;
+    let jwt = dir.join(JWT_DIR);
+    fs::create_dir(&jwt)?;
+    fs::set_permissions(&jwt, fs::Permissions::from_mode(0o755))?;
+    for (alias, token) in tokens {
+        if alias.is_empty() || alias.contains('/') || alias.starts_with('.') {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("{alias:?} is not a token alias"),
+            ));
+        }
+        let path = jwt.join(alias);
+        write_file(&path, token.as_bytes(), modes.key)?;
+        if let Some(gid) = modes.key_gid {
+            chgrp(&path, gid)?;
+        }
+    }
+    fsync_dir(&jwt)?;
+    fsync_dir(&dir)?;
+    link(target, JWT_DIR, &format!("{JWT_LINK}/{JWT_DIR}"))?;
+    swap(target, JWT_LINK, JWT_VERSION_PREFIX, version)?;
+    fsync_dir(target)?;
+    remove_stale_versions(target, JWT_VERSION_PREFIX, version)
+}
+
+/// The tokens currently published, by alias. Empty when none are.
+pub fn read_tokens(target: &Path) -> std::collections::BTreeMap<String, String> {
+    let mut out = std::collections::BTreeMap::new();
+    let Ok(generation) = fs::read_link(target.join(JWT_LINK)) else {
+        return out;
+    };
+    let dir = target.join(generation).join(JWT_DIR);
+    if let Ok(entries) = fs::read_dir(&dir) {
+        for entry in entries.flatten() {
+            if let Ok(token) = fs::read_to_string(entry.path()) {
+                out.insert(entry.file_name().to_string_lossy().into_owned(), token);
+            }
+        }
+    }
+    out
 }
 
 /// The revision currently published, if any. Lets the policy daemon skip a
@@ -254,6 +315,7 @@ pub fn unexpose(farm_root: &Path, name: &str) -> io::Result<()> {
 }
 
 #[cfg(target_os = "linux")]
+#[allow(unsafe_code)]
 fn expose_at(point: &Path, target: &Path) -> io::Result<()> {
     if point.exists() && is_mount_point(point)? {
         return Ok(());
@@ -429,7 +491,12 @@ fn remove_stale_versions(target: &Path, prefix: &str, keep: u64) -> io::Result<(
     Ok(())
 }
 
-/// True when `path` sits on a different filesystem from its parent.
+/// True when `path` sits on a different filesystem from its parent, or is
+/// listed as a mount point in `/proc/self/mountinfo`.
+///
+/// The device comparison alone misses a bind mount whose source lives on the
+/// same filesystem as its mount point — the farm's bind mounts whenever the
+/// volume is not a tmpfs, as in tests run as root.
 fn is_mount_point(path: &Path) -> io::Result<bool> {
     use std::os::unix::fs::MetadataExt;
     let here = fs::metadata(path)?;
@@ -437,7 +504,50 @@ fn is_mount_point(path: &Path) -> io::Result<bool> {
         Some(p) => fs::metadata(p)?,
         None => return Ok(true),
     };
-    Ok(here.dev() != parent.dev())
+    if here.dev() != parent.dev() {
+        return Ok(true);
+    }
+    Ok(listed_in_mountinfo(path))
+}
+
+#[cfg(target_os = "linux")]
+fn listed_in_mountinfo(path: &Path) -> bool {
+    let Ok(canonical) = fs::canonicalize(path) else {
+        return false;
+    };
+    let Ok(table) = fs::read_to_string("/proc/self/mountinfo") else {
+        return false;
+    };
+    let wanted = canonical.to_string_lossy();
+    // Field 5 is the mount point, with spaces and the like octal-escaped.
+    table
+        .lines()
+        .filter_map(|line| line.split(' ').nth(4))
+        .any(|point| unescape_mountinfo(point) == wanted)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn listed_in_mountinfo(_path: &Path) -> bool {
+    false
+}
+
+#[cfg(target_os = "linux")]
+fn unescape_mountinfo(field: &str) -> String {
+    let bytes = field.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'\\' && i + 4 <= bytes.len() {
+            if let Ok(v) = u8::from_str_radix(&field[i + 1..i + 4], 8) {
+                out.push(v);
+                i += 4;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 #[cfg(target_os = "linux")]

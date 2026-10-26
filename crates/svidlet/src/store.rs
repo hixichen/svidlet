@@ -15,6 +15,18 @@ pub struct PodRef {
     pub name: String,
     pub namespace: String,
     pub uid: String,
+    pub service_account: String,
+}
+
+/// The pod-bound token the kubelet hands the CSI driver on every
+/// (re)publish. Kept in memory only, and never printed.
+#[derive(Clone, PartialEq, Eq)]
+pub struct PodToken(pub String);
+
+impl std::fmt::Debug for PodToken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("PodToken(<redacted>)")
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -29,6 +41,9 @@ pub struct Entry {
     pub renew_at: i64,
     /// Consecutive renewal failures; drives the backoff.
     pub failures: u32,
+    /// The latest pod token from the kubelet. `None` after a restart until
+    /// the next republish; only a broker needs it.
+    pub pod_token: Option<PodToken>,
 }
 
 impl Entry {
@@ -66,6 +81,15 @@ impl Store {
 
     pub fn remove(&self, target_path: &Path) -> Option<Entry> {
         self.lock().remove(target_path)
+    }
+
+    /// Replace the cached pod token. A republish does nothing else (§5.2).
+    pub fn set_pod_token(&self, target_path: &Path, token: Option<PodToken>) {
+        if let Some(entry) = self.lock().get_mut(target_path) {
+            if token.is_some() {
+                entry.pod_token = token;
+            }
+        }
     }
 
     pub fn get(&self, target_path: &Path) -> Option<Entry> {
@@ -171,11 +195,13 @@ mod tests {
                 name: "web-0".into(),
                 namespace: "default".into(),
                 uid: "uid".into(),
+                service_account: "web".into(),
             },
             not_before,
             not_after,
             renew_at: jittered_renew_at(not_before, not_after, (0.5, 0.7)),
             failures: 0,
+            pod_token: None,
         }
     }
 

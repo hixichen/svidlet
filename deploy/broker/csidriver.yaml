@@ -1,0 +1,21 @@
+# v0.2 (broker mode). Replaces ../csidriver.yaml once every node uses the broker.
+apiVersion: storage.k8s.io/v1
+kind: CSIDriver
+metadata:
+  name: csi.svidlet.io
+spec:
+  attachRequired: false
+  # The kubelet passes namespace, pod name, UID and ServiceAccount; the broker
+  # treats them as hints and re-derives every one from the pod token (I1).
+  podInfoOnMount: true
+  # Calls NodePublishVolume about every minute with a fresh pod token. The
+  # node only caches it (§5.2 republish); nothing is issued.
+  requiresRepublish: true
+  volumeLifecycleModes:
+    - Ephemeral
+  fsGroupPolicy: File
+  # The pod token: bound to the pod and its UID, audience-scoped, and only
+  # obtainable by the kubelet on the pod's own node. The pod never sees it.
+  tokenRequests:
+    - audience: svidlet-broker
+      expirationSeconds: 600
