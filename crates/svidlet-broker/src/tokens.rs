@@ -94,7 +94,7 @@ impl JwksSource {
     fn refresh_if_stale(&self, now: i64) {
         {
             let mut st = self.state.lock().expect("jwks poisoned");
-            if now - st.forced_at < 10 {
+            if now.saturating_sub(st.forced_at) < 10 {
                 return;
             }
             st.forced_at = now;

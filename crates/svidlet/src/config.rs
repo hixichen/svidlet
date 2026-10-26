@@ -1241,4 +1241,45 @@ mod tests {
         );
         assert_eq!(cfg.vault.pki_role, "custom-role");
     }
+
+    #[test]
+    fn broker_mode_needs_no_vault_settings_at_all() {
+        let mut vars = HashMap::from([
+            ("NODE_NAME".to_string(), "node-1".to_string()),
+            ("SVIDLET_CLUSTER".to_string(), "gpu-a".to_string()),
+            (
+                "SVIDLET_TRUST_DOMAIN".to_string(),
+                "corp.internal".to_string(),
+            ),
+            ("SVIDLET_ISSUER".to_string(), "broker".to_string()),
+        ]);
+        let cfg = load(vars.clone()).unwrap();
+        let b = cfg.broker.expect("broker settings");
+        assert_eq!(b.sign_url, "https://svidlet-broker.svidlet-system.svc:8443");
+        assert_eq!(
+            b.token_url,
+            "https://svidlet-broker.svidlet-system.svc:8444"
+        );
+        assert_eq!(b.pod_token_audience, "svidlet-broker");
+        assert_eq!(b.jwt_refresh_interval, Duration::from_secs(900));
+        assert!(b.jwt_enabled);
+        assert!(cfg.vault.address.is_empty(), "no Vault address is read");
+
+        vars.insert("SVIDLET_JWT_ENABLED".into(), "false".into());
+        vars.insert("SVIDLET_JWT_REFRESH_INTERVAL".into(), "5m".into());
+        vars.insert("SVIDLET_BROKER_URL".into(), "https://b:1".into());
+        let b = load(vars).unwrap().broker.unwrap();
+        assert!(!b.jwt_enabled);
+        assert_eq!(b.jwt_refresh_interval, Duration::from_secs(300));
+        assert_eq!(b.sign_url, "https://b:1");
+    }
+
+    #[test]
+    fn vault_mode_is_still_the_default_and_unknown_issuers_are_refused() {
+        let cfg = load(base()).unwrap();
+        assert!(cfg.broker.is_none());
+        assert_eq!(cfg.vault.address, "https://vault.example:8200");
+        let err = with(&[("SVIDLET_ISSUER", "spire")]).unwrap_err();
+        assert!(err.0.contains("SVIDLET_ISSUER"), "{err}");
+    }
 }

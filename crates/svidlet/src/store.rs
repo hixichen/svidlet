@@ -286,4 +286,35 @@ mod tests {
         assert_eq!(store.record_failure(Path::new("/gone"), 0), 0);
         assert_eq!(store.len(), 0);
     }
+
+    #[test]
+    fn a_republish_refreshes_the_pod_token_and_nothing_else() {
+        let store = Store::new();
+        let e = entry("/t", 0, 3600);
+        let renew_at = e.renew_at;
+        store.insert(e);
+        assert!(store.get(Path::new("/t")).unwrap().pod_token.is_none());
+
+        store.set_pod_token(Path::new("/t"), Some(PodToken("t1".into())));
+        store.set_pod_token(Path::new("/t"), None);
+        let got = store.get(Path::new("/t")).unwrap();
+        assert_eq!(
+            got.pod_token,
+            Some(PodToken("t1".into())),
+            "None never clears a token"
+        );
+        assert_eq!(got.renew_at, renew_at);
+        // Unknown targets are ignored.
+        store.set_pod_token(Path::new("/other"), Some(PodToken("x".into())));
+        assert!(store.get(Path::new("/other")).is_none());
+    }
+
+    #[test]
+    fn a_pod_token_never_shows_in_debug_output() {
+        let mut e = entry("/t", 0, 10);
+        e.pod_token = Some(PodToken("eyJsecret".into()));
+        let shown = format!("{e:?}");
+        assert!(!shown.contains("eyJsecret"), "{shown}");
+        assert!(shown.contains("redacted"));
+    }
 }

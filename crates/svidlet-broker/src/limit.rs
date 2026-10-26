@@ -94,3 +94,33 @@ impl Distinct {
         map.retain(|_, (start, _)| now - *start < self.window);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_window_slides() {
+        let w = Window::new(2, 60);
+        assert!(w.allow("n", 0));
+        assert!(w.allow("n", 10));
+        assert!(!w.allow("n", 59));
+        assert!(w.allow("other", 59), "keys are independent");
+        assert!(w.allow("n", 60), "the first event left the window");
+        w.sweep(1000);
+        assert!(w.events.lock().unwrap().is_empty());
+        assert!(Window::new(0, 60).allow("n", 0), "zero disables");
+    }
+
+    #[test]
+    fn distinct_identities_are_capped_per_window_but_repeats_pass() {
+        let d = Distinct::new(2, 3600);
+        assert!(d.allow("n", "a", 0));
+        assert!(d.allow("n", "b", 1));
+        assert!(!d.allow("n", "c", 2));
+        assert!(d.allow("n", "a", 3), "a renewal of a known identity");
+        assert!(d.allow("n", "c", 3600), "a new window");
+        d.sweep(10_000);
+        assert!(d.seen.lock().unwrap().is_empty());
+    }
+}

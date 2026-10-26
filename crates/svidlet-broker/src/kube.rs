@@ -329,3 +329,76 @@ pub fn parse_pod(json: &str) -> Result<Pod, String> {
             .collect(),
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_pod_bound_review_yields_its_pod_and_node() {
+        let json = r#"{"status":{"authenticated":true,"audiences":["svidlet-broker"],
+            "user":{"username":"system:serviceaccount:payments:api",
+            "extra":{"authentication.kubernetes.io/pod-name":["api-0"],
+                     "authentication.kubernetes.io/pod-uid":["u-1"],
+                     "authentication.kubernetes.io/node-name":["n1"]}}}}"#;
+        let r = parse_review(json, "svidlet-broker").unwrap().unwrap();
+        assert_eq!(r.service_account(), Some(("payments", "api")));
+        assert_eq!(r.pod_name.as_deref(), Some("api-0"));
+        assert_eq!(r.pod_uid.as_deref(), Some("u-1"));
+        assert_eq!(r.node_name.as_deref(), Some("n1"));
+    }
+
+    #[test]
+    fn unauthenticated_or_wrong_audience_reviews_are_none() {
+        let unauth = r#"{"status":{"authenticated":false}}"#;
+        assert_eq!(parse_review(unauth, "a").unwrap(), None);
+        let other_aud = r#"{"status":{"authenticated":true,"audiences":["https://kubernetes.default.svc"],"user":{"username":"u"}}}"#;
+        assert_eq!(parse_review(other_aud, "svidlet-broker").unwrap(), None);
+        let no_aud = r#"{"status":{"authenticated":true,"user":{"username":"u"}}}"#;
+        assert_eq!(parse_review(no_aud, "svidlet-broker").unwrap(), None);
+        assert!(parse_review("nope", "a").is_err());
+    }
+
+    #[test]
+    fn only_service_account_usernames_split() {
+        let r = |u: &str| Review {
+            username: u.into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            r("system:serviceaccount:ns:sa").service_account(),
+            Some(("ns", "sa"))
+        );
+        assert_eq!(r("system:node:n1").service_account(), None);
+        assert_eq!(r("system:serviceaccount:ns:").service_account(), None);
+        assert_eq!(r("system:serviceaccount:ns:a:b").service_account(), None);
+    }
+
+    #[test]
+    fn a_pod_reads_back_every_image_and_its_owners() {
+        let json = r#"{"metadata":{"name":"p","namespace":"ns","uid":"u",
+            "deletionTimestamp":"2026-10-26T00:00:00Z",
+            "ownerReferences":[{"kind":"DaemonSet","name":"svidlet-node"}]},
+          "spec":{"nodeName":"n1",
+            "initContainers":[{"image":"i@sha256:1"}],
+            "containers":[{"image":"c@sha256:2"}],
+            "ephemeralContainers":[{"image":"debug:latest"}]}}"#;
+        let p = parse_pod(json).unwrap();
+        assert_eq!(p.service_account, "default", "unset means default");
+        assert!(p.terminating);
+        assert_eq!(p.images, vec!["i@sha256:1", "c@sha256:2", "debug:latest"]);
+        assert_eq!(
+            p.owners,
+            vec![("DaemonSet".to_string(), "svidlet-node".to_string())]
+        );
+        assert_eq!(p.node_name, "n1");
+    }
+
+    #[test]
+    fn names_that_could_reshape_the_url_are_never_requested() {
+        for bad in ["", "../secrets", "a/b", "A", "x?y"] {
+            assert!(!safe_segment(bad), "{bad:?}");
+        }
+        assert!(safe_segment("api-0.payments"));
+    }
+}

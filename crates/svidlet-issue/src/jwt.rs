@@ -233,3 +233,99 @@ pub fn test_token(kid: &str, sub: &str, aud: &str, iat: i64, exp: i64) -> String
         URL_SAFE_NO_PAD.encode(claims.to_string())
     )
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::error::ErrorCode;
+
+    #[test]
+    fn a_token_is_read_without_verifying_its_signature() {
+        let t = test_token("k1", "spiffe://td/ns/a/sa/b", "vault", 1000, 1000 + 3600);
+        let u = decode_unverified(&t).unwrap();
+        assert_eq!(u.header.kid, "k1");
+        assert_eq!(u.header.alg, "ES256");
+        assert_eq!(u.claims.sub, "spiffe://td/ns/a/sa/b");
+        assert_eq!(u.claims.aud, vec!["vault".to_string()]);
+        assert_eq!(u.claims.exp, 4600);
+        assert_eq!(u.lifetime(), 3600);
+        assert!(!u.claims.jti.is_empty());
+    }
+
+    #[test]
+    fn half_life_is_the_cache_boundary() {
+        let u = decode_unverified(&test_token("k", "s", "a", 1000, 2000)).unwrap();
+        assert!(!u.past_half_life(1000));
+        assert!(!u.past_half_life(1499));
+        assert!(u.past_half_life(1500));
+        assert!(u.past_half_life(5000));
+    }
+
+    #[test]
+    fn a_single_string_audience_is_accepted() {
+        let header = URL_SAFE_NO_PAD.encode(r#"{"alg":"ES256","kid":"k"}"#);
+        let claims = URL_SAFE_NO_PAD.encode(r#"{"sub":"s","aud":"one","exp":10}"#);
+        let u = decode_unverified(&format!("{header}.{claims}.sig")).unwrap();
+        assert_eq!(u.claims.aud, vec!["one".to_string()]);
+    }
+
+    #[test]
+    fn malformed_tokens_are_protocol_errors() {
+        let none_alg = format!(
+            "{}.{}.sig",
+            URL_SAFE_NO_PAD.encode(r#"{"alg":"none"}"#),
+            URL_SAFE_NO_PAD.encode(r#"{"exp":1}"#)
+        );
+        let unsigned = format!(
+            "{}.{}.",
+            URL_SAFE_NO_PAD.encode(r#"{"alg":"ES256"}"#),
+            URL_SAFE_NO_PAD.encode(r#"{"exp":1}"#)
+        );
+        let no_exp = format!(
+            "{}.{}.sig",
+            URL_SAFE_NO_PAD.encode(r#"{"alg":"ES256"}"#),
+            URL_SAFE_NO_PAD.encode(r#"{"sub":"s"}"#)
+        );
+        for bad in [
+            "", "a.b", "a.b.c.d", "!!.!!.!!", &none_alg, &unsigned, &no_exp,
+        ] {
+            let err = decode_unverified(bad).unwrap_err();
+            assert_eq!(err.code(), ErrorCode::Protocol, "{bad:?}");
+        }
+    }
+
+    fn ec(kid: &str) -> String {
+        format!(r#"{{"kid":"{kid}","kty":"EC","crv":"P-256","x":"AAAA","y":"BBBB"}}"#)
+    }
+
+    #[test]
+    fn a_jwks_reports_its_key_ids() {
+        let rsa_n = URL_SAFE_NO_PAD.encode([7u8; 256]);
+        let json = format!(
+            r#"{{"keys":[{},{{"kid":"r1","kty":"RSA","n":"{rsa_n}","e":"AQAB"}}]}}"#,
+            ec("e1")
+        );
+        let set = Jwks::parse(&json).unwrap();
+        assert_eq!(set.len(), 2);
+        assert!(set.contains("e1") && set.contains("r1"));
+        assert!(!set.contains("gone"));
+        assert_eq!(set.kids().collect::<Vec<_>>(), vec!["e1", "r1"]);
+        assert!(Jwks::parse(r#"{"keys":[]}"#).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_jwks_with_any_bad_key_is_refused_whole() {
+        let short_rsa = URL_SAFE_NO_PAD.encode([7u8; 128]);
+        for bad in [
+            "not json".to_string(),
+            r#"{"keys":[{"kty":"EC","crv":"P-256","x":"AA","y":"BB"}]}"#.to_string(),
+            r#"{"keys":[{"kid":"k","kty":"EC","crv":"secp256k1","x":"AA","y":"BB"}]}"#.to_string(),
+            r#"{"keys":[{"kid":"k","kty":"oct","k":"AA"}]}"#.to_string(),
+            r#"{"keys":[{"kid":"k","kty":"EC","crv":"P-256","x":"!!","y":"BB"}]}"#.to_string(),
+            format!(r#"{{"keys":[{{"kid":"k","kty":"RSA","n":"{short_rsa}","e":"AQAB"}}]}}"#),
+            format!(r#"{{"keys":[{},{}]}}"#, ec("dup"), ec("dup")),
+        ] {
+            assert!(Jwks::parse(&bad).is_err(), "{bad}");
+        }
+    }
+}

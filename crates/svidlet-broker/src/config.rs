@@ -296,3 +296,62 @@ impl Config {
         )
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    fn load(pairs: &[(&str, &str)]) -> Result<Config> {
+        let mut vars: HashMap<String, String> = HashMap::from([
+            ("SVIDLET_CLUSTER".into(), "gpu-a".into()),
+            ("SVIDLET_TRUST_DOMAIN".into(), "corp.internal".into()),
+            ("VAULT_ADDR".into(), "https://vault:8200".into()),
+        ]);
+        for (k, v) in pairs {
+            vars.insert(k.to_string(), v.to_string());
+        }
+        Config::from_source(&|k| vars.get(k).cloned())
+    }
+
+    #[test]
+    fn defaults_follow_the_design() {
+        let c = load(&[]).unwrap();
+        assert_eq!(c.vault.pki_role, "spiffe-gpu-a");
+        assert_eq!(c.vault.pki_mount, "pki_int");
+        assert_eq!(c.vault.auth.method(), "jwt");
+        assert!(matches!(&c.vault.auth, VaultAuth::Jwt { mount, .. } if mount == "k8s-gpu-a"));
+        assert_eq!(c.effective_ttl(), Duration::from_secs(48 * 3600));
+        assert_eq!(
+            c.node_username(),
+            "system:serviceaccount:svidlet-system:svidlet-node"
+        );
+        assert!(c.denied_namespaces.contains(&"kube-system".to_string()));
+        assert_eq!(c.bundle_path, c.client_ca_path);
+    }
+
+    #[test]
+    fn the_kubernetes_url_brackets_an_ipv6_host() {
+        let c = load(&[
+            ("KUBERNETES_SERVICE_HOST", "fd00::1"),
+            ("KUBERNETES_SERVICE_PORT", "6443"),
+        ])
+        .unwrap();
+        assert_eq!(c.kube.api_url, "https://[fd00::1]:6443");
+    }
+
+    #[test]
+    fn bad_settings_stop_the_broker_at_start_up() {
+        assert!(load(&[("SVIDLET_BROKER_VAULT_AUTH", "oidc")]).is_err());
+        assert!(
+            load(&[("SVIDLET_BROKER_VAULT_AUTH", "approle")]).is_err(),
+            "role id required"
+        );
+        assert!(load(&[("SVIDLET_CERT_TTL", "soon")]).is_err());
+        assert!(load(&[("SVIDLET_CERT_TTL", "0")]).is_err());
+        assert!(load(&[("SVIDLET_NODE_RATE_PER_MINUTE", "-1")]).is_err());
+        assert!(load(&[("SVIDLET_SPIFFE_ID_TEMPLATE", "spiffe://{nope}")]).is_err());
+        let c = load(&[("SVIDLET_CERT_TTL", "72h"), ("SVIDLET_CERT_MAX_TTL", "24h")]).unwrap();
+        assert_eq!(c.effective_ttl(), Duration::from_secs(24 * 3600));
+    }
+}

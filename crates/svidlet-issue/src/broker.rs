@@ -285,3 +285,54 @@ impl Issuer for BrokerClient {
         "node-token"
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::error::ErrorCode;
+
+    #[test]
+    fn broker_statuses_map_onto_the_error_taxonomy() {
+        let body = r#"{"error":"pod runs elsewhere","rule":"I3"}"#;
+        let e = classify(403, body);
+        assert_eq!(e.code(), ErrorCode::Policy);
+        assert!(e.to_string().contains("pod runs elsewhere (I3)"));
+        assert!(!e.is_retryable());
+
+        assert_eq!(classify(400, "{}").code(), ErrorCode::Identity);
+        assert_eq!(classify(401, "nope").code(), ErrorCode::Auth);
+        for status in [429, 500, 503] {
+            let e = classify(status, r#"{"error":"down"}"#);
+            assert_eq!(e.code(), ErrorCode::BackendStatus);
+            assert!(e.is_retryable(), "{status}");
+        }
+    }
+
+    #[test]
+    fn a_ca_bundle_without_certificates_is_a_config_error() {
+        let err = BrokerClient::new(BrokerEndpoint {
+            sign_url: "https://broker:8443".into(),
+            token_url: "https://broker:8444".into(),
+            ca_cert_pem: "nothing here".into(),
+            node_token_path: "/nonexistent".into(),
+            timeout: Duration::from_secs(1),
+        })
+        .err()
+        .unwrap();
+        assert_eq!(err.code(), ErrorCode::Config);
+    }
+
+    #[test]
+    fn the_pod_token_never_appears_in_debug_output() {
+        let ctx = crate::issuer::PodContext {
+            namespace: "ns",
+            name: "p",
+            uid: "u",
+            service_account: "sa",
+            token: Some("eyJ.secret.token"),
+        };
+        let shown = format!("{ctx:?}");
+        assert!(!shown.contains("secret"), "{shown}");
+        assert!(shown.contains("<redacted>"));
+    }
+}

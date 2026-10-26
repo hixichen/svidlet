@@ -346,3 +346,145 @@ pub fn parse_duration(text: &str) -> Option<Duration> {
     };
     Some(Duration::from_secs(secs))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const GOOD: &str = r#"
+schema = 1
+trust_domain = "corp.internal"
+
+[mode]
+allowlist = true
+
+[sensitive]
+registries = ["registry.corp.example/"]
+
+[[identity]]
+cluster = "gpu-a"
+namespace = "payments"
+service_account = "api"
+token_ttl = "6h"
+sensitive = true
+audiences = [
+  { alias = "aws", audience = "sts.amazonaws.com" },
+  { alias = "vault", audience = "vault" },
+]
+
+[[identity]]
+cluster = "*"
+namespace = "payments"
+service_account = "api"
+audiences = [{ alias = "vault", audience = "vault" }]
+
+[[identity]]
+cluster = "*"
+namespace = "batch"
+service_account = "runner"
+"#;
+
+    #[test]
+    fn a_good_catalog_parses() {
+        let c = Catalog::parse(GOOD).unwrap();
+        assert!(c.mode.allowlist);
+        assert_eq!(c.identity.len(), 3);
+        assert_eq!(c.path_template, DEFAULT_PATH_TEMPLATE);
+        let api = c.lookup("gpu-a", "payments", "api").unwrap();
+        assert_eq!(api.token_ttl(), Duration::from_secs(6 * 3600));
+        assert_eq!(api.audience("vault").unwrap().alias, "vault");
+        assert!(api.audience("other").is_none());
+    }
+
+    #[test]
+    fn an_exact_cluster_entry_shadows_the_wildcard() {
+        let c = Catalog::parse(GOOD).unwrap();
+        assert_eq!(
+            c.lookup("gpu-a", "payments", "api").unwrap().cluster,
+            "gpu-a"
+        );
+        assert_eq!(c.lookup("gpu-b", "payments", "api").unwrap().cluster, "*");
+        assert!(c.lookup("gpu-b", "payments", "web").is_none());
+        let names: Vec<_> = c
+            .for_cluster("gpu-a")
+            .iter()
+            .map(|i| (i.cluster.as_str(), i.namespace.as_str()))
+            .collect();
+        assert_eq!(names, vec![("*", "batch"), ("gpu-a", "payments")]);
+        assert_eq!(
+            c.lookup("gpu-b", "batch", "runner").unwrap().token_ttl(),
+            DEFAULT_TOKEN_TTL
+        );
+    }
+
+    #[test]
+    fn role_names_and_ids_follow_the_identity() {
+        let c = Catalog::parse(GOOD).unwrap();
+        assert_eq!(
+            role_name("gpu-a", "payments", "api"),
+            "gpu-a__payments__api"
+        );
+        assert_eq!(
+            c.spiffe_id("gpu-a", "payments", "api"),
+            "spiffe://corp.internal/cluster/gpu-a/ns/payments/sa/api"
+        );
+    }
+
+    #[test]
+    fn the_policy_grants_exactly_the_clusters_roles_and_audiences() {
+        let c = Catalog::parse(GOOD).unwrap();
+        let hcl = c.render_policy("gpu-a", "pki_int", "spiffe-gpu-a", "/spiffe/");
+        assert!(hcl.contains(r#"path "pki_int/sign/spiffe-gpu-a""#));
+        assert!(hcl.contains(r#"path "spiffe/role/gpu-a__payments__api/mintjwt""#));
+        assert!(hcl.contains(r#"{ "audience" = ["sts.amazonaws.com", "vault"] }"#));
+        // No audiences, no mint grant.
+        assert!(!hcl.contains("batch__runner"));
+        // Nothing for another cluster, and nothing broader than one role.
+        assert!(!hcl.contains("gpu-b"));
+        assert!(!hcl.contains('*'));
+
+        let roles = c.render_roles("gpu-b", "spiffe");
+        assert!(roles.contains("spiffe/role/gpu-b__payments__api"));
+        assert!(roles.contains(r#"{"sub":"/cluster/gpu-b/ns/payments/sa/api"}"#));
+        assert!(roles.contains("ttl=43200s"));
+    }
+
+    #[test]
+    fn invalid_catalogs_are_refused() {
+        let base =
+            |identity: &str| format!("schema = 1\ntrust_domain = \"td\"\n[[identity]]\n{identity}");
+        for bad in [
+            "schema = 2\ntrust_domain = \"td\"".to_string(),
+            "schema = 1\ntrust_domain = \"a/b\"".to_string(),
+            "schema = 1\ntrust_domain = \"td\"\npath_template = \"/ns/{namespace}\"".to_string(),
+            "schema = 1\ntrust_domain = \"td\"\n[sensitive]\nregistries = [\"registry.corp\"]".to_string(),
+            "schema = 1\ntrust_domain = \"td\"\nunknown = 1".to_string(),
+            base("cluster = \"a\"\nnamespace = \"Payments\"\nservice_account = \"api\""),
+            base("cluster = \"a\"\nnamespace = \"pay__x\"\nservice_account = \"api\""),
+            base("cluster = \"a\"\nnamespace = \"p\"\nservice_account = \"s\"\ntoken_ttl = \"24h\""),
+            base("cluster = \"a\"\nnamespace = \"p\"\nservice_account = \"s\"\ntoken_ttl = \"soon\""),
+            base("cluster = \"a\"\nnamespace = \"p\"\nservice_account = \"s\"\naudiences = [{ alias = \"A\", audience = \"x\" }]"),
+            base("cluster = \"a\"\nnamespace = \"p\"\nservice_account = \"s\"\naudiences = [{ alias = \"a\", audience = \"x,y\" }]"),
+            base("cluster = \"a\"\nnamespace = \"p\"\nservice_account = \"s\"\naudiences = [{ alias = \"a\", audience = \"x\" }, { alias = \"a\", audience = \"y\" }]"),
+            base("cluster = \"a\"\nnamespace = \"p\"\nservice_account = \"s\"\naudiences = [{ alias = \"a\", audience = \"x\" }, { alias = \"b\", audience = \"x\" }]"),
+            format!(
+                "{}\n[[identity]]\ncluster = \"a\"\nnamespace = \"p\"\nservice_account = \"s\"",
+                base("cluster = \"a\"\nnamespace = \"p\"\nservice_account = \"s\"")
+            ),
+        ] {
+            assert!(Catalog::parse(&bad).is_err(), "accepted:\n{bad}");
+        }
+    }
+
+    #[test]
+    fn durations_parse_in_every_documented_unit() {
+        assert_eq!(parse_duration("30"), Some(Duration::from_secs(30)));
+        assert_eq!(parse_duration("30s"), Some(Duration::from_secs(30)));
+        assert_eq!(parse_duration("10m"), Some(Duration::from_secs(600)));
+        assert_eq!(parse_duration("12h"), Some(Duration::from_secs(43_200)));
+        assert_eq!(parse_duration("2d"), Some(Duration::from_secs(172_800)));
+        assert_eq!(parse_duration("1w"), None);
+        assert_eq!(parse_duration("h"), None);
+        assert_eq!(parse_duration(""), None);
+    }
+}

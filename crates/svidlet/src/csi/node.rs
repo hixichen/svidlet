@@ -63,7 +63,9 @@ fn status_for(e: svidlet_issue::Error) -> Status {
         ErrorCode::Identity => Status::invalid_argument(e.to_string()),
         ErrorCode::Policy => Status::permission_denied(e.to_string()),
         ErrorCode::Auth => Status::unauthenticated(e.to_string()),
-        ErrorCode::BackendStatus if e.to_string().contains("429") => {
+        ErrorCode::BackendStatus
+            if matches!(e, svidlet_issue::Error::Backend { status: 429, .. }) =>
+        {
             Status::resource_exhausted(e.to_string())
         }
         _ if e.is_retryable() => Status::unavailable(e.to_string()),
@@ -432,5 +434,72 @@ impl Node for NodeService {
             node_id: self.publisher.cfg.node_name.clone(),
             max_volumes_per_node: 0,
         }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    fn ctx(json: &str) -> HashMap<String, String> {
+        HashMap::from([(vc::SERVICE_ACCOUNT_TOKENS.to_string(), json.to_string())])
+    }
+
+    #[test]
+    fn the_pod_token_comes_from_the_kubelets_token_map() {
+        let c = ctx(
+            r#"{"svidlet-broker":{"token":"tok","expirationTimestamp":"2026-10-26T00:10:00Z"},"other":{"token":"no"}}"#,
+        );
+        assert_eq!(
+            pod_token_from(&c, "svidlet-broker"),
+            Some(PodToken("tok".into()))
+        );
+        assert_eq!(pod_token_from(&c, "missing"), None);
+    }
+
+    #[test]
+    fn a_missing_or_malformed_token_map_yields_no_token() {
+        assert_eq!(pod_token_from(&HashMap::new(), "a"), None);
+        assert_eq!(pod_token_from(&ctx("not json"), "a"), None);
+        assert_eq!(pod_token_from(&ctx(r#"{"a":{"token":""}}"#), "a"), None);
+        assert_eq!(pod_token_from(&ctx(r#"{"a":{"token":7}}"#), "a"), None);
+    }
+
+    #[test]
+    fn broker_errors_reach_the_kubelet_with_the_right_code() {
+        use svidlet_issue::Error;
+        assert_eq!(
+            status_for(Error::Policy("no".into())).code(),
+            tonic::Code::PermissionDenied
+        );
+        assert_eq!(
+            status_for(Error::Auth("no".into())).code(),
+            tonic::Code::Unauthenticated
+        );
+        assert_eq!(
+            status_for(Error::Transport("down".into())).code(),
+            tonic::Code::Unavailable
+        );
+        assert_eq!(
+            status_for(Error::Backend {
+                status: 503,
+                body: "x".into()
+            })
+            .code(),
+            tonic::Code::Unavailable
+        );
+        assert_eq!(
+            status_for(Error::Backend {
+                status: 429,
+                body: "slow".into()
+            })
+            .code(),
+            tonic::Code::ResourceExhausted
+        );
+        assert_eq!(
+            status_for(Error::Certificate("bad".into())).code(),
+            tonic::Code::Internal
+        );
     }
 }

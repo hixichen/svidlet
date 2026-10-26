@@ -62,3 +62,46 @@ pub fn write(out: &Path, issuer: &str, discovery: &str, jwks: &str) -> std::io::
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const ISSUER: &str = "https://oidc.corp.example/v1/spiffe";
+    const KEYS: &str = r#"{"keys":[{"kid":"k1","kty":"EC","crv":"P-256","x":"AAAA","y":"AAAA"}]}"#;
+
+    fn discovery(issuer: &str, jwks_uri: &str) -> String {
+        serde_json::json!({ "issuer": issuer, "jwks_uri": jwks_uri }).to_string()
+    }
+
+    #[test]
+    fn a_consistent_pair_is_published_under_the_issuer_path() {
+        let d = discovery(ISSUER, &format!("{ISSUER}/.well-known/keys"));
+        let checked = check(&d, KEYS, ISSUER).unwrap();
+        assert_eq!(checked.kids, vec!["k1"]);
+
+        let out = std::env::temp_dir().join(format!("svidlet-publish-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&out);
+        write(&out, ISSUER, &d, KEYS).unwrap();
+        let keys = out.join("v1/spiffe/.well-known/keys");
+        assert_eq!(std::fs::read_to_string(keys).unwrap(), KEYS);
+        assert!(out
+            .join("v1/spiffe/.well-known/openid-configuration")
+            .exists());
+        std::fs::remove_dir_all(&out).unwrap();
+    }
+
+    #[test]
+    fn anything_relying_parties_should_not_trust_is_refused() {
+        let good_uri = format!("{ISSUER}/.well-known/keys");
+        for (d, k) in [
+            (discovery("https://evil.example/v1/spiffe", &good_uri), KEYS),
+            (discovery(ISSUER, "https://evil.example/keys"), KEYS),
+            (discovery(ISSUER, &good_uri), r#"{"keys":[]}"#),
+            (discovery(ISSUER, &good_uri), r#"{"keys":[{"kty":"EC"}]}"#),
+            ("not json".to_string(), KEYS),
+        ] {
+            assert!(check(&d, k, ISSUER).is_err(), "{d} {k}");
+        }
+    }
+}
