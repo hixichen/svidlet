@@ -6,6 +6,9 @@
 //! boundary — nothing here holds a Vault credential, because the daemon never
 //! has one.
 
+mod common;
+use common::remove_tree;
+
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -131,17 +134,14 @@ fn the_daemon_learns_identities_from_the_certificates_svidlet_wrote() {
     assert!(gone.is_empty());
     assert_eq!(daemon.volume_count(), 2);
 
-    // The daemon addresses volumes through the farm; canonicalising resolves
-    // the farm entry to the volume svidlet published.
-    let targets: Vec<PathBuf> = daemon
-        .volumes()
-        .into_iter()
-        .map(|v| std::fs::canonicalize(&v.target).unwrap())
-        .collect();
-    assert!(targets.contains(&std::fs::canonicalize(&api).unwrap()));
-    assert!(targets.contains(&std::fs::canonicalize(&web).unwrap()));
+    // The daemon addresses volumes through the farm; each farm entry is the
+    // volume svidlet published.
+    let targets: Vec<PathBuf> = daemon.volumes().into_iter().map(|v| v.target).collect();
+    for published in [&api, &web] {
+        assert!(targets.iter().any(|t| common::same_file(t, published)));
+    }
 
-    std::fs::remove_dir_all(&root).unwrap();
+    remove_tree(&root);
 }
 
 #[test]
@@ -175,7 +175,7 @@ fn policy_is_written_beside_the_certificate_it_belongs_to() {
     // A second pass rewrites nothing: the revisions already match.
     assert_eq!(daemon.apply(), 0);
 
-    std::fs::remove_dir_all(&root).unwrap();
+    remove_tree(&root);
 }
 
 #[test]
@@ -205,7 +205,7 @@ fn the_daemon_never_touches_the_certificate_chain() {
     );
     assert_eq!(volume::published_revision(&target).as_deref(), Some("r3"));
 
-    std::fs::remove_dir_all(&root).unwrap();
+    remove_tree(&root);
 }
 
 #[test]
@@ -228,7 +228,7 @@ fn a_pod_going_away_is_noticed_and_unsubscribed() {
     // And the backend is no longer asked for policy nobody will write.
     assert_eq!(policy.subscription_count(), 1);
 
-    std::fs::remove_dir_all(&root).unwrap();
+    remove_tree(&root);
 }
 
 #[test]
@@ -248,7 +248,7 @@ fn a_volume_holding_a_foreign_identity_is_left_alone() {
     assert!(ours.join("policy").exists());
     assert!(!theirs.join("policy").exists());
 
-    std::fs::remove_dir_all(&root).unwrap();
+    remove_tree(&root);
 }
 
 #[test]
@@ -269,7 +269,7 @@ fn an_id_pattern_gates_which_volumes_receive_policy() {
     assert!(payments.join("policy").exists());
     assert!(!default.join("policy").exists());
 
-    std::fs::remove_dir_all(&root).unwrap();
+    remove_tree(&root);
 }
 
 #[test]
@@ -288,7 +288,7 @@ fn a_volume_without_a_certificate_yet_is_skipped_quietly() {
     assert_eq!(daemon.volume_count(), 0);
     assert_eq!(daemon.metrics.unreadable_volumes.load(Ordering::Relaxed), 1);
 
-    std::fs::remove_dir_all(&root).unwrap();
+    remove_tree(&root);
 }
 
 #[test]
@@ -314,7 +314,7 @@ fn a_volume_that_is_not_exposed_is_invisible() {
     assert_eq!(daemon.scan(), (vec![], vec![]));
     assert_eq!(daemon.volume_count(), 0);
 
-    std::fs::remove_dir_all(&root).unwrap();
+    remove_tree(&root);
 }
 
 #[tokio::test]
@@ -345,7 +345,7 @@ async fn the_run_loop_converges_a_node_on_its_own() {
     );
     assert!(daemon.metrics.scans.load(Ordering::Relaxed) > 0);
 
-    std::fs::remove_dir_all(&root).unwrap();
+    remove_tree(&root);
 }
 
 #[test]
@@ -387,7 +387,7 @@ fn the_metrics_endpoint_reports_what_this_process_owns() {
         svidlet::policy::daemon::respond("GET /nope HTTP/1.1", &daemon).starts_with("HTTP/1.1 404")
     );
 
-    std::fs::remove_dir_all(&root).unwrap();
+    remove_tree(&root);
 }
 
 // ------------------------------------------------ policy over a real stream
@@ -507,6 +507,6 @@ mod stream {
         // The certificate is untouched: this process never writes that chain.
         assert!(target.join("tls.crt").exists());
 
-        std::fs::remove_dir_all(&root).unwrap();
+        remove_tree(&root);
     }
 }

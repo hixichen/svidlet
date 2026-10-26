@@ -254,6 +254,7 @@ pub fn unexpose(farm_root: &Path, name: &str) -> io::Result<()> {
 }
 
 #[cfg(target_os = "linux")]
+#[allow(unsafe_code)]
 fn expose_at(point: &Path, target: &Path) -> io::Result<()> {
     if point.exists() && is_mount_point(point)? {
         return Ok(());
@@ -429,7 +430,12 @@ fn remove_stale_versions(target: &Path, prefix: &str, keep: u64) -> io::Result<(
     Ok(())
 }
 
-/// True when `path` sits on a different filesystem from its parent.
+/// True when `path` sits on a different filesystem from its parent, or is
+/// listed as a mount point in `/proc/self/mountinfo`.
+///
+/// The device comparison alone misses a bind mount whose source lives on the
+/// same filesystem as its mount point — the farm's bind mounts whenever the
+/// volume is not a tmpfs, as in tests run as root.
 fn is_mount_point(path: &Path) -> io::Result<bool> {
     use std::os::unix::fs::MetadataExt;
     let here = fs::metadata(path)?;
@@ -437,7 +443,50 @@ fn is_mount_point(path: &Path) -> io::Result<bool> {
         Some(p) => fs::metadata(p)?,
         None => return Ok(true),
     };
-    Ok(here.dev() != parent.dev())
+    if here.dev() != parent.dev() {
+        return Ok(true);
+    }
+    Ok(listed_in_mountinfo(path))
+}
+
+#[cfg(target_os = "linux")]
+fn listed_in_mountinfo(path: &Path) -> bool {
+    let Ok(canonical) = fs::canonicalize(path) else {
+        return false;
+    };
+    let Ok(table) = fs::read_to_string("/proc/self/mountinfo") else {
+        return false;
+    };
+    let wanted = canonical.to_string_lossy();
+    // Field 5 is the mount point, with spaces and the like octal-escaped.
+    table
+        .lines()
+        .filter_map(|line| line.split(' ').nth(4))
+        .any(|point| unescape_mountinfo(point) == wanted)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn listed_in_mountinfo(_path: &Path) -> bool {
+    false
+}
+
+#[cfg(target_os = "linux")]
+fn unescape_mountinfo(field: &str) -> String {
+    let bytes = field.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'\\' && i + 4 <= bytes.len() {
+            if let Ok(v) = u8::from_str_radix(&field[i + 1..i + 4], 8) {
+                out.push(v);
+                i += 4;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 #[cfg(target_os = "linux")]
