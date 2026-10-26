@@ -190,7 +190,7 @@ Runs as a Deployment, not on workload nodes. See [DESIGN.md](DESIGN.md) §5–§
 
 ## `oidc-publisher` and `svidlet-catalog`
 
-`oidc-publisher` (§8) reads `VAULT_ADDR`, `VAULT_CACERT`, `VAULT_NAMESPACE`, `SVIDLET_SPIFFE_MOUNT`, `OIDC_ISSUER` (e.g. `https://oidc.corp.example/v1/spiffe`), `OIDC_OUT_DIR` and `OIDC_INTERVAL` (`60s`; `0` runs once). It writes `<OIDC_OUT_DIR>/<issuer path>/.well-known/{openid-configuration,keys}` only after checking the issuer and every key; a sidecar syncs the directory to the bucket with `Cache-Control: max-age=300`.
+`oidc-publisher` (§8) reads `VAULT_ADDR`, `VAULT_CACERT`, `VAULT_NAMESPACE`, `SVIDLET_SPIFFE_MOUNT`, `OIDC_ISSUER` (e.g. `https://oidc.corp.example/v1/spiffe`), `OIDC_OUT_DIR` and `OIDC_INTERVAL` (`60s`; `0` runs once and exits non-zero if it refused to publish). It writes `<OIDC_OUT_DIR>/<issuer path>/.well-known/{openid-configuration,keys}` only after checking the issuer and every key; a sidecar syncs the directory to the bucket with `Cache-Control: max-age=300`.
 
 `svidlet-catalog lint|policy|roles <catalog.toml> [cluster]` lints the catalog and prints the per-cluster Vault policy (§7.3) and the `vault write spiffe/role/…` commands (§7.2).
 

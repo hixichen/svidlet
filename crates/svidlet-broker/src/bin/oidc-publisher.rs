@@ -4,7 +4,8 @@
 //! Environment: `VAULT_ADDR`, `VAULT_CACERT` (optional), `VAULT_NAMESPACE`
 //! (optional), `SVIDLET_SPIFFE_MOUNT` (default `spiffe`), `OIDC_ISSUER` (e.g.
 //! `https://oidc.corp.example/v1/spiffe`), `OIDC_OUT_DIR`, `OIDC_INTERVAL`
-//! (default `60s`; `0` runs once). The upload itself (`gsutil rsync`,
+//! (default `60s`; `0` runs once and exits non-zero if nothing was
+//! published). The upload itself (`gsutil rsync`,
 //! `aws s3 sync` with `Cache-Control: max-age=300`) is the sidecar's job, so
 //! the bucket credential never reaches this process.
 
@@ -54,13 +55,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .map_err(|e| format!("cannot write {}: {e}", out.display()))?;
             Ok(checked)
         };
-        match once() {
+        let outcome = once();
+        match &outcome {
             Ok(c) => tracing::info!(issuer = %c.issuer, kids = ?c.kids, "published"),
             // Keep the last good copy; the stale-age alert is on the sidecar.
             Err(e) => tracing::error!(error = %e, "not published; the last good copy stays"),
         }
         if interval.is_zero() {
-            return Ok(());
+            // Run once (a CI job, a CronJob): the exit status is the result.
+            return outcome.map(|_| ()).map_err(Into::into);
         }
         std::thread::sleep(interval);
     }

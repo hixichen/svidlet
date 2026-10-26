@@ -41,7 +41,7 @@ release: ## release build of the whole workspace
 	$(RUN) cargo build --release --workspace
 
 .PHONY: test
-test: ## unit + integration tests (241; no cluster, no Vault needed)
+test: ## unit + integration tests (323; no cluster, no Vault; root for tmpfs mounts)
 	$(RUN) cargo test --workspace
 
 .PHONY: test-vault
