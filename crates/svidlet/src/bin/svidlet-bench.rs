@@ -4,7 +4,9 @@
 //! the kubelet would, so the memory and latency numbers come from the real
 //! process serving the real protocol rather than from a test harness.
 //!
-//!   svidlet-bench <csi-socket> <target-dir> <count> [--unpublish]
+//! ```text
+//! svidlet-bench <csi-socket> <target-dir> <count> [--unpublish]
+//! ```
 
 use std::collections::HashMap;
 use std::path::PathBuf;

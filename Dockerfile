@@ -22,19 +22,23 @@ RUN mkdir -p crates/svidlet/src crates/svidlet-issue/src crates/svidlet-broker/s
  && rm -rf crates/svidlet/src crates/svidlet-issue/src crates/svidlet-broker/src crates/svidlet/build.rs
 
 COPY crates crates
-# Touch the manifests so cargo rebuilds the workspace crates against the
-# now-real sources.
-RUN touch crates/svidlet/src/main.rs crates/svidlet-issue/src/lib.rs crates/svidlet-broker/src/lib.rs \
+# Touch the entry points so cargo rebuilds the workspace crates against the
+# now-real sources — build.rs included: the copied one is older than the stub
+# that ran above, so without the touch cargo keeps the stub's (empty) output
+# and the generated gRPC code never appears.
+RUN touch crates/svidlet/build.rs crates/svidlet/src/main.rs crates/svidlet-issue/src/lib.rs crates/svidlet-broker/src/lib.rs \
  && cargo build --release --locked \
  && strip target/release/svidlet target/release/svidlet-policy \
           target/release/svidlet-broker target/release/oidc-publisher target/release/svidlet-catalog
 
 # The trust roots for reaching Vault are compiled in (webpki-roots), and a
 # private Vault CA is supplied through VAULT_CACERT, so nothing else is needed.
-# One image, two binaries. They run as two containers in the same DaemonSet pod
-# so that identity issuance and policy distribution are separate processes with
-# separate credentials — see docs/DESIGN-v0.1.md, "Two processes, one volume".
-# The broker and the two control-plane tools ship in the same image.
+# One image, every binary. svidlet and svidlet-policy run as two containers in
+# the same DaemonSet pod, so identity issuance and policy distribution are
+# separate processes with separate credentials (docs/DESIGN-v0.1.md, "Two
+# processes, one volume"). svidlet-broker runs as its own Deployment
+# (docs/DESIGN.md §4); oidc-publisher and svidlet-catalog are control-plane
+# tools.
 FROM scratch
 COPY --from=build /src/target/release/svidlet /svidlet
 COPY --from=build /src/target/release/svidlet-policy /svidlet-policy

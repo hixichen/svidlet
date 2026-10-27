@@ -6,7 +6,7 @@
 > implementation than SPIRE or cert-manager's `csi-driver-spiffe`, and it is not trying
 > to be — both are mature, and both do more. What this aims at is a narrower thing:
 > lightweight, easy to deploy, and easy to maintain — one static binary, one DaemonSet,
-> no control plane and no API-server dependency — for pod identity across multiple
+> and, in broker mode, one small Deployment per cluster — for pod identity across multiple
 > Kubernetes clusters. Read it in that spirit.
 
 ## TL;DR
@@ -22,8 +22,18 @@ key on the node, has a PKI backend sign a certificate for
 mounts it into only the containers that should hold it. It renews in the background and
 can also ship the authorization policy that goes with the identity.
 
-No control plane, no API-server access, no sidecars, no CRDs, no datastore. 3.2 MB
-resident idle, 6.7 MB with 2000 certificates on the node.
+No sidecars, no CRDs, no datastore. 3.2 MB resident idle, 6.7 MB with 2000
+certificates on the node.
+
+Two ways to run it ([docs/DESIGN.md](docs/DESIGN.md)):
+
+- **Direct (v0.1, the default).** Each node signs against Vault PKI with a per-cluster
+  credential. No control plane, no API-server access.
+- **Broker (v0.2, `SVIDLET_ISSUER=broker`).** Nodes hold nothing that can sign. A
+  per-cluster `svidlet-broker` Deployment attests each pod with two TokenReviews, asks
+  Vault PKI to sign its certificate, and asks Vault's SPIFFE engine to mint JWT-SVIDs,
+  which land beside the certificate as `jwt/<alias>`. A compromised node gets only its
+  own pods' identities, and the cluster is one Vault client, not one per node.
 
 ## Goal
 
@@ -46,9 +56,10 @@ honestly do it:
   federation or bundle exchange. Vault enforces the per-cluster prefix, so a compromised
   node can only mint identities in its own cluster.
 
-Explicitly **not** goals: replacing SPIRE, JWT SVIDs, evaluating or enforcing policy
-(Svidlet delivers bytes), certificate revocation (short lifetimes replace it), or
-federation with external trust domains.
+Explicitly **not** goals: replacing SPIRE, signing anything ourselves (Vault signs
+certificates and, in broker mode, JWT-SVIDs), evaluating or enforcing policy (Svidlet
+delivers bytes), certificate revocation (short lifetimes replace it), or federation with
+external trust domains.
 
 **Known gap:** Svidlet issues identity to whatever the cluster admitted. Verifying that a
 workload is what it claims to be — signed images, a reviewed pod spec — needs a
@@ -102,6 +113,12 @@ cannot mint identities — see [Policy](#policy).
 
 323 tests, plus six integration tests that run against a real Vault
 (`./hack/local-vault.sh`).
+
+Broker mode (v0.2): `svidlet-broker` with the certificate invariants I1–I11 and token
+rules T1–T8, broker mode on the node with `jwt/` files, `oidc-publisher` and
+`svidlet-catalog`. Covered end to end against fakes and stubs, including the shipped
+binaries as processes; not yet run against a real API server or a Vault Enterprise
+SPIFFE engine.
 
 Not started: a validating admission controller for workload provenance (the
 [missing half](docs/DESIGN-v0.1.md#admission-control-the-missing-half-of-the-chain) of the
@@ -316,8 +333,10 @@ SVIDLET_POLICY_ENABLED=false cargo run -p svidlet     # no policy backend needed
 never drift. The gate a change must pass is `make ci`.
 
 ```sh
-sudo -E cargo test          # 323 tests, no cluster and no Vault needed (root: real tmpfs mounts)
-cargo test -p svidlet-broker # the v0.2 broker path alone
+make test                   # 323 tests, no cluster and no Vault; test binaries run as root
+make test-broker            # the v0.2 broker path alone
+make ci                     # fmt, clippy -D warnings, docs, tests: what CI runs
+make tidy                   # afterwards: reclaim disk, keep the dependency cache
 ./hack/coverage.sh          # coverage report; fails under 80%
 ./hack/bench-memory.sh      # resident memory under load
 
@@ -339,9 +358,16 @@ bundle that does not match its signed digest, and a registry that goes away. The
 that the CSR svidlet builds is one Vault actually signs, and that the per-cluster role
 really refuses an identity outside its prefix.
 
-`cargo test` runs as root because the plugin's tests mount a real tmpfs per volume
-and bind-mount it into the policy farm, exactly as on a node; unprivileged, those
-tests fail on `mount(2)`. CI does the same.
+The plugin's tests mount a real tmpfs per volume and bind-mount it into the policy farm,
+exactly as on a node, so their binaries need root; unprivileged, they fail on
+`mount(2)`. `make test` keeps cargo itself unprivileged and runs only the test binaries
+through `sudo` (`hack/root-tests.toml`), so `target/` never ends up owned by root.
+Without make: `cargo test --config hack/root-tests.toml`. CI does the same.
+
+Debug builds keep line tables but no full debug info, which roughly halves `target/`;
+`make size` shows where the rest goes and `make tidy` drops incremental caches and this
+workspace's own artifacts while keeping compiled dependencies. CI caches dependencies
+and builds without incremental compilation.
 
 The v0.2 broker path is covered three ways, none needing a cluster:
 
@@ -550,6 +576,7 @@ Every label combination is exported from process start, including the zero ones,
 | `svidlet_certificates_active` | certificates this node is renewing |
 | `svidlet_earliest_certificate_expiry_seconds` | **the one to alert on** |
 | `svidlet_renewals_due` | deadlines passed but not yet renewed |
+| `svidlet_jwt_earliest_expiry_seconds` | broker mode: soonest JWT-SVID expiry under any `jwt/`; falling towards zero means check-ins are failing |
 | `svidlet_volumes_recovered_total` | adopted after a restart, not re-issued |
 | `svidlet_volumes_adoption_skipped_total` | non-zero means certificates are being re-issued that need not be |
 | `svidlet_ca_refresh_total`, `…_failures_total` | trust bundle |
@@ -642,8 +669,20 @@ crates/
     src/issuer.rs         The PKI-engine seam
     src/auth.rs           The authentication seam, and the token cache every backend needs
     src/error.rs          The stable error-code taxonomy
-    src/vault/            Vault PKI: HTTP, three auth methods, the issuer
+    src/vault/            Vault: HTTP, four auth methods (incl. JWT), PKI issuer, SPIFFE minter
+    src/broker.rs         The node's client for svidlet-broker (v0.2)
+    src/jwt.rs            Reading JWT-SVIDs and JWKS (never signing)
+    src/catalog.rs        The identity catalog and its Vault role/policy rendering
+  svidlet-broker/         The per-cluster broker (v0.2)
+    src/sign.rs           Certificate path: two TokenReviews, invariants I1–I11, Vault PKI
+    src/tokens.rs         Token path: mTLS caller, rules T1–T7, shared cache, Vault SPIFFE
+    src/server.rs         HTTPS on 8443 and 8444, metrics, housekeeping
+    src/kube.rs           TokenReview and Pod reads behind a trait
+    src/bin/              oidc-publisher, svidlet-catalog
+    tests/                Rules, node through broker, the binaries as processes
 deploy/                   CSIDriver, DaemonSet, example workload, Vault bootstrap
+deploy/broker/            Broker-mode manifests and an example catalog
+hack/root-tests.toml      Cargo runner: only test binaries run as root
 hack/local-vault.sh       A dev-mode Vault on this machine, configured for svidlet
 hack/kind-e2e.sh          End-to-end check on kind against a dev Vault
 hack/bench-memory.sh      Resident memory against a real Vault under real CSI load

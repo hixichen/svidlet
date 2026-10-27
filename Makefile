@@ -4,7 +4,8 @@
 # target and its script cannot drift apart.
 #
 #   make            # list targets
-#   make ci         # the gate a change must pass: fmt --check, clippy, tests
+#   make ci         # the gate a change must pass: fmt --check, clippy, docs, tests
+#   make tidy       # reclaim disk after a build, keeping the dependency cache
 
 SHELL := /bin/bash
 .SHELLFLAGS := -eu -o pipefail -c
@@ -22,6 +23,16 @@ TRUST_DOMAIN ?= example.org
 CLUSTER      ?= cluster-a
 BUNDLE_DIR   ?= ./policy/bundle
 ROLLOUT_FILE ?= ./rollout.toml
+
+# The plugin's tests mount real tmpfs and bind mounts, so their binaries need
+# root. As root, run them directly; otherwise cargo runs as you and only the
+# test binaries go through sudo (hack/root-tests.toml), so target/ never ends
+# up owned by root.
+ifeq ($(shell id -u),0)
+TEST_FLAGS :=
+else
+TEST_FLAGS := --config hack/root-tests.toml
+endif
 
 .DEFAULT_GOAL := help
 
@@ -41,8 +52,12 @@ release: ## release build of the whole workspace
 	$(RUN) cargo build --release --workspace
 
 .PHONY: test
-test: ## unit + integration tests (323; no cluster, no Vault; root for tmpfs mounts)
-	$(RUN) cargo test --workspace
+test: ## unit + integration tests (323; no cluster, no Vault; test binaries run as root)
+	$(RUN) cargo test --workspace $(TEST_FLAGS)
+
+.PHONY: test-broker
+test-broker: ## the v0.2 broker path alone: rules, node through broker, the binaries
+	$(RUN) cargo test -p svidlet-broker $(TEST_FLAGS)
 
 .PHONY: test-vault
 test-vault: ## the 6 live-Vault integration tests (starts and stops a dev Vault)
@@ -54,7 +69,7 @@ test-vault: ## the 6 live-Vault integration tests (starts and stops a dev Vault)
 	exit $$status
 
 .PHONY: ci
-ci: fmt-check clippy test ## the gate a change must pass
+ci: fmt-check clippy doc test ## the gate a change must pass (what CI runs)
 
 # ------------------------------------------------------------------- style
 
@@ -67,8 +82,12 @@ fmt-check: ## fail if any source is not rustfmt-clean
 	$(RUN) cargo fmt --all -- --check
 
 .PHONY: clippy
-clippy: ## clippy over the workspace, all targets
-	$(RUN) cargo clippy --workspace --all-targets
+clippy: ## clippy over the workspace, all targets; warnings fail, as in CI
+	$(RUN) cargo clippy --workspace --all-targets -- -D warnings
+
+.PHONY: doc
+doc: ## build the API docs; broken intra-doc links fail, as in CI
+	RUSTDOCFLAGS="-D warnings" $(RUN) cargo doc --workspace --no-deps
 
 # ---------------------------------------------------------------- measurement
 
@@ -87,7 +106,7 @@ e2e: ## kind + dev Vault + DaemonSet + a workload, end to end (needs kind, kubec
 	$(RUN) ./hack/kind-e2e.sh
 
 .PHONY: image
-image: ## build the static two-binary image (scratch, musl)
+image: ## build the static image (scratch, musl): node plugin, policy daemon, broker, tools
 	docker build -t $(IMAGE) .
 
 # ------------------------------------------------------------------- policy
@@ -111,12 +130,39 @@ vault-bootstrap: ## one-time PKI setup for a cluster: VAULT_ADDR=… VAULT_TOKEN
 	./deploy/vault-bootstrap.sh $(TRUST_DOMAIN) $(CLUSTER)
 
 .PHONY: deploy
-deploy: ## apply the CSIDriver and DaemonSet to the current kubectl context
+deploy: ## v0.1: apply the CSIDriver and DaemonSet (nodes sign against Vault)
 	kubectl apply -f deploy/csidriver.yaml
 	kubectl apply -f deploy/daemonset.yaml
 
+.PHONY: deploy-broker
+deploy-broker: ## v0.2: apply the broker, the broker-mode CSIDriver and node DaemonSet
+	kubectl apply -f deploy/broker/csidriver.yaml
+	kubectl apply -f deploy/broker/broker.yaml
+	kubectl apply -f deploy/broker/node.yaml
+
+CATALOG ?= deploy/broker/catalog.toml
+
+.PHONY: catalog
+catalog: ## lint CATALOG and print CLUSTER's Vault policy and SPIFFE roles
+	$(RUN) cargo run -q -p svidlet-broker --bin svidlet-catalog -- lint $(CATALOG)
+	$(RUN) cargo run -q -p svidlet-broker --bin svidlet-catalog -- policy $(CATALOG) $(CLUSTER)
+	$(RUN) cargo run -q -p svidlet-broker --bin svidlet-catalog -- roles $(CATALOG) $(CLUSTER)
+
 # ------------------------------------------------------------------- housekeeping
 
+.PHONY: tidy
+tidy: ## reclaim disk after a build: drop incremental caches and this workspace's own artifacts, keep compiled dependencies
+	rm -rf target/debug/incremental target/release/incremental
+	$(RUN) cargo clean -p svidlet -p svidlet-issue -p svidlet-broker
+	@du -sh target 2>/dev/null || true
+
+.PHONY: size
+size: ## how much disk target/ uses, and where
+	@if [ -d target ]; then \
+		du -sh target/*/deps target/*/incremental target/*/build 2>/dev/null || true; \
+		du -sh target; \
+	else echo "no target/"; fi
+
 .PHONY: clean
-clean: ## remove build artifacts
+clean: ## remove all build artifacts (the next build recompiles every dependency)
 	$(RUN) cargo clean

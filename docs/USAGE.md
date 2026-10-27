@@ -2,7 +2,7 @@
 
 What a workload can do with the files in its volume — all of it, in one list.
 
-**Depends on:** [DESIGN.md](DESIGN-v0.1.md) · [../svidlet-policy/authz-management-plane.md](../svidlet-policy/authz-management-plane.md) · [../svidlet-policy/authz-enforcement-plane.md](../svidlet-policy/authz-enforcement-plane.md)
+**Depends on:** [DESIGN.md](DESIGN.md) (v0.2) · [DESIGN-v0.1.md](DESIGN-v0.1.md) · [../svidlet-policy/authz-management-plane.md](../svidlet-policy/authz-management-plane.md) · [../svidlet-policy/authz-enforcement-plane.md](../svidlet-policy/authz-enforcement-plane.md)
 
 ---
 
@@ -15,6 +15,8 @@ What a workload can do with the files in its volume — all of it, in one list.
   ca.crt           trust bundle for the whole trust domain
   policy/          authorization rules        (only if a policy source is configured)
   policy.revision  upstream revision of those rules
+  jwt/<alias>      one JWT-SVID per approved audience, mode 0640
+                   (only in broker mode, for identities the catalog lists)
 ```
 
 The identity is the **URI SAN**, not the subject — the subject is deliberately empty:
@@ -177,9 +179,35 @@ workloadIdentityPools/svidlet/subject/spiffe://example.org/cluster/cluster-a/ns/
 
 In the pod, an `external_account` credential configuration pointing at the two files lets the Google SDKs do the exchange (`GOOGLE_APPLICATION_CREDENTIALS`).
 
-### Azure — keep two credentials, each doing what it is good at
+### Azure — a JWT-SVID, in broker mode
 
-Azure has no first-party certificate federation that accepts an arbitrary CA. The supported path is federated identity credentials with OIDC: use the cluster's projected ServiceAccount token for Azure, and keep the svidlet certificate for service-to-service mTLS. Do not contort the design to upload daily-rotating certificates to an app registration.
+Azure has no first-party certificate federation that accepts an arbitrary CA; its path is federated identity credentials over OIDC. In broker mode ([DESIGN.md](DESIGN.md) §6) the volume carries a JWT-SVID for each audience the catalog approves, issued by the fleet's one OIDC issuer and registered once per app with an exact subject:
+
+```sh
+AZURE_FEDERATED_TOKEN_FILE=/var/run/svid/jwt/azure
+```
+
+Without broker mode, use the cluster's projected ServiceAccount token for Azure and keep the certificate for service-to-service mTLS. Do not upload short-lived certificates to an app registration.
+
+### Use a JWT-SVID — Azure, Vault, SaaS, or AWS and GCP by token
+
+Broker mode only. Each file under `jwt/` is a token for one audience, named by its alias in the catalog; its `sub` is your SPIFFE ID. Point the SDK at the file and let it re-read it — the node rewrites it atomically, about every 15 minutes when something changed, and well before it expires:
+
+```sh
+AWS_ROLE_ARN=arn:aws:iam::123456789012:role/payments-api
+AWS_WEB_IDENTITY_TOKEN_FILE=/var/run/svid/jwt/aws
+# GCP: an external_account credential config with "credential_source": {"file": "/var/run/svid/jwt/gcp"}
+vault write auth/jwt/login role=payments jwt=@/var/run/svid/jwt/vault
+```
+
+A token for an audience chosen at run time comes from the broker directly, with the certificate you already hold. The audience must still be approved for you, and your namespace needs a NetworkPolicy to port 8444:
+
+```sh
+curl --cert /var/run/svid/tls.crt --key /var/run/svid/tls.key --cacert /var/run/svid/ca.crt \
+  https://svidlet-broker.svidlet-system.svc:8444/v1/token -d '{"audience":"https://api.vendor.example"}'
+```
+
+No `jwt/` directory means no approved audiences, or broker mode is off. A file that stops changing while `svidlet_jwt_earliest_expiry_seconds` falls means the node cannot reach the broker; the current token stays until it expires.
 
 ### Prove your own identity, to yourself
 

@@ -1,0 +1,11 @@
+# Run test binaries, and only test binaries, as root.
+#
+#   cargo test --config hack/root-tests.toml
+#
+# The plugin's tests mount a real tmpfs per volume and bind-mount it into the
+# policy farm, exactly as on a node, and mount(2) needs root. With this runner
+# cargo itself — compilation, the target directory, the registry cache — stays
+# with the invoking user; `sudo cargo test` would leave root-owned files in
+# target/ that the next unprivileged build cannot overwrite.
+[target.'cfg(target_os = "linux")']
+runner = "sudo -E"
